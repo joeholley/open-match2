@@ -1,0 +1,59 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Repo-specific Go build outputs (module ends in /v2, so `go build .` produces `v2`)
+/v2
+/open-match2
+/om-core
+/bin/
+/dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage, benchmark, and pprof outputs
+*.out
+coverage.*
+*.prof
+
+# Go workspace and local vendor directory
+go.work
+go.work.sum
+/vendor/
+
+# Unmoved protoc build artifacts in proto/ (committed outputs live in pkg/)
+/proto/protoc/
+/proto/protoc-*.zip
+/proto/*.pb.go
+/proto/*.pb.gw.go
+/proto/*.swagger.json
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
