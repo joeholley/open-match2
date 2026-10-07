@@ -22,11 +22,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
@@ -38,6 +40,30 @@ import (
 
 	gw "github.com/googleforgames/open-match2/v2/pkg/api"
 )
+
+// unaryPanicRecoveryInterceptor recovers from panics in unary gRPC handlers so
+// a single unexpected panic cannot terminate the om-core process and wipe the
+// in-memory ticket cache.
+func unaryPanicRecoveryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("Recovered from panic in unary gRPC handler %s: %v\n%s", info.FullMethod, r, string(debug.Stack()))
+			err = status.Errorf(codes.Internal, "internal server error")
+		}
+	}()
+	return handler(ctx, req)
+}
+
+// streamPanicRecoveryInterceptor recovers from panics in streaming gRPC handlers.
+func streamPanicRecoveryInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("Recovered from panic in stream gRPC handler %s: %v\n%s", info.FullMethod, r, string(debug.Stack()))
+			err = status.Errorf(codes.Internal, "internal server error")
+		}
+	}()
+	return handler(srv, ss)
+}
 
 // start brings up the gRPC server, based on the configuration.
 func start(cfg *viper.Viper) {
@@ -58,7 +84,11 @@ func start(cfg *viper.Viper) {
 		logger.Fatalf("Couldn't listen on port %v - net.Listen error: %v", cfg.GetString("OM_GRPC_PORT"), err)
 	}
 	var opts []grpc.ServerOption
-	opts = append(opts, grpc.StatsHandler(&Handler{}))
+	opts = append(opts,
+		grpc.StatsHandler(&Handler{}),
+		grpc.UnaryInterceptor(unaryPanicRecoveryInterceptor),
+		grpc.StreamInterceptor(streamPanicRecoveryInterceptor),
+	)
 	omServer := grpc.NewServer(opts...)
 	pb.RegisterOpenMatchServiceServer(omServer, &grpcServer{})
 	go func() {

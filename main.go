@@ -48,12 +48,15 @@ import (
 	grpcMetadata "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 
 	"github.com/googleforgames/open-match2/v2/internal/filter"
 	"github.com/googleforgames/open-match2/v2/internal/logging"
+	"github.com/googleforgames/open-match2/v2/internal/mmfauth"
 	"github.com/googleforgames/open-match2/v2/internal/statestore/cache"
 	store "github.com/googleforgames/open-match2/v2/internal/statestore/datatypes"
 	memoryReplicator "github.com/googleforgames/open-match2/v2/internal/statestore/memory"
@@ -66,6 +69,13 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
+
+// MatchDeactivationTimeoutExtensionKey is the key added to a returned Match's
+// Extensions map (with a google.protobuf.BoolValue(true) payload) when waiting
+// for the match's ticket deactivations to replicate to the local cache times
+// out before the match is returned. Clients that do not inspect this extension
+// key are unaffected.
+const MatchDeactivationTimeoutExtensionKey = "deactivation_timeout"
 
 // Required by protobuf compiler's golang gRPC auto-generated code.
 type grpcServer struct {
@@ -89,8 +99,16 @@ var (
 	// One global instance for the local ticket cache. Everything reads and
 	// writes to this one instance which contains concurrent-safe data
 	// structures where necessary.
-	tc               cache.ReplicatedTicketCache
-	tlsConfig        *tls.Config
+	tc cache.ReplicatedTicketCache
+
+	tlsConfig *tls.Config
+
+	// Concurrency-safe ID token cache for authenticating to HTTPS MMFs on Cloud Run.
+	mmfIDTokens = mmfauth.NewIDTokenCache(func(ctx context.Context, audience string) (oauth2.TokenSource, error) {
+		return idtoken.NewTokenSource(ctx, audience)
+	})
+
+	// oTel globals for metrics
 	meter            *metric.Meter
 	otelShutdownFunc func(context.Context) error
 )
@@ -130,8 +148,7 @@ func main() {
 
 	// Set up the replicated ticket cache.
 	// fields using sync.Map come ready to use and don't need initialization
-	tc.Cfg = cfg
-	tc.UpRequests = make(chan *cache.UpdateRequest)
+	var replicator store.StateReplicator
 	switch cfg.GetString("OM_STATE_STORAGE_TYPE") {
 	case "redis":
 		// Default: use redis
@@ -139,7 +156,7 @@ func main() {
 		if err != nil {
 			logger.Fatal(fmt.Errorf("Redis Failure; exiting: %w", err).Error())
 		}
-		tc.Replicator = rr
+		replicator = rr
 	case "memory":
 		// NOT RECOMMENDED FOR PRODUCTION
 		//
@@ -148,8 +165,11 @@ func main() {
 		// any updates to/from any other instances.
 		// Useful for debugging, local development, etc.
 		logger.Warnf("OM_STATE_STORAGE_TYPE configuration variable set to 'memory'. NOT RECOMMENDED FOR PRODUCTION")
-		tc.Replicator = memoryReplicator.New(cfg)
+		replicator = memoryReplicator.New(cfg)
+	default:
+		logger.Fatalf("Unknown OM_STATE_STORAGE_TYPE: %q", cfg.GetString("OM_STATE_STORAGE_TYPE"))
 	}
+	tc.Init(cfg, replicator)
 
 	// These goroutines send and receive cache updates from state storage
 	go tc.OutgoingReplicationQueue(ctx)
@@ -222,6 +242,7 @@ func createTicket(parentCtx context.Context, tc *cache.ReplicatedTicketCache, re
 		// tc.IncomingReplicationQueue().
 		ResultsChan: rChan,
 		Ctx:         parentCtx,
+		EnqueuedAt:  time.Now(),
 		Update: store.StateUpdate{
 			Cmd:   store.Ticket,
 			Value: string(ticketPb[:]),
@@ -373,13 +394,17 @@ func deactivateTickets(parentCtx context.Context, logger *logrus.Entry, tc *cach
 	}
 
 	// Send the ticket activation updates.
-	updateStateErrDetails := updateTicketsActiveState(ctx, logger, tc, validTicketIds, store.Deactivate)
+	updateStateErrDetails, _ := updateTicketsActiveState(ctx, logger, tc, validTicketIds, store.Deactivate)
 
 	// Attach error details we found while validating ticket IDs and
 	// replicating the updates.
 	maps.Copy(updateStateErrDetails, invalidIdErrorDetails)
 	if len(updateStateErrDetails) > 0 {
-		err = addErrorDetails(updateStateErrDetails, status.New(codes.InvalidArgument, err.Error()))
+		if err != nil {
+			err = addErrorDetails(updateStateErrDetails, status.New(codes.InvalidArgument, err.Error()))
+		} else {
+			err = addErrorDetails(updateStateErrDetails, status.New(codes.Internal, "unable to update ticket state"))
+		}
 	}
 
 	// Record metrics
@@ -427,13 +452,17 @@ func activateTickets(parentCtx context.Context, logger *logrus.Entry, tc *cache.
 	}
 
 	// Send the ticket activation updates.
-	updateStateErrDetails := updateTicketsActiveState(ctx, logger, tc, validTicketIds, store.Activate)
+	updateStateErrDetails, _ := updateTicketsActiveState(ctx, logger, tc, validTicketIds, store.Activate)
 
 	// Attach error details we found while validating ticket IDs and
 	// replicating the updates.
 	maps.Copy(updateStateErrDetails, invalidIdErrorDetails)
 	if len(updateStateErrDetails) > 0 {
-		err = addErrorDetails(updateStateErrDetails, status.New(codes.InvalidArgument, err.Error()))
+		if err != nil {
+			err = addErrorDetails(updateStateErrDetails, status.New(codes.InvalidArgument, err.Error()))
+		} else {
+			err = addErrorDetails(updateStateErrDetails, status.New(codes.Internal, "unable to update ticket state"))
+		}
 	}
 
 	// Record metrics
@@ -499,10 +528,12 @@ func validateTicketStateUpdates(logger *logrus.Entry, idValidator *regexp.Regexp
 }
 
 // updateTicketsActiveState accepts a list of ticketids to (de-)activate, and
-// generates cache updates for each.
+// generates cache updates for each. It returns a map of any ticket IDs that
+// failed to update, along with the highest replication stream ID assigned to
+// the successful updates.
 //
 // NOTE This function does no input validation, the calling function has to handle that.
-func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, tc *cache.ReplicatedTicketCache, ticketIds []string, command int) map[string]error {
+func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, tc *cache.ReplicatedTicketCache, ticketIds []string, command int) (map[string]error, string) {
 	// Make a human-readable version of the requested state transition, for logging
 	var requestedStateAsString string
 	switch command {
@@ -519,22 +550,58 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 	})
 
 	errs := map[string]error{}
+	var maxReplId string
 
-	// Generate result channel
-	rChan := make(chan *store.StateResponse, len(ticketIds))
-	defer close(rChan)
+	// v2.1 - new config allows packing activate/deactivate commands for a small
+	// redis optimization.
+	packUpdates := tc.Cfg.GetBool("OM_CACHE_PACK_TICKET_STATE_UPDATES")
+
+	if packUpdates && len(ticketIds) > 0 {
+		rChan := make(chan *store.StateResponse, 1)
+		packedKeys := append([]string(nil), ticketIds...)
+		logger.Trace("queuing packed update for ticket state change")
+		tc.UpRequests <- &cache.UpdateRequest{
+			ResultsChan: rChan,
+			Ctx:         parentCtx,
+			EnqueuedAt:  time.Now(),
+			Update: store.StateUpdate{
+				Cmd:  command,
+				Key:  packedKeys[0],
+				Keys: packedKeys,
+			},
+		}
+		r := <-rChan
+		if r.Err != nil {
+			for _, id := range ticketIds {
+				errs[id] = status.Error(codes.Internal, fmt.Errorf("Unable to update ticket %v state to %v : %w", id, requestedStateAsString, r.Err).Error())
+				logger.Error(errs[id])
+			}
+		} else if r.Result != "" {
+			maxReplId = r.Result
+		}
+		return errs, maxReplId
+	}
+
+	// Generate a 1-buffered result channel per request so each response stays
+	// paired with its exact ticketIds[i] regardless of batching or completion
+	// order. Do not close channels explicitly so a late writer in the
+	// replication queue can never panic on send to a closed channel; the
+	// garbage collector reclaims them once unreferenced.
+	rChans := make([]chan *store.StateResponse, len(ticketIds))
 
 	// Queue the update requests
 	logger.Trace("queuing updates for ticket state change")
-	for _, id := range ticketIds {
+	for i, id := range ticketIds {
+		rChans[i] = make(chan *store.StateResponse, 1)
 		tc.UpRequests <- &cache.UpdateRequest{
 			// This command (adding/removing the id to the inactive list)
 			// is replicated to all other om-core instances using the batch
 			// writing async goroutine tc.OutgoingReplicationQueue() and its
 			// effect is applied to the local ticket cache in the update
 			// processing async goroutine tc.IncomingReplicationQueue().
-			ResultsChan: rChan,
+			ResultsChan: rChans[i],
 			Ctx:         parentCtx,
+			EnqueuedAt:  time.Now(),
 			Update: store.StateUpdate{
 				Cmd: command,
 				Key: id,
@@ -545,29 +612,66 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 		}).Trace("generated request to update ticket status")
 	}
 
-	// Look through all results for errors. Since results come back on a
-	// channel, we need to process all the results, even if the context has
-	// been cancelled and we'll never return those results to the calling
-	// client (returning from this function before processing all results
-	// closes the results channel, which will cause a panic, as the state
-	// storage layer isn't context-aware). This is slightly inefficient in the
-	// worst-case scenario (client has quit) but the code is very simple and
-	// therefore robust.
+	// Look through all results for errors.
 	for i := 0; i < len(ticketIds); i++ {
-		r := <-rChan
+		r := <-rChans[i]
 		if r.Err != nil {
 			// Wrap redis error and give it a gRPC internal server error status code
 			// The results.result field contains the ticket id that generated the error.
-			errs[r.Result] = status.Error(codes.Internal, fmt.Errorf("Unable to update ticket %v state to %v : %w", ticketIds[i], requestedStateAsString, r.Err).Error())
-			logger.Error(errs[r.Result])
+			failedId := r.Result
+			if failedId == "" {
+				failedId = ticketIds[i]
+			}
+			errs[failedId] = status.Error(codes.Internal, fmt.Errorf("Unable to update ticket %v state to %v : %w", failedId, requestedStateAsString, r.Err).Error())
+			logger.Error(errs[failedId])
+		} else if r.Result != "" && store.CompareReplIds(r.Result, maxReplId) > 0 {
+			maxReplId = r.Result
 		}
 	}
-	return errs
+	return errs, maxReplId
 }
 
 //----------------------------------------------------------------------------------
 // InvokeMatchmakingFunctions()
 //----------------------------------------------------------------------------------
+
+// buildChunkedRequests constructs the ChunkedMmfRunRequest slice from chunkedPools,
+// cloning each Pool message from reqProfile so that setting pool.Participants on
+// one chunk never mutates the Pool in earlier chunks or in reqProfile itself.
+func buildChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*pb.Ticket) []*pb.ChunkedMmfRunRequest {
+	chunkedRequest := make([]*pb.ChunkedMmfRunRequest, len(chunkedPools))
+	for chunkIndex, chunk := range chunkedPools {
+		logger.Debugf("processing chunk %v ", chunkIndex)
+
+		// Fill this request 'chunk' with the chunked pools we built above
+		pools := make(map[string]*pb.Pool, len(chunk))
+		profile := &pb.Profile{
+			Name:       reqProfile.GetName(),
+			Pools:      pools,
+			Extensions: reqProfile.GetExtensions(),
+		}
+		for name, participantRoster := range chunk {
+			logger.Debugf("making chunk containing %v tickets", len(participantRoster))
+			// Clone the empty pool from the original request's profile so each
+			// chunk owns a distinct *pb.Pool instance, then fill in as much of
+			// the participant roster as will fit in this chunk.
+			poolCopy, ok := proto.Clone(reqProfile.GetPools()[name]).(*pb.Pool)
+			if !ok || poolCopy == nil {
+				poolCopy = &pb.Pool{Name: name}
+			}
+			poolCopy.Participants = &pb.Roster{
+				Name:    name + "_roster",
+				Tickets: participantRoster,
+			}
+			profile.Pools[name] = poolCopy
+		}
+		chunkedRequest[chunkIndex] = &pb.ChunkedMmfRunRequest{
+			Profile:   profile,
+			NumChunks: int32(len(chunkedPools)),
+		}
+	}
+	return chunkedRequest
+}
 
 // InvokeMatchmakingFunctions loops through each Pool in the provided Profile,
 // applying the filters inside and adding participating tickets to those pools.
@@ -593,9 +697,11 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// practices dictate that we define /some/ timeout (default: 10 mins)
 	mmfTimeout := time.Duration(cfg.GetInt("OM_MMF_TIMEOUT_SECS")) * time.Second
 	ctx, cancel := context.WithCancelCause(context.WithoutCancel(context.Background())) // ignore cancellation from parent context
-	ctx, _ = context.WithTimeoutCause(ctx, mmfTimeout, MMFTimeoutError)
+	var timeoutCancel context.CancelFunc
+	ctx, timeoutCancel = context.WithTimeoutCause(ctx, mmfTimeout, MMFTimeoutError)
 	defer func() {
 		logger.Debugf("MMFs complete, sending context cancellation after %04d ms", time.Since(startTime).Milliseconds())
+		timeoutCancel()
 		cancel(MMFsComplete)
 	}()
 
@@ -632,7 +738,8 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// the ticket cache that happen after this point.
 
 	// Copy the ticket cache, leaving out inactive tickets.
-	activeTickets := setDifference(&tc.Tickets, &tc.InactiveSet)
+	prepStart := time.Now()
+	activeTickets := tc.SnapshotActiveTickets()
 	// This is largely for local debugging when developiong a matchmaker against
 	// OM. Assignments are considered deprecated, so OM shouldn't be
 	// responsible for them in production and doesn't output OTEL metrics for
@@ -679,7 +786,7 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	chunkedPools = append(chunkedPools, map[string][]*pb.Ticket{})
 
 	for _, ticket := range activeTickets {
-		for name, _ := range validPools {
+		for name := range validPools {
 			// All the implementation details of filtering are in github.com/googleforgames/open-match2/v2/internal/filter/filter.go
 			if filter.In(req.GetProfile().GetPools()[name], ticket.(*pb.Ticket)) {
 				ticketSize := proto.Size(ticket.(*pb.Ticket))
@@ -709,33 +816,10 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// so we don't repeatedly send profile details in larger payloads, but this
 	// implementation is 1) simpler and 2) could still be useful to the receiving
 	// MMF if it somehow only got part of the chunked request.
-	chunkedRequest := make([]*pb.ChunkedMmfRunRequest, len(chunkedPools))
-	for chunkIndex, chunk := range chunkedPools {
-		logger.Debugf("processing chunk %v ", chunkIndex)
-
-		// Fill this request 'chunk' with the chunked pools we built above
-		pools := make(map[string]*pb.Pool)
-		profile := &pb.Profile{
-			Name:       req.GetProfile().GetName(),
-			Pools:      pools,
-			Extensions: req.GetProfile().GetExtensions(),
-		}
-		for name, participantRoster := range chunk {
-			logger.Debugf("making chunk containing %v tickets", len(participantRoster))
-			// Make a copy of the empty pool from the original request's
-			// profile, and then fill in as much of the participant roster as
-			// will fit in this chunk.
-			profile.GetPools()[name] = req.GetProfile().GetPools()[name]
-			profile.GetPools()[name].Participants = &pb.Roster{
-				Name:    name + "_roster",
-				Tickets: participantRoster,
-			}
-		}
-		chunkedRequest[chunkIndex] = &pb.ChunkedMmfRunRequest{
-			Profile:   profile,
-			NumChunks: int32(len(chunkedPools)),
-		}
-	}
+	chunkedRequest := buildChunkedRequests(req.GetProfile(), chunkedPools)
+	otelMmfPrepDuration.Record(context.Background(), float64(time.Since(prepStart).Microseconds())/1000.0,
+		metric.WithAttributes(attribute.String("profile.name", profileName)),
+	)
 
 	// MMF Result fan-in goroutine
 	// Simple fan-in channel pattern implemented as an async inline goroutine.
@@ -746,8 +830,9 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// Channel on which MMFs return their matches.
 	matchChan := make(chan *pb.Match)
 	var fanwg sync.WaitGroup
+	fanwg.Add(1)
 	go func() {
-		fanwg.Add(1)
+		defer fanwg.Done()
 		// Local logger with a field to indicate logs are from this goroutine.
 		logger := logger.WithFields(logrus.Fields{"stage": "fan-in"})
 		logger.Trace("MMF results fan-in goroutine active")
@@ -764,12 +849,13 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			if err != nil {
 				logger.Errorf("Unable to stream match result back to matchmaker, dropping %v matches: %v, %v", len(matchChan)+1, err, context.Cause(ctx))
 				logger.Errorf("dropped: %v", match.GetId())
+				for dropped := range matchChan {
+					logger.Errorf("dropped: %v", dropped.GetId())
+				}
 				return
 			}
 		}
 		logger.Trace("ALL MMFS COMPLETE: exiting MMF results fan-in goroutine")
-		fanwg.Done()
-		return
 	}()
 
 	// Set up grpc dial options for all MMFs.
@@ -785,12 +871,6 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	opts = append(opts,
 		grpc.WithConnectParams(grpc.ConnectParams{MinConnectTimeout: mmfTimeout}),
 	)
-
-	// Auth using IAM when on Google Cloud
-	// Maintain a dictionary of tokens and tokenSources by MMF so we aren't
-	// recreating them every time.
-	tokenSources := map[string]oauth2.TokenSource{}
-	tokens := map[string]*oauth2.Token{}
 
 	// Invoke each requested MMF, and put the matches they stream back into the match channel.
 	// TODO: Technically this would be better as an ErrorGroup but this already works.
@@ -845,95 +925,62 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			var conn *grpc.ClientConn
 			// Default to unauthenticated grpc
 			creds := insecure.NewCredentials()
+			mmfCtx := ctx
+			var audience string
+			var token *oauth2.Token
+			var httpsLogger *logrus.Entry
 
 			// If MMF server is running with TLS (https), we must authenticate
 			// Note: TLS is transparently added to the MMF server when running on Cloud Run,
 			//       see https://cloud.google.com/run/docs/container-contract#tls
 			if mmfUrl.Scheme == "https" {
 				creds = credentials.NewTLS(tlsConfig)
-				audience := mmf.GetHost()
-				httpsLogger := logger.WithFields(logrus.Fields{
+				audience = mmf.GetHost()
+				httpsLogger = logger.WithFields(logrus.Fields{
 					"audience": audience,
 				})
 				httpsLogger.Infof("HTTPS mmf url detected. Attempting to set up secure grpc credentials.")
 
-				// Fetch Google Cloud IAM auth token; have to make a new one if
-				// it doesn't exists or is invalid
-				var token *oauth2.Token
-				var exists bool
-				if token, exists = tokens[audience]; !exists || !token.Valid() {
-
-					// Check for existing tokenSource
-					if _, exists = tokenSources[audience]; !exists {
-						// Create a TokenSource if none exists.
-						tokenSources[audience], err = idtoken.NewTokenSource(ctx, audience)
-						if err != nil {
-							err = status.Error(codes.Internal, fmt.Errorf(
-								"Failed to get a source for ID tokens to contact gRPC MMF at %v: %w",
-								mmfUrl.Host, err).Error())
-							httpsLogger.Error(err)
-							otelMmfFailures.Add(ctx, 1, metric.WithAttributes(
-								attribute.String("mmf.name", mmf.GetName()),
-								attribute.String("profile.name", profileName),
-							))
-							return fmt.Errorf("%w", err)
-						}
-						httpsLogger.Trace("successfully initialized new token source")
-					}
-
-					// Get new token from the tokenSource, store it in the map
-					// for later use
-					tokens[audience], err = tokenSources[audience].Token()
-					if err != nil {
-						err = status.Error(codes.Internal, fmt.Errorf(
-							"Failed to get ID token to contact gRPC MMF at %v: %w",
-							mmfUrl.Host, err).Error())
-						httpsLogger.Error(err)
-						otelMmfFailures.Add(ctx, 1, metric.WithAttributes(
-							attribute.String("mmf.name", mmf.GetName()),
-							attribute.String("profile.name", profileName),
-						))
-						return fmt.Errorf("%w", err)
-					}
-
-					// New token successfully minted; use it for this call
-					token = tokens[audience]
-
-					// Make a truncated version of the token for trace logging.
-					if logrus.IsLevelEnabled(logrus.TraceLevel) {
-						truncToken := token.AccessToken
-						if len(truncToken) >= 8 {
-							truncToken = truncToken[0:7]
-						}
-						ttField := logrus.Fields{"trunc_access_token": fmt.Sprintf("%v...", truncToken)}
-
-						httpsLogger.WithFields(ttField).Trace("successfully retrieved new access token")
-					}
-				} else {
-					// Make a truncated version of the token for trace logging.
-					if logrus.IsLevelEnabled(logrus.TraceLevel) {
-						truncToken := token.AccessToken
-						if len(truncToken) >= 8 {
-							truncToken = truncToken[0:7]
-						}
-						ttField := logrus.Fields{"trunc_access_token": fmt.Sprintf("%v...", truncToken)}
-
-						httpsLogger.WithFields(ttField).Trace("reusing existing valid access token")
-					}
+				// Fetch Google Cloud IAM auth token from the concurrency-safe
+				// per-audience cache (cached while token.Valid() holds).
+				token, err = mmfIDTokens.Token(audience)
+				if err != nil {
+					err = status.Error(codes.Internal, fmt.Errorf(
+						"Failed to get ID token to contact gRPC MMF at %v: %w",
+						mmfUrl.Host, err).Error())
+					httpsLogger.Error(err)
+					otelMmfFailures.Add(ctx, 1, metric.WithAttributes(
+						attribute.String("mmf.name", mmf.GetName()),
+						attribute.String("profile.name", profileName),
+					))
+					return fmt.Errorf("%w", err)
 				}
 
-				// Add Google Cloud IAM auth token to the context.
-				ctx = grpcMetadata.AppendToOutgoingContext(ctx,
+				// Make a truncated version of the token for trace logging.
+				if logrus.IsLevelEnabled(logrus.TraceLevel) {
+					truncToken := token.AccessToken
+					if len(truncToken) >= 8 {
+						truncToken = truncToken[0:7]
+					}
+					ttField := logrus.Fields{"trunc_access_token": fmt.Sprintf("%v...", truncToken)}
+					httpsLogger.WithFields(ttField).Trace("successfully retrieved access token")
+				}
+
+				// Add Google Cloud IAM auth token to a goroutine-local context so
+				// sibling MMF goroutines never race on or inherit this MMF's header.
+				mmfCtx = grpcMetadata.AppendToOutgoingContext(ctx,
 					"authorization", "Bearer "+token.AccessToken)
 			}
 
-			opts = append(opts,
+			mmfOpts := make([]grpc.DialOption, 0, len(opts)+2)
+			mmfOpts = append(mmfOpts, opts...)
+			mmfOpts = append(mmfOpts,
 				grpc.WithTransportCredentials(creds),
 				grpc.WithAuthority(mmfUrl.Host),
 			)
 
 			// Connect to gRPC server for this mmf.
-			conn, err = grpc.NewClient(mmfUrl.Host, opts...)
+			conn, err = grpc.NewClient(mmfUrl.Host, mmfOpts...)
 			if err != nil {
 				err = status.Error(codes.Internal, fmt.Errorf("Failed to dial gRPC for %v: %w", mmfUrl.Host, err).Error())
 				logger.Error(err)
@@ -956,9 +1003,43 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			client := pb.NewMatchMakingFunctionServiceClient(conn)
 			logger.Trace("Connected to MMF")
 
+			openAndSendChunks := func(callCtx context.Context) (pb.MatchMakingFunctionService_RunClient, error) {
+				streamClient, runErr := client.Run(callCtx)
+				if runErr != nil {
+					return nil, runErr
+				}
+				logger.Trace("MMF .Run() invoked, sending profile chunks")
+
+				// Request itself is chunked if all the tickets returned in
+				// ticket pools result in a total request size larger than the
+				// default gRPC message size of 4mb.
+				for index, chunk := range chunkedRequest {
+					sendErr := streamClient.Send(chunk)
+					if sendErr != nil {
+						logger.Errorf("Failed to send MmfRequest chunk to MMF: %v", sendErr)
+					}
+					logger.Tracef("MMF request chunk %02d/%02d: %0.2fmb", index+1, len(chunkedRequest), float64(proto.Size(chunk))/float64(1024*1024))
+				}
+				return streamClient, nil
+			}
+
 			// Run the MMF
 			var mmfStream pb.MatchMakingFunctionService_RunClient
-			mmfStream, err = client.Run(ctx)
+			retriedAuth := false
+			mmfStream, err = openAndSendChunks(mmfCtx)
+			if err != nil && mmfUrl.Scheme == "https" && !retriedAuth && mmfauth.IsAuthRejection(err) {
+				retriedAuth = true
+				httpsLogger.Warnf("MMF rejected cached ID token on stream creation (%v); refreshing token and retrying once", err)
+				refreshedToken, refreshErr := mmfIDTokens.Refresh(audience, token.AccessToken)
+				if refreshErr == nil {
+					token = refreshedToken
+					mmfCtx = grpcMetadata.AppendToOutgoingContext(ctx,
+						"authorization", "Bearer "+token.AccessToken)
+					mmfStream, err = openAndSendChunks(mmfCtx)
+				} else {
+					httpsLogger.Errorf("Failed to refresh rejected ID token for %v: %v", mmfUrl.Host, refreshErr)
+				}
+			}
 			if err != nil {
 				// Example failure that will trigger this codepath:
 				// "Failed to connect to MMF at localhost:50443: rpc error:
@@ -972,18 +1053,6 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				))
 				return status.Error(codes.Internal, fmt.Errorf("Failed to connect to MMF at %v: %w", mmfUrl.Host, err).Error())
 			}
-			logger.Trace("MMF .Run() invoked, sending profile chunks")
-
-			// Request itself is chunked if all the tickets returned in
-			// ticket pools result in a total request size larger than the
-			// default gRPC message size of 4mb.
-			for index, chunk := range chunkedRequest {
-				err = mmfStream.Send(chunk)
-				if err != nil {
-					logger.Errorf("Failed to send MmfRequest chunk to MMF: %v", err)
-				}
-				logger.Tracef("MMF request chunk %02d/%02d: %0.2fmb", index+1, len(chunkedRequest), float64(proto.Size(chunk))/float64(1024*1024))
-			}
 
 			// Make a waitgroup that lets us know when all ticket deactivations
 			// are complete. (All tickets in matches returned by the MMF are
@@ -995,7 +1064,6 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			// match responses from the mmf and runs until a break
 			// statement is encountered.
 			var i int64
-			i = 0
 			for {
 				// Get results from MMF
 				var result *pb.StreamedMmfResponse
@@ -1007,6 +1075,24 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					break
 				}
 				if err != nil { // MMF has an error
+					// If the MMF rejected our cached ID token before returning any matches,
+					// refresh the token once and re-open the stream.
+					if mmfUrl.Scheme == "https" && i == 0 && !retriedAuth && mmfauth.IsAuthRejection(err) {
+						retriedAuth = true
+						httpsLogger.Warnf("MMF rejected cached ID token (%v); refreshing token and retrying once", err)
+						refreshedToken, refreshErr := mmfIDTokens.Refresh(audience, token.AccessToken)
+						if refreshErr == nil {
+							token = refreshedToken
+							mmfCtx = grpcMetadata.AppendToOutgoingContext(ctx,
+								"authorization", "Bearer "+token.AccessToken)
+							mmfStream, err = openAndSendChunks(mmfCtx)
+							if err == nil {
+								continue
+							}
+						} else {
+							httpsLogger.Errorf("Failed to refresh rejected ID token for %v: %v", mmfUrl.Host, refreshErr)
+						}
+					}
 					err = status.Error(codes.Internal, fmt.Errorf("MMF Failure: %w", err).Error())
 					logger.Error(err)
 					otelMmfFailures.Add(ctx, 1, metric.WithAttributes(
@@ -1044,9 +1130,18 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					// optimization to do this before we hear concrete feedback
 					// that it is a performance bottleneck.
 					ticketIdsToDeactivate := []string{}
+					idValidator := tc.Replicator.GetReplIdValidator()
 					for _, roster := range res.GetRosters() {
 						for _, ticket := range roster.GetTickets() {
-							ticketIdsToDeactivate = append(ticketIdsToDeactivate, ticket.GetId())
+							id := ticket.GetId()
+							if idValidator != nil && !idValidator.MatchString(id) {
+								logger.WithFields(logrus.Fields{
+									"match_id":  res.GetId(),
+									"ticket_id": id,
+								}).Errorf("Skipping invalid ticket ID in match response: %v", InvalidIdErr)
+								continue
+							}
+							ticketIdsToDeactivate = append(ticketIdsToDeactivate, id)
 						}
 					}
 
@@ -1061,9 +1156,9 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 
 					// Kick off deactivation
 					logger.Tracef("deactivating tickets in %v", res.GetId())
-					errs := updateTicketsActiveState(ctx, logger, &tc, ticketIdsToDeactivate, store.Deactivate)
+					errs, maxReplId := updateTicketsActiveState(ctx, logger, &tc, ticketIdsToDeactivate, store.Deactivate)
 					if len(errs) > 0 {
-						logger.Errorf("Error deactivating match %v tickets: %v", res.GetId(), err)
+						logger.Errorf("Error deactivating match %v tickets: %v", res.GetId(), errs)
 					}
 					otelMmfTicketDeactivations.Add(ctx, int64(len(ticketIdsToDeactivate)-len(errs)),
 						metric.WithAttributes(
@@ -1074,36 +1169,24 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 
 					logger.Tracef("Done requesting deactivation of tickets in %v", res.GetId())
 
-					// Function to check if deactivation of the last ticket in
-					// this match's rosters has been replicated to the local
-					// cache.
-					deactivationCheck := func(ticketId string) {
-						// We'd never expect the deactivation to take this
-						// long to replicate, but best practices require
-						// /some/ timeout.
-						timeout := time.After(time.Second * 60)
-						for {
-							select {
-							case <-timeout:
-								// Log the timeout and continue.
-								logger.Errorf("Timeout while waiting for ticket %v deactivation to be replicated to local cache", ticketId)
-								return
-							default:
-								// There is always /some/ replication delay, sleep
-								// before first check.
-								time.Sleep(100 * time.Millisecond)
-								if _, replComplete := tc.InactiveSet.Load(ticketId); replComplete == true {
-									logger.Tracef("deactivation of ticket %v replicated to local cache", ticketId)
-									return
-								}
-							}
+					// Select the last ticket ID in the match whose deactivation
+					// write succeeded. If every ticket write failed, do not
+					// block waiting for replication that can never arrive.
+					targetTicketId := ""
+					for idx := len(ticketIdsToDeactivate) - 1; idx >= 0; idx-- {
+						candidateId := ticketIdsToDeactivate[idx]
+						if _, failed := errs[candidateId]; !failed {
+							targetTicketId = candidateId
+							break
 						}
 					}
 
 					// Option 1 (default): Wait for deactivation to complete
-					// BEFORE returning the match.
+					// BEFORE returning the match. If waiting for replication
+					// times out, annotate res.Extensions[MatchDeactivationTimeoutExtensionKey]
+					// before queueing res on matchChan.
 					if cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
-						deactivationCheck(ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
+						waitForMatchDeactivation(ctx, logger, &tc, res, mmf.GetName(), profileName, targetTicketId, maxReplId, true)
 						logger.Trace("ticket deactivations complete, returning match")
 					}
 
@@ -1113,11 +1196,11 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 						"match_id": res.GetId(),
 						"stage":    "queuing_for_send",
 					}).Trace("sending match to InvokeMMF() output queue")
-					if ctx.Err() != nil { // context cancelled
+					if stream.Context().Err() != nil { // caller stream context cancelled
 						// In this case, just exit; there's no need to
 						// stream back the rest of the results.
 						logger.WithFields(logrus.Fields{
-							"error": ctx.Err(),
+							"error": stream.Context().Err(),
 							"stage": "queuing_for_send",
 						}).Warn("context cancelled")
 						return
@@ -1129,10 +1212,9 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					// setting if you throughly understand this code, and the
 					// state storage replication code!
 					if !cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
-						deactivationCheck(ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
+						waitForMatchDeactivation(ctx, logger, &tc, res, mmf.GetName(), profileName, targetTicketId, maxReplId, false)
 						logger.Trace("ticket deactivations complete for previously returned match")
 					}
-					return
 				}(resultCopy) // End of match return & ticket deactivation goroutine
 
 			} // End of match stream receiving loop
@@ -1199,7 +1281,10 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 		return nil, fmt.Errorf("%w", status.Error(codes.InvalidArgument, "roster with assignment is required"))
 	}
 	assignmentPb, err := proto.Marshal(req.GetAssignmentRoster().GetAssignment())
-	if assignmentPb == nil || err != nil {
+	if len(assignmentPb) == 0 || err != nil {
+		if err == nil {
+			return nil, fmt.Errorf("%w", status.Error(codes.InvalidArgument, "roster with non-empty assignment is required"))
+		}
 		err = errors.Wrap(err, "failed to marshal the assignment protobuf")
 		logger.Errorf("Error: %v", err)
 		return nil, err
@@ -1223,6 +1308,7 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 				},
 				ResultsChan: rChan,
 				Ctx:         parentCtx,
+				EnqueuedAt:  time.Now(),
 			}
 			numUpdates++
 		} else {
@@ -1318,7 +1404,7 @@ func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb
 	// This is a very naive implementation. This functionality is deprecated.
 	timeout := time.After(time.Until(newestTicketCtime.Add(time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS")))))
 	var err error
-	for i, _ := range req.GetTicketIds() {
+	for i := range req.GetTicketIds() {
 		select {
 		case thisAssignment := <-updateChan:
 			otelAssignmentWatches.Add(context.Background(), -1)
@@ -1375,7 +1461,11 @@ func addErrorDetails(errs map[string]error, currentStatus *status.Status) error 
 func syncMapDump(sm *sync.Map) map[string]interface{} {
 	out := map[string]interface{}{}
 	sm.Range(func(key, value interface{}) bool {
-		out[fmt.Sprint(key)] = value
+		if s, ok := key.(string); ok {
+			out[s] = value
+		} else {
+			out[fmt.Sprint(key)] = value
+		}
 		return true
 	})
 	return out
@@ -1388,15 +1478,81 @@ func syncMapDump(sm *sync.Map) map[string]interface{} {
 // two sets, as they are still being updated asynchronously in a number of
 // other goroutines. The rest of the design of OM takes this into account.
 func setDifference(tix *sync.Map, inactiveSet *sync.Map) (activeTickets []any) {
-	inactiveTicketIds := syncMapDump(inactiveSet)
-	// Copy the ticket cache, leaving out inactive tickets.
+	// Copy the ticket cache into a point-in-time snapshot slice, leaving out
+	// inactive tickets by checking inactiveSet directly rather than dumping
+	// the entire inactiveSet into an intermediate map on every call.
 	tix.Range(func(id, ticket any) bool {
-		// not ok means an error was encountered, indicating this
-		// ticket is NOT inactive (meaning it IS active)
-		if _, ok := inactiveTicketIds[id.(string)]; !ok {
+		// not ok means this ticket ID is not in inactiveSet (meaning it IS active)
+		if _, ok := inactiveSet.Load(id); !ok {
 			activeTickets = append(activeTickets, ticket)
 		}
 		return true
 	})
 	return
+}
+
+// annotateMatchDeactivationTimeout attaches a google.protobuf.BoolValue(true)
+// annotation under MatchDeactivationTimeoutExtensionKey ("deactivation_timeout")
+// on match.Extensions, preserving any existing extension entries set by the MMF.
+func annotateMatchDeactivationTimeout(match *pb.Match) {
+	if match == nil {
+		return
+	}
+	extVal, err := anypb.New(wrapperspb.Bool(true))
+	if err != nil {
+		return
+	}
+	if match.Extensions == nil {
+		match.Extensions = make(map[string]*anypb.Any)
+	}
+	match.Extensions[MatchDeactivationTimeoutExtensionKey] = extVal
+}
+
+// waitForMatchDeactivation checks whether deactivation of ticketId (at or after
+// replId) has replicated to the local cache within OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS.
+// When annotateOnTimeout is true and the wait times out, it annotates
+// res.Extensions[MatchDeactivationTimeoutExtensionKey] before the match is returned.
+func waitForMatchDeactivation(
+	ctx context.Context,
+	logger *logrus.Entry,
+	tc *cache.ReplicatedTicketCache,
+	res *pb.Match,
+	mmfName string,
+	profileName string,
+	ticketId string,
+	replId string,
+	annotateOnTimeout bool,
+) bool {
+	if ticketId == "" {
+		logger.Warnf("Skipping local cache replication wait for match %v because all ticket deactivation writes failed", res.GetId())
+		if annotateOnTimeout {
+			annotateMatchDeactivationTimeout(res)
+		}
+		return false
+	}
+	waitStart := time.Now()
+	timeout := time.Duration(tc.Cfg.GetInt("OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS")) * time.Millisecond
+	replicated := tc.WaitForDeactivation(ticketId, replId, timeout)
+	otelMmfDeactivationWait.Record(ctx, float64(time.Since(waitStart).Microseconds())/1000.0,
+		metric.WithAttributes(
+			attribute.String("mmf.name", mmfName),
+			attribute.String("profile.name", profileName),
+		),
+	)
+	if !replicated {
+		otelMmfDeactivationTimeouts.Add(ctx, 1,
+			metric.WithAttributes(
+				attribute.String("mmf.name", mmfName),
+				attribute.String("profile.name", profileName),
+			),
+		)
+		if annotateOnTimeout {
+			annotateMatchDeactivationTimeout(res)
+		}
+		// Log the timeout and continue.
+		logger.Errorf("Timeout while waiting for ticket %v deactivation to be replicated to local cache", ticketId)
+		return false
+	}
+	logger.Tracef("deactivation of ticket %v replicated to local cache", ticketId)
+	return true
 }
