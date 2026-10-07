@@ -88,8 +88,8 @@ This is the most important part of the "fire-and-forget" model: **You are not re
 
 When your Matchmaking Function (MMF) returns a `Match` to Open Match core, the core service automatically performs the following actions on your behalf:
 
-* It inspects all the `Tickets` within the `Match`.  
-* It marks every one of those tickets as **inactive**.
+* It inspects and validates all the `Tickets` within the `Match` rosters.  
+* It writes a deactivation update for those tickets to the replication stream and, by default (`OM_MATCH_TICKET_DEACTIVATION_WAIT=true`), waits up to `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` for the deactivation to be applied to its local cache before returning the match to your Director (annotating `extensions["deactivation_timeout"]` with a `google.protobuf.BoolValue` of `true` if the wait times out or deactivation fails).
 
 This automatic deactivation, as seen in the `InvokeMatchmakingFunctions` logic, ensures that a player who has just been assigned to a game isn't immediately put back into the matchmaking pool for another one. It's a core feature that simplifies your matchmaker logic significantly.
 
@@ -254,9 +254,9 @@ This is not a bug; it is a deliberate and standard design pattern for high-perfo
 
 Open Match achieves this state synchronization using Redis Streams as a central, ordered log for all ticket-related events.
 
-1. **Writing to the Log**: When an Open Match instance receives an API call (e.g., `CreateTicket`), it writes a new event to the central Redis Stream.  
-2. **Reading from the Log**: Every Open Match instance, including the one that wrote the event, is constantly listening to this stream for new events.  
-3. **Applying Changes**: As events arrive from the stream, each instance applies the changes to its own local, in-memory ticket cache.
+1. **Writing to the Log**: When an Open Match instance receives an API call (e.g., `CreateTicket`, `ActivateTickets`, `DeactivateTickets`, or automatic match ticket deactivations), it batches and writes the update events to the central Redis Stream (`om-replication`). When `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`, multi-ticket activations or deactivations and contiguous same-command batch requests are packed into a single stream entry. Each write batch ends with an approximate `XTRIM om-replication MINID ~ <threshold>` command (based on `OM_CACHE_TICKET_TTL_MS`) so Redis can evict expired stream macro-nodes in O(1) time without per-entry rewrite overhead.  
+2. **Reading from the Log**: Every Open Match instance, including the one that wrote the event, continuously polls this stream via blocking reads (`XREAD BLOCK` up to `OM_CACHE_IN_WAIT_TIMEOUT_MS` when the stream is empty). Between polls, the poller pauses for `OM_CACHE_IN_POLL_WAIT_MS` after a non-empty partial poll so trickling updates coalesce into batches, or for `OM_CACHE_IN_FULL_POLL_WAIT_MS` after a full poll (`OM_CACHE_IN_MAX_UPDATES_PER_POLL`) to yield CPU while draining a backlog.  
+3. **Applying Changes**: As events arrive from the stream, each instance applies them to its local, in-memory ticket cache (`ReplicatedTicketCache`) in bounded cycles (up to `OM_CACHE_IN_MAX_APPLY_DURATION_MS`, sleeping `OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS` after draining the buffer or `OM_CACHE_IN_FULL_APPLY_SLEEP_MS` when a cycle hits the time limit). Each instance incrementally maintains its active-ticket index (`ActiveTickets`) and enforces exact per-ticket TTL expiration locally via deadline-ordered expiration min-heaps.
 
 This event-sourcing pattern provides two critical guarantees:
 
@@ -271,7 +271,7 @@ Your Director's `InvokeMatchmakingFunctions` calls will be load-balanced across 
 
 This is where you must consider a critical trade-off. The Open Match API allows you to invoke **multiple MMFs from a single API call**.
 
-* **The Benefit**: When you invoke multiple MMFs in one call, you get a powerful guarantee: **all MMFs in that single operation see an identical, atomic snapshot of the ticket pool** from the one instance that handled your request. This is perfect for tasks like A/B testing or analytics where you need to compare results on the exact same data set.
+* **The Benefit**: When you invoke multiple MMFs in one call, you get a powerful guarantee: **all MMFs in that single operation see an identical, atomic point-in-time snapshot of the active ticket pool** (`SnapshotActiveTickets()`) from the one instance that handled your request. This is perfect for tasks like A/B testing or analytics where you need to compare results on the exact same data set.
 
 * **The Trade-Off**: This guarantee comes at a cost. Forcing multiple MMFs into a single call pins that entire workload to a single Open Match core instance. For that operation, you are intentionally **bypassing the benefits of load balancing and horizontal scalability**.
 
