@@ -44,16 +44,18 @@ func Read() *viper.Viper {
 
 	// OTel metrics config.
 	cfg.SetDefault("OM_OTEL_SIDECAR", true)
+	cfg.SetDefault("OM_PROM_PORT", 2223)
 
-	// False: wait until all tickets in a match have had their deactivation
-	// saved to state storage before returning the match to the matchmaker.
-	// Slower results but (theoretically) fewer ticket collisions among
-	// matches.
-	// True (default): return the match to the matchmaker as soon as the mmf
-	// streams it to om-core. Deactivate tickets in the match after it has been
-	// successfully returned. Fastest results but possibly more ticket
-	// collisions if you have lots of mmfs running concurrently.
-	// TODO: validate this has the expected effect when using redis
+	// True (default): wait (up to OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS) until
+	// all tickets in a match have had their deactivation replicated to the local
+	// cache before returning the match to the matchmaker. Slower results but
+	// fewer ticket collisions among concurrent MMFs. If the wait times out (or
+	// deactivation writes fail), the returned Match is annotated with
+	// extensions["deactivation_timeout"] = BoolValue(true).
+	// False: return the match to the matchmaker as soon as the MMF streams it to
+	// om-core, and deactivate tickets in the match after it has been returned.
+	// Fastest results but possibly more ticket collisions if you have lots of
+	// MMFs running concurrently.
 	cfg.SetDefault("OM_MATCH_TICKET_DEACTIVATION_WAIT", true)
 
 	// Maximum number of updates allowed in activate/deactivate/assignment gRPC requests.
@@ -127,10 +129,19 @@ func Read() *viper.Viper {
 	// replicated to all other instances (i.e. writing to state storage)
 	cfg.SetDefault("OM_CACHE_IN_MAX_UPDATES_PER_POLL", 10000)            // In number of update operations
 	cfg.SetDefault("OM_CACHE_IN_WAIT_TIMEOUT_MS", 1500)                  // In milliseconds
+	cfg.SetDefault("OM_CACHE_IN_FULL_POLL_WAIT_MS", 500)                 // Guaranteed post-poll pause (in ms) after a full poll (len(results) >= OM_CACHE_IN_MAX_UPDATES_PER_POLL)
+	cfg.SetDefault("OM_CACHE_IN_QUEUE_BUFFER_SIZE", 20000)               // Buffer capacity for the incoming replication update channel
 	cfg.SetDefault("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 500) // In milliseconds
+	cfg.SetDefault("OM_CACHE_IN_FULL_APPLY_SLEEP_MS", 100)               // Guaranteed yield sleep (in ms) after an apply cycle force-stopped by OM_CACHE_IN_MAX_APPLY_DURATION_MS
+	cfg.SetDefault("OM_CACHE_IN_MAX_APPLY_DURATION_MS", 500)             // Maximum time (in ms) spent applying incoming updates per cycle before yielding
 	cfg.SetDefault("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD", 50)               // In number of update operations
 	cfg.SetDefault("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 500)                  // In milliseconds
+	cfg.SetDefault("OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 500)                // Buffer capacity for the outgoing update request channel
+	cfg.SetDefault("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)          // Pack ticket activations/deactivations from a single call/match and coalesce contiguous same-command outgoing batch requests (up to OM_MAX_STATE_UPDATES_PER_CALL keys per stream entry)
 	cfg.SetDefault("OM_CACHE_TICKET_TTL_MS", 600000)                     // In milliseconds
+	cfg.SetDefault("OM_CACHE_EXPIRATION_INTERVAL_MS", 1000)              // Interval (in ms) between local cache expiration scans
+	cfg.SetDefault("OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE", 5000)    // Maximum number of expired cache entries deleted per expiration cycle (processed in bounded chunks)
+	cfg.SetDefault("OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS", 60000)     // Timeout (in ms) waiting for match ticket deactivations to replicate to local cache
 	// How long assignments will be retained AFTER ticket expiration
 	cfg.SetDefault("OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS", 600000) // DEPRECATED In milliseconds
 

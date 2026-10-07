@@ -68,10 +68,18 @@ func TestRead(t *testing.T) {
 		assert.IsType(t, 0, cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_MAX_UPDATES_PER_POLL"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_WAIT_TIMEOUT_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_FULL_POLL_WAIT_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_QUEUE_BUFFER_SIZE"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_FULL_APPLY_SLEEP_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_MAX_APPLY_DURATION_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_WAIT_TIMEOUT_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_QUEUE_BUFFER_SIZE"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_EXPIRATION_INTERVAL_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE"))
+		assert.IsType(t, 0, cfg.GetInt("OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_MMF_TIMEOUT_SECS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_REDIS_POOL_MAX_IDLE"))
@@ -79,9 +87,11 @@ func TestRead(t *testing.T) {
 		assert.IsType(t, 0, cfg.GetInt("REDISPORT"))
 		assert.IsType(t, 0, cfg.GetInt("PORT"))
 		assert.IsType(t, 0, cfg.GetInt("OM_GRPC_PORT"))
+		assert.IsType(t, 0, cfg.GetInt("OM_PROM_PORT"))
 
 		// Boolean type assertion
 		assert.IsType(t, false, cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT"))
+		assert.IsType(t, false, cfg.GetBool("OM_CACHE_PACK_TICKET_STATE_UPDATES"))
 		assert.IsType(t, false, cfg.GetBool("OM_VERBOSE"))
 
 		// Duration type assertion
