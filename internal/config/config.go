@@ -128,8 +128,9 @@ func Read() *viper.Viper {
 	// OUT vars refer to the cache sending its local updates out to be
 	// replicated to all other instances (i.e. writing to state storage)
 	cfg.SetDefault("OM_CACHE_IN_MAX_UPDATES_PER_POLL", 10000)            // In number of update operations
-	cfg.SetDefault("OM_CACHE_IN_WAIT_TIMEOUT_MS", 1500)                  // In milliseconds
-	cfg.SetDefault("OM_CACHE_IN_FULL_POLL_WAIT_MS", 500)                 // Guaranteed post-poll pause (in ms) after a full poll (len(results) >= OM_CACHE_IN_MAX_UPDATES_PER_POLL)
+	cfg.SetDefault("OM_CACHE_IN_WAIT_TIMEOUT_MS", 1500)                  // Maximum time (in ms) GetUpdates() blocks waiting for an update when the replication stream is empty (Redis XREAD BLOCK)
+	cfg.SetDefault("OM_CACHE_IN_POLL_WAIT_MS", 250)                      // Post-poll pause (in ms) after a non-empty partial poll (0 < len(results) < OM_CACHE_IN_MAX_UPDATES_PER_POLL) so trickling updates coalesce into batches
+	cfg.SetDefault("OM_CACHE_IN_FULL_POLL_WAIT_MS", 100)                 // Post-poll pause (in ms) after a full poll (len(results) >= OM_CACHE_IN_MAX_UPDATES_PER_POLL) to yield CPU while catching up
 	cfg.SetDefault("OM_CACHE_IN_QUEUE_BUFFER_SIZE", 20000)               // Buffer capacity for the incoming replication update channel
 	cfg.SetDefault("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 500) // In milliseconds
 	cfg.SetDefault("OM_CACHE_IN_FULL_APPLY_SLEEP_MS", 100)               // Guaranteed yield sleep (in ms) after an apply cycle force-stopped by OM_CACHE_IN_MAX_APPLY_DURATION_MS
@@ -159,15 +160,37 @@ func Read() *viper.Viper {
 	// Override default values with those from the environment variables of the same name.
 	cfg.AutomaticEnv()
 
+	positiveRequiredIntDefaults := []struct {
+		key string
+		def int
+	}{
+		{"OM_CACHE_EXPIRATION_INTERVAL_MS", 1000},
+		{"OM_CACHE_IN_MAX_APPLY_DURATION_MS", 500},
+		{"OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE", 5000},
+		{"OM_CACHE_IN_QUEUE_BUFFER_SIZE", 20000},
+		{"OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 500},
+		{"OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS", 60000},
+		{"OM_CACHE_IN_MAX_UPDATES_PER_POLL", 10000},
+		{"OM_MAX_STATE_UPDATES_PER_CALL", 500},
+	}
+	for _, item := range positiveRequiredIntDefaults {
+		if got := cfg.GetInt(item.key); got <= 0 {
+			cfgLogger.Warnf("%s must be > 0 (got %d); resetting to default %d", item.key, got, item.def)
+			cfg.Set(item.key, item.def)
+		}
+	}
+
 	return cfg
 }
+
+var cfgLogger = logrus.WithFields(logrus.Fields{
+	"app":       "open_match",
+	"component": "internal.config",
+})
 
 // LogConfig is a convenience function to output all config settings to the log.
 func LogConfig(cfg *viper.Viper) {
 	for key, value := range cfg.AllSettings() {
-		logrus.WithFields(logrus.Fields{
-			"app":       "open_match",
-			"component": "internal.config",
-		}).Debugf(" CONFIG %v: %v", key, value)
+		cfgLogger.Debugf(" CONFIG %v: %v", key, value)
 	}
 }

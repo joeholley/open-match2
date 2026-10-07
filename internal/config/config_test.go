@@ -68,6 +68,7 @@ func TestRead(t *testing.T) {
 		assert.IsType(t, 0, cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_MAX_UPDATES_PER_POLL"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_WAIT_TIMEOUT_MS"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_POLL_WAIT_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_FULL_POLL_WAIT_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_QUEUE_BUFFER_SIZE"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS"))
@@ -97,5 +98,27 @@ func TestRead(t *testing.T) {
 		// Duration type assertion
 		assert.IsType(t, time.Minute, cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT"))
 		assert.IsType(t, time.Minute, cfg.GetDuration("OM_REDIS_DIAL_MAX_BACKOFF_TIMEOUT"))
+	})
+
+	// Test Case 4: Non-positive values for positive-required integer keys reset to defaults
+	t.Run("non-positive integer keys reset to default", func(t *testing.T) {
+		expectedDefaults := map[string]int{
+			"OM_CACHE_EXPIRATION_INTERVAL_MS":           1000,
+			"OM_CACHE_IN_MAX_APPLY_DURATION_MS":         500,
+			"OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE": 5000,
+			"OM_CACHE_IN_QUEUE_BUFFER_SIZE":             20000,
+			"OM_CACHE_OUT_QUEUE_BUFFER_SIZE":            500,
+			"OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS":   60000,
+			"OM_CACHE_IN_MAX_UPDATES_PER_POLL":          10000,
+			"OM_MAX_STATE_UPDATES_PER_CALL":             500,
+		}
+
+		for _, invalidVal := range []string{"0", "-5"} {
+			for key, def := range expectedDefaults {
+				t.Setenv(key, invalidVal)
+				cfg := Read()
+				assert.Equal(t, def, cfg.GetInt(key), "key %s with env=%s should reset to %d", key, invalidVal, def)
+			}
+		}
 	})
 }
