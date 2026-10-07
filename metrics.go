@@ -53,6 +53,9 @@ var (
 	otelPoolsPerProfile                                    otelmetrics.Int64Histogram
 	otelTicketSize                                         otelmetrics.Float64Histogram
 	otelMmfTicketDeactivations                             otelmetrics.Int64Counter
+	otelMmfPrepDuration                                    otelmetrics.Float64Histogram
+	otelMmfDeactivationWait                                otelmetrics.Float64Histogram
+	otelMmfDeactivationTimeouts                            otelmetrics.Int64Counter
 	otelMmfFailures                                        otelmetrics.Int64Counter
 	otelMatches                                            otelmetrics.Int64Counter
 	otelAssignmentWatches                                  otelmetrics.Int64UpDownCounter
@@ -146,9 +149,14 @@ func initializeOtelWithLocalProm() (*otelmetrics.Meter, func(context.Context) er
 
 	// Start the prometheus HTTP server and pass the exporter Collector to it
 	go func() {
-		otelLogger.Infof("serving metrics at localhost:2223/metrics")
-		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(":2223", nil) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
+		promPort := "2223"
+		if cfg != nil && cfg.GetString("OM_PROM_PORT") != "" {
+			promPort = cfg.GetString("OM_PROM_PORT")
+		}
+		otelLogger.Infof("serving metrics at localhost:%s/metrics", promPort)
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		err := http.ListenAndServe(":"+promPort, mux) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
 		if err != nil {
 			fmt.Printf("error serving http: %v", err)
 			return
@@ -294,6 +302,32 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	otelMmfTicketDeactivations, err = meter.Int64Counter(
 		metricsNamePrefix+"mmf.deactivations",
 		otelmetrics.WithDescription("Number of deactivations due to tickets being returned in matches by MMFs"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelMmfPrepDuration, err = meter.Float64Histogram(
+		metricsNamePrefix+"mmf.prep.duration",
+		otelmetrics.WithDescription("Time spent snapshotting active tickets, filtering pools, and chunking requests in InvokeMatchmakingFunctions before invoking MMFs"),
+		otelmetrics.WithUnit("ms"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelMmfDeactivationWait, err = meter.Float64Histogram(
+		metricsNamePrefix+"mmf.deactivation.wait",
+		otelmetrics.WithDescription("Time spent waiting for match ticket deactivations to replicate to the local cache"),
+		otelmetrics.WithUnit("ms"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelMmfDeactivationTimeouts, err = meter.Int64Counter(
+		metricsNamePrefix+"mmf.deactivation.timeouts",
+		otelmetrics.WithDescription("Number of times waiting for match ticket deactivations to replicate to the local cache timed out"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

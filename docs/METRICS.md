@@ -32,6 +32,9 @@ These metrics are defined in `metrics.go` and provide insights into the overall 
 | `om_core.profile.pools` | Number of pools in the profile provided to the InvokeMatchmakingFunctions() call. | count |
 | `om_core.mmf.failures` | Number of MMF failures. | count |
 | `om_core.mmf.deactivations` | Number of deactivations due to tickets being returned in matches by MMFs. | count |
+| `om_core.mmf.prep.duration` | Time spent snapshotting active tickets, filtering pools, and chunking requests in InvokeMatchmakingFunctions() before invoking MMFs. | ms |
+| `om_core.mmf.deactivation.wait` | Time spent waiting for match ticket deactivations to replicate to the local cache. | ms |
+| `om_core.mmf.deactivation.timeouts` | Number of times waiting for match ticket deactivations to replicate to the local cache timed out. | count |
 | `om_core.match.received` | Total matches received from MMFs. | count |
 
 ### **Cache Metrics**
@@ -51,6 +54,17 @@ These metrics are defined in `internal/statestore/cache/metrics.go` and provide 
 | `om_core.cache.ticket.inactive.expirations` | Number of inactive tickets expired per cache expiration cycle. | count |
 | `om_core.cache.outgoing.timeouts` | Number of times the outgoing replication queue waited OM\_CACHE\_OUT\_WAIT\_TIMEOUT\_MS and did not reach OM\_CACHE\_OUT\_MAX\_QUEUE\_THRESHOLD updates to send as a batch to the replicator. | count |
 | `om_core.cache.outgoing.maxqueuethresholdreached` | Number of times the outgoing replication queue saw OM\_CACHE\_OUT\_MAX\_QUEUE\_THRESHOLD updates in less than OM\_CACHE\_OUT\_WAIT\_TIMEOUT\_MS milliseconds. | count |
+| `om_core.cache.outgoing.queue.wait` | Time an outgoing replication update spends queued and being sent before returning a response. | ms |
+| `om_core.cache.outgoing.send.duration` | Duration of sending a batch of outgoing replication updates to state storage. | ms |
 | `om_core.cache.incoming.timeouts.empty` | Number of times the incoming replication queue saw no updates after waiting for OM\_CACHE\_IN\_WAIT\_TIMEOUT\_MS. | count |
-| `om_core.cache.incoming.timeouts.full` | Number of times the incoming replication queue couldn't process all pending updates in 500ms. | count |
+| `om_core.cache.incoming.timeouts.full` | Number of times the incoming replication queue couldn't process all pending updates in OM\_CACHE\_IN\_MAX\_APPLY\_DURATION\_MS. | count |
+| `om_core.cache.incoming.polls.full` | Number of times an incoming replication poll returned the maximum OM\_CACHE\_IN\_MAX\_UPDATES\_PER\_POLL updates. | count |
+| `om_core.cache.incoming.poll.duration` | Duration of polling state storage for incoming replication updates. | ms |
+| `om_core.cache.incoming.poll.wait` | Time spent waiting between incoming replication polls. | ms |
+| `om_core.cache.incoming.queue.wait` | Time the incoming poller spent pushing polled updates into the local replication channel. | ms |
+| `om_core.cache.incoming.apply.duration` | Time spent applying incoming replication updates to the local cache per cycle. | ms |
+| `om_core.cache.incoming.apply.sleep` | Time spent sleeping between incoming cache apply cycles. | ms |
+| `om_core.cache.replication.lag` | Time elapsed between when a state update is written to state storage and when it is applied to the local cache. | ms |
+| `om_core.cache.incoming.backlog` | Number of incoming replication updates buffered and waiting to be applied to the local cache. | count |
+| `om_core.cache.outgoing.backlog` | Number of outgoing replication updates queued and waiting to be sent to state storage. | count |
 
