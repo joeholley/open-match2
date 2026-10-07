@@ -17,12 +17,12 @@
 // https://redis.io/docs/latest/develop/data-types/streams/
 //
 // If you're thinking about updating how data is stored in Redis by editing this file:
-//   - All updates should be modelled as a single redis command that adds one item to the stream.
-//     Each addition to the stream gets its own entry ID from redis, meaning
-//     every update has a unique entry ID, which simplifies replication
-//     significantly.  Although putting multiple key/value pairs modelling
-//     multiple  updates into one stream addition is possible, it isn't
-//     accounted for in this design and shouldn't be used.
+//   - Each logical state update is added as a single Redis stream entry with
+//     its own Redis-assigned entry ID (`<ms>-<seq>`), which simplifies
+//     watermark tracking and replication. By default each entry holds a single
+//     `<cmd> <value>` pair; when `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`,
+//     homogeneous `activate` or `deactivate` batches may pack multiple
+//     `activate <id>` or `deactivate <id>` field-value pairs into one entry.
 //   - There is a memoryReplicator as well, that aims to reproduce this
 //     redisReplicator's behavior in local memory. If you change anything here,
 //     you'll likely need to update that file too.
@@ -387,20 +387,48 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 			redisArgs = append(redisArgs, update.Value)
 		case store.Activate:
 			// Validate input
-			if update.Key == "" {
-				out[i].Err = NoTicketKeyErr
-				continue
+			if len(update.Keys) > 0 {
+				for _, k := range update.Keys {
+					if k == "" {
+						logger.Warn("Skipping empty ticket key in packed activate update")
+						continue
+					}
+					redisArgs = append(redisArgs, "activate", k)
+				}
+				if len(redisArgs) <= 2 {
+					out[i].Err = NoTicketKeyErr
+					continue
+				}
+			} else {
+				if update.Key == "" {
+					out[i].Err = NoTicketKeyErr
+					continue
+				}
+				redisArgs = append(redisArgs, "activate")
+				redisArgs = append(redisArgs, update.Key)
 			}
-			redisArgs = append(redisArgs, "activate")
-			redisArgs = append(redisArgs, update.Key)
 		case store.Deactivate:
 			// Validate input
-			if update.Key == "" {
-				out[i].Err = NoTicketKeyErr
-				continue
+			if len(update.Keys) > 0 {
+				for _, k := range update.Keys {
+					if k == "" {
+						logger.Warn("Skipping empty ticket key in packed deactivate update")
+						continue
+					}
+					redisArgs = append(redisArgs, "deactivate", k)
+				}
+				if len(redisArgs) <= 2 {
+					out[i].Err = NoTicketKeyErr
+					continue
+				}
+			} else {
+				if update.Key == "" {
+					out[i].Err = NoTicketKeyErr
+					continue
+				}
+				redisArgs = append(redisArgs, "deactivate")
+				redisArgs = append(redisArgs, update.Key)
 			}
-			redisArgs = append(redisArgs, "deactivate")
-			redisArgs = append(redisArgs, update.Key)
 		case store.Assign:
 			// TODO: decide if we want multiple assignments in one redis record
 			// Right now, each entry in the Redis stream only holds one
@@ -441,10 +469,14 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	}
 
 	// Append one additional command to the pipeline to remove expired entries.
+	// Use approximate trimming ("~") so Redis can evict whole radix-tree macro
+	// nodes in O(1) instead of scanning and rewriting partial nodes on every
+	// write batch; om-core enforces exact per-ticket TTLs locally via its
+	// expiration min-heaps.
 	expirationThresh := strconv.FormatInt(time.Now().UnixMilli()-rr.cfg.GetInt64("OM_CACHE_TICKET_TTL_MS"), 10)
-	redisCmdWithArgs := fmt.Sprintf("XTRIM om-replication MINID %v", expirationThresh)
+	redisCmdWithArgs := fmt.Sprintf("XTRIM om-replication MINID ~ %v", expirationThresh)
 	logger.Debug(redisCmdWithArgs)
-	err = rConn.Send("XTRIM", "om-replication", "MINID", expirationThresh)
+	err = rConn.Send("XTRIM", "om-replication", "MINID", "~", expirationThresh)
 	if err != nil {
 		logger.WithFields(logrus.Fields{
 			"redis_command": redisCmdWithArgs,
@@ -458,16 +490,44 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	}
 
 	// Make sure we have results before we parse them.
+	// On any error, StateResponse.Result carries the failing update's primary
+	// ticket key (via PrimaryKey) so callers can identify which ticket failed.
 	if r == nil {
 		logger.Error("Redis returned empty results from update!")
+		batchErr := err
+		if batchErr == nil {
+			batchErr = errors.New("Redis returned empty results from update")
+		}
+		for i := range out {
+			out[i].Result = updates[i].PrimaryKey()
+			if out[i].Err == nil {
+				out[i].Err = batchErr
+			}
+		}
+		return out
+	}
+
+	rSlice, ok := r.([]interface{})
+	if !ok || len(rSlice) == 0 {
+		batchErr := err
+		if batchErr == nil {
+			batchErr = errors.New("Redis returned unexpected result format from update")
+		}
+		logger.Errorf("Redis returned unexpected result format from update: %v", batchErr)
+		for i := range out {
+			out[i].Result = updates[i].PrimaryKey()
+			if out[i].Err == nil {
+				out[i].Err = batchErr
+			}
+		}
 		return out
 	}
 
 	// The last result from Redis is a count of number of entries we removed with the XTRIM command.
 	// Can be useful when debugging, so log it.
-	expiredCount, err := redis.Int64(r.([]interface{})[len(r.([]interface{}))-1], err)
-	if err != nil {
-		logger.Errorf("Redis output int64 conversion error: %v", err)
+	expiredCount, convErr := redis.Int64(rSlice[len(rSlice)-1], err)
+	if convErr != nil {
+		logger.Errorf("Redis output int64 conversion error: %v", convErr)
 	}
 	if expiredCount > 0 {
 		logger.WithFields(logrus.Fields{
@@ -477,7 +537,11 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	}
 
 	// Process all other Redis results into the return output array.
-	for index := 0; index < len(r.([]interface{}))-1; index++ {
+	// Track sentIdx separately from index because updates that failed input
+	// validation (out[index].Err != nil) were never sent via rConn.Send and
+	// therefore have no corresponding entry in rSlice.
+	sentIdx := 0
+	for index := 0; index < len(updates); index++ {
 
 		// First, make sure the update parsing didn't find any issues.  If
 		// parsing the update generated an error, then the update didn't
@@ -488,17 +552,18 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 			}).Error("an update could not be parsed and was skipped")
 
 			// There is no Redis result to return, so return the update parsing error
-			// and the key that generated the error.
-			out[index].Result = updates[index].Key
+			// and the primary ticket key that generated the error.
+			out[index].Result = updates[index].PrimaryKey()
 
-		} else {
+		} else if sentIdx < len(rSlice)-1 {
 			// The update was valid and sent to Redis. Try to convert the
 			// Redis response to a string.
-			t, err := redis.String(r.([]interface{})[index], err)
+			t, err := redis.String(rSlice[sentIdx], err)
+			sentIdx++
 			if err != nil {
 				// Error, the redis result isn't a string (meaning it caused some issue).
-				// Return the error code, and the result is the key that generated the error.
-				t = updates[index].Key
+				// Return the error code, and set Result to the ticket key that failed.
+				t = updates[index].PrimaryKey()
 				out[index].Err = fmt.Errorf("Redis output string conversion error: %w", err)
 				logger.WithFields(logrus.Fields{
 					"err":    err,
@@ -512,6 +577,14 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 				"result": t,
 			}).Tracef("Redis successfully processed update")
 			out[index].Result = t
+		} else {
+			sentIdx++
+			out[index].Result = updates[index].PrimaryKey()
+			if err != nil {
+				out[index].Err = err
+			} else {
+				out[index].Err = errors.New("missing Redis response for update")
+			}
 		}
 	}
 
@@ -563,28 +636,51 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 	// Redigo module returns nil for the data if it reaches the timeout (BLOCK
 	// Xms) without seeing any updates. In that case, just return gracefully.
 	if data != nil {
-		switch data.(type) {
+		switch streams := data.(type) {
 		case redis.Error:
-			logger.Errorf("Redis error: %v", data.(redis.Error))
+			logger.Errorf("Redis error: %v", streams)
 		case []interface{}:
 			// the data is down a couple of nested array levels in the response:
 			// https://redis.io/docs/latest/develop/data-types/streams/#listening-for-new-items-with-xread
-			replStream := data.([]interface{})[0].([]interface{})[1].([]interface{})
+			if len(streams) == 0 {
+				logger.Error("Redis XREAD returned empty streams slice")
+				return out
+			}
+			streamEntry, ok := streams[0].([]interface{})
+			if !ok || len(streamEntry) < 2 {
+				logger.Error("Redis XREAD returned malformed stream entry")
+				return out
+			}
+			replStream, ok := streamEntry[1].([]interface{})
+			if !ok {
+				logger.Error("Redis XREAD returned malformed replication stream")
+				return out
+			}
 			for _, v := range replStream {
+				entry, ok := v.([]interface{})
+				if !ok || len(entry) < 2 {
+					logger.Error("Redis XREAD returned malformed stream item")
+					continue
+				}
 				// Element 0 is the redis stream entry ID, which we use as the replication ID.
-				replId, err := redis.String(v.([]interface{})[0], nil)
+				replId, err := redis.String(entry[0], nil)
 				if err != nil {
 					logger.Error(err)
 				}
-				thisUpdate := &store.StateUpdate{}
+				thisUpdate := &store.StateUpdate{
+					ReplId: replId,
+				}
 
-				// Element 1 is the actual data in the stream entry.
-				// Our implementation assumes only one update is stored at each
-				// stream entry (Redis allows multiple, but our implementation
-				// does not)
-				y, err := redis.Strings(v.([]interface{})[1], nil)
+				// Element 1 is the field/value array in the stream entry
+				// (either a single `<cmd> <value>` pair, or repeated
+				// `activate <id>` / `deactivate <id>` pairs when packed).
+				y, err := redis.Strings(entry[1], nil)
 				if err != nil {
 					logger.Error(err)
+				}
+				if len(y) < 2 {
+					logger.Error("Redis XREAD stream item missing key/value fields")
+					continue
 				}
 
 				// Update type/key/value data
@@ -595,14 +691,36 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 					thisUpdate.Value = y[1] // Only argument for a ticket is the ticket PB
 				case "activate":
 					thisUpdate.Cmd = store.Activate
-					thisUpdate.Key = y[1] // Only argument for a ticket activation is the ticket's ID
+					thisUpdate.Key = y[1] // Ticket ID (or first ticket ID when packed)
+					if len(y) > 2 {
+						keys := make([]string, 0, len(y)/2)
+						for idx := 0; idx+1 < len(y); idx += 2 {
+							keys = append(keys, y[idx+1])
+						}
+						thisUpdate.Keys = keys
+					}
 				case "deactivate":
 					thisUpdate.Cmd = store.Deactivate
-					thisUpdate.Key = y[1] // Only argument for a ticket deactivation is the ticket's ID
+					thisUpdate.Key = y[1] // Ticket ID (or first ticket ID when packed)
+					if len(y) > 2 {
+						keys := make([]string, 0, len(y)/2)
+						for idx := 0; idx+1 < len(y); idx += 2 {
+							keys = append(keys, y[idx+1])
+						}
+						thisUpdate.Keys = keys
+					}
 				case "assign":
+					if len(y) < 4 {
+						logger.Error("Redis XREAD assign item missing connection field")
+						continue
+					}
 					thisUpdate.Cmd = store.Assign
 					thisUpdate.Key = y[1]   // ticket's ID
 					thisUpdate.Value = y[3] // assignment
+				default:
+					logger.Errorf("Redis XREAD stream item had unknown command %q", y[0])
+					rr.replId = replId
+					continue
 				}
 
 				// Populated all the fields without an error

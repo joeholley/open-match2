@@ -13,7 +13,12 @@
 // limitations under the License.
 package store
 
-import "regexp"
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+)
 
 // An enum for the type of operations that the replication queue can process.
 const (
@@ -25,9 +30,98 @@ const (
 
 // Every change to the state of the tickets in om-core is modelled as a StateUpdate.
 type StateUpdate struct {
-	Cmd   int    // The operation this update contains
-	Key   string // The key to update
-	Value string // The value to associate with this key (if applicable)
+	Cmd    int      // The operation this update contains
+	Key    string   // The key to update (or first key when Keys is populated)
+	Keys   []string // Optional batch of keys for packed Activate/Deactivate updates
+	Value  string   // The value to associate with this key (if applicable)
+	ReplId string   // The replication ID assigned to this update by the state storage implementation
+}
+
+// PrimaryKey returns the primary ticket key identified by this update:
+//   - For single-ticket updates (or packed updates that already set Key), it returns u.Key.
+//   - For packed Activate/Deactivate updates where u.Key was left blank and ticket IDs
+//     were only provided in u.Keys, it returns the first non-empty element of u.Keys.
+//   - If u is nil or contains no non-empty ticket key, it returns "".
+//
+// This is primarily used when constructing an error StateResponse for a failed
+// StateUpdate: StateResponse.Result is overloaded to carry the newly assigned
+// replication ID on success (Err == nil), but on failure (Err != nil) it carries
+// the ticket key of the StateUpdate that failed so callers of batched SendUpdates
+// can attribute the error to the originating ticket.
+func (u *StateUpdate) PrimaryKey() string {
+	if u == nil {
+		return ""
+	}
+	if u.Key != "" {
+		return u.Key
+	}
+	for _, k := range u.Keys {
+		if k != "" {
+			return k
+		}
+	}
+	return ""
+}
+
+// ParseReplIdTimestampMs extracts the millisecond timestamp from a replication ID
+// formatted as "<timestamp_ms>-<seq>".
+func ParseReplIdTimestampMs(replId string) (int64, error) {
+	parts := strings.Split(replId, "-")
+	if len(parts) == 0 || parts[0] == "" {
+		return 0, fmt.Errorf("invalid replication ID %q", replId)
+	}
+	ts, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid replication ID %q: %w", replId, err)
+	}
+	return ts, nil
+}
+
+func parseReplId(replId string) (int64, int64, bool) {
+	parts := strings.Split(replId, "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	ts, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	seq, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return ts, seq, true
+}
+
+// CompareReplIds compares two replication IDs formatted as "<timestamp_ms>-<seq>" numerically.
+func CompareReplIds(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if a == "" {
+		return -1
+	}
+	if b == "" {
+		return 1
+	}
+	tsA, seqA, okA := parseReplId(a)
+	tsB, seqB, okB := parseReplId(b)
+	if !okA || !okB {
+		return strings.Compare(a, b)
+	}
+	if tsA < tsB {
+		return -1
+	}
+	if tsA > tsB {
+		return 1
+	}
+	if seqA < seqB {
+		return -1
+	}
+	if seqA > seqB {
+		return 1
+	}
+	return 0
 }
 
 // Results of changes to the state of the cache. State replication batches
@@ -39,12 +133,12 @@ type StateUpdate struct {
 // layer. It may also used in internal implementations to track which updates
 // have been applied to the local replicated ticket cache.
 //
-// If err is nil, result contains the replication id assigned to the update by the
-// state storage implementation (in redis, this will be a stream event ID, for
-// example).
-//
-// If err is not nil, result contains the key of the StateUpdate that failed,
-// used by the calling function to track what requests caused errors.
+// Note that the Result field is overloaded depending on whether Err is nil:
+//   - If Err is nil, Result contains the replication ID assigned to the update
+//     by the state storage implementation (e.g., a Redis stream entry ID).
+//   - If Err is not nil, Result contains the primary ticket key of the
+//     StateUpdate that failed (via StateUpdate.PrimaryKey), used by the calling
+//     function to identify which ticket request caused the error.
 type StateResponse struct {
 	Result string
 	Err    error
