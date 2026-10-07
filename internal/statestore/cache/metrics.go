@@ -219,7 +219,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelCacheIncomingPollWait, err = meter.Float64Histogram(
 		metricsNamePrefix+"incoming.poll.wait",
-		otelmetrics.WithDescription("Time spent waiting between incoming replication polls"),
+		otelmetrics.WithDescription("Post-poll pause before the next incoming replication poll (OM_CACHE_IN_POLL_WAIT_MS after a partial poll, OM_CACHE_IN_FULL_POLL_WAIT_MS after a full poll, or any remaining OM_CACHE_IN_WAIT_TIMEOUT_MS if an empty poll returned early on error)"),
 		otelmetrics.WithUnit("ms"),
 	)
 	if err != nil {
@@ -246,7 +246,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelCacheIncomingApplySleep, err = meter.Float64Histogram(
 		metricsNamePrefix+"incoming.apply.sleep",
-		otelmetrics.WithDescription("Time spent sleeping between incoming cache apply cycles"),
+		otelmetrics.WithDescription("Time spent sleeping between incoming cache apply cycles (OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS after draining the queue, or OM_CACHE_IN_FULL_APPLY_SLEEP_MS after hitting OM_CACHE_IN_MAX_APPLY_DURATION_MS)"),
 		otelmetrics.WithUnit("ms"),
 	)
 	if err != nil {
@@ -279,7 +279,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 	}
 
 	// Each time metrics are sampled, get the latest counts of active/inactive
-	// tickets and assignments.
+	// tickets, assignments, and replication backlogs.
 	if _, err := meter.RegisterCallback(
 		func(ctx context.Context, o otelmetrics.Observer) error {
 			o.ObserveInt64(otelCacheActiveTickets, atomic.LoadInt64(&TicketCount)-atomic.LoadInt64(&InactiveCount))

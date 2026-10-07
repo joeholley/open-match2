@@ -60,10 +60,10 @@ These metrics are defined in `internal/statestore/cache/metrics.go` and provide 
 | `om_core.cache.incoming.timeouts.full` | Number of times the incoming replication queue couldn't process all pending updates in OM\_CACHE\_IN\_MAX\_APPLY\_DURATION\_MS. | count |
 | `om_core.cache.incoming.polls.full` | Number of times an incoming replication poll returned the maximum OM\_CACHE\_IN\_MAX\_UPDATES\_PER\_POLL updates. | count |
 | `om_core.cache.incoming.poll.duration` | Duration of polling state storage for incoming replication updates. | ms |
-| `om_core.cache.incoming.poll.wait` | Time spent waiting between incoming replication polls. | ms |
+| `om_core.cache.incoming.poll.wait` | Post-poll pause before the next incoming replication poll (OM\_CACHE\_IN\_POLL\_WAIT\_MS after a partial poll, OM\_CACHE\_IN\_FULL\_POLL\_WAIT\_MS after a full poll, or any remaining OM\_CACHE\_IN\_WAIT\_TIMEOUT\_MS if an empty poll returned early on error). | ms |
 | `om_core.cache.incoming.queue.wait` | Time the incoming poller spent pushing polled updates into the local replication channel. | ms |
 | `om_core.cache.incoming.apply.duration` | Time spent applying incoming replication updates to the local cache per cycle. | ms |
-| `om_core.cache.incoming.apply.sleep` | Time spent sleeping between incoming cache apply cycles. | ms |
+| `om_core.cache.incoming.apply.sleep` | Time spent sleeping between incoming cache apply cycles (OM\_CACHE\_IN\_SLEEP\_BETWEEN\_APPLYING\_UPDATES\_MS after draining the queue, or OM\_CACHE\_IN\_FULL\_APPLY\_SLEEP\_MS after hitting OM\_CACHE\_IN\_MAX\_APPLY\_DURATION\_MS). | ms |
 | `om_core.cache.replication.lag` | Time elapsed between when a state update is written to state storage and when it is applied to the local cache. | ms |
 | `om_core.cache.incoming.backlog` | Number of incoming replication updates buffered and waiting to be applied to the local cache. | count |
 | `om_core.cache.outgoing.backlog` | Number of outgoing replication updates queued and waiting to be sent to state storage. | count |

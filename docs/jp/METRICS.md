@@ -1,26 +1,26 @@
 ### **Open Match 2 テレメトリー**
 
-Open Match 2はOpenTelemetryを使用して、コアの操作、RPCコール、キャッシュのパフォーマンスに関する詳細なメトリクスを出力し、マッチメイキングプロセスに対する深い可視性を提供します 。
+Open Match 2はOpenTelemetryを使用して、コアの操作、RPCコール、キャッシュのパフォーマンスに関する詳細なメトリクスを出力し、マッチメイキングプロセスに対する深い可視性を提供します。
 
-このドキュメントでは、om-coreがインポートするgolangモジュールによって標準で提供される一部のメトリクス（rpcなど）については触れません 。
+このドキュメントでは、om-coreがインポートするgolangモジュールによって標準で提供される一部のメトリクス（rpcなど）については触れません。
 
-Open Match 2に対して記述するマッチメーカーからもOpenTelemetryを使用してテレメトリーを出力することを推奨します。マッチメーカーのテレメトリーの例については、[open-match-ecosystemリポジトリのサンプル](https://github.com/googleforgames/open-match-ecosystem/blob/main/v2/examples/METRICS-JP.md)を参照してください 。
+Open Match 2に対して記述するマッチメーカーからもOpenTelemetryを使用してテレメトリーを出力することを推奨します。マッチメーカーのテレメトリーの例については、[open-match-ecosystemリポジトリのサンプル](https://github.com/googleforgames/open-match-ecosystem/blob/main/v2/examples/METRICS-JP.md)を参照してください。
 
 #### **Open Match 2でOpenTelemetryを有効化および設定する方法**
 
-Open Match 2でOpenTelemetryを有効にするには、`OM_OTEL_SIDECAR`環境変数を`true`に設定する必要があります 。
+Open Match 2でOpenTelemetryを有効にするには、`OM_OTEL_SIDECAR`環境変数を`true`に設定する必要があります。
 
-デフォルトでは、Open MatchはローカルのOpenTelemetryサイドカーにメトリクスをエクスポートしようとします 。
+デフォルトでは、Open MatchはローカルのOpenTelemetryサイドカーにメトリクスをエクスポートしようとします。
 
-サイドカーなしで実行している場合（例えば、ローカル開発時）は、`OM_OTEL_SIDECAR`を`false`に設定できます 。
+サイドカーなしで実行している場合（例えば、ローカル開発時）は、`OM_OTEL_SIDECAR`を`false`に設定できます。
 
-適切な環境変数を設定することで、OpenTelemetryエクスポーターを設定できます 。
+適切な環境変数を設定することで、OpenTelemetryエクスポーターを設定できます。
 
-詳細については、OpenTelemetryのドキュメントを参照してください 。
+詳細については、OpenTelemetryのドキュメントを参照してください。
 
 #### **コアメトリクス**
 
-これらのメトリクスは`metrics.go`で定義されており、Open Matchサービスの全体的な健全性とパフォーマンスに関する洞察を提供します 。
+これらのメトリクスは`metrics.go`で定義されており、Open Matchサービスの全体的な健全性とパフォーマンスに関する洞察を提供します。
 
 | メトリクス名 | 説明 | 単位 |
 | ----- | ----- | ----- |
@@ -47,7 +47,7 @@ Open Match 2でOpenTelemetryを有効にするには、`OM_OTEL_SIDECAR`環境�
 
 #### **キャッシュメトリクス**
 
-これらのメトリクスは`internal/statestore/cache/metrics.go`で定義されており、レプリケートされたチケットキャッシュのパフォーマンスに関する洞察を提供します 。
+これらのメトリクスは`internal/statestore/cache/metrics.go`で定義されており、レプリケートされたチケットキャッシュのパフォーマンスに関する洞察を提供します。
 
 | メトリクス名 | 説明 | 単位 |
 | ----- | ----- | ----- |
@@ -68,10 +68,10 @@ Open Match 2でOpenTelemetryを有効にするには、`OM_OTEL_SIDECAR`環境�
 | `om_core.cache.incoming.timeouts.full` | 受信レプリケーションキューが`OM_CACHE_IN_MAX_APPLY_DURATION_MS`以内に保留中のすべての更新を処理できなかった回数。 | count |
 | `om_core.cache.incoming.polls.full` | 受信レプリケーションのポーリングが最大値`OM_CACHE_IN_MAX_UPDATES_PER_POLL`の更新数を返した回数。 | count |
 | `om_core.cache.incoming.poll.duration` | 状態ストレージから受信レプリケーション更新をポーリングするのに要した時間。 | ms |
-| `om_core.cache.incoming.poll.wait` | 受信レプリケーションのポーリング間に待機した時間。 | ms |
+| `om_core.cache.incoming.poll.wait` | 次の受信レプリケーションポーリングまでのポーリング後待機時間（部分ポーリング後の`OM_CACHE_IN_POLL_WAIT_MS`、フルポーリング後の`OM_CACHE_IN_FULL_POLL_WAIT_MS`、または空のポーリングがエラー等で早期に返った場合の残りの`OM_CACHE_IN_WAIT_TIMEOUT_MS`）。 | ms |
 | `om_core.cache.incoming.queue.wait` | 受信ポーラーが取得した更新をローカルレプリケーションチャネルにプッシュするのに要した時間。 | ms |
 | `om_core.cache.incoming.apply.duration` | 各サイクルで受信レプリケーション更新をローカルキャッシュに適用するのに費やした時間。 | ms |
-| `om_core.cache.incoming.apply.sleep` | 受信キャッシュ適用サイクルの間にスリープした時間。 | ms |
+| `om_core.cache.incoming.apply.sleep` | 受信キャッシュ適用サイクルの間にスリープした時間（キューを空にした後の`OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS`、または`OM_CACHE_IN_MAX_APPLY_DURATION_MS`に達した後の`OM_CACHE_IN_FULL_APPLY_SLEEP_MS`）。 | ms |
 | `om_core.cache.replication.lag` | 状態更新が状態ストレージに書き込まれてからローカルキャッシュに適用されるまでの経過時間。 | ms |
 | `om_core.cache.incoming.backlog` | バッファリングされ、ローカルキャッシュへの適用を待機している受信レプリケーション更新の数。 | count |
 | `om_core.cache.outgoing.backlog` | キューに入れられ、状態ストレージへの送信を待機している送信レプリケーション更新の数。 | count |
