@@ -12,7 +12,7 @@ Our target development environment is the default Cloud Shell you get by clickin
 The Open Match maintainers build `core` [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds).  A typical build goes something like this, with the repo cloned,  `gcloud` initialized, and an existing [Docker Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images) called `open-match`:
 ```
 # Update the dependencies to the latest versions and kick off a Cloud Build
-go get -u && go mod tidy && gcloud builds submit --async --pack \
+go get -u -t ./... && go mod tidy && go vet ./... && go test -race ./... && gcloud builds submit --async --pack \
 image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match/om-core
 ```
 There is no `cloudbuild.yaml` or `Dockerfile` required for this. [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) takes care of everything.
@@ -31,7 +31,7 @@ Step #1: [builder] 2025/08/27 06:00:39 [DEBUG] GET https://go.dev/dl/?mode=json
 Step #1: [builder] ***** CACHE MISS: "go"
 Step #1: [builder] Installing Go v1.24.6.
 ``` 
-use the lower of these two versions in the `go.mod` files in Open Match 2 related projects (`go mod edit -go=<VERSION>`). This is to ensure that users following the instructions to build in their own projects can do their own builds using the default Cloud Shell environment and the latest Google Cloud buildpacks.
+use the lower of these two versions (typically it is the one used in the pack builder that is older) in the `go.mod` files in Open Match 2 related projects using `go mod edit -go=<VERSION>`. This is to ensure that users following the instructions to build in their own projects can do their own builds using the default Cloud Shell environment and the latest Google Cloud buildpacks.
 * After verifying that the build works with the latest dependencies, commit any changes to `go.mod` to the repo. 
 
 ## Deploy
