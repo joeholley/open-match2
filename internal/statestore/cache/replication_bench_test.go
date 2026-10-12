@@ -240,7 +240,7 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 			cfg.Set("OM_CACHE_IN_MAX_UPDATES_PER_POLL", 10000)
 			cfg.Set("OM_CACHE_IN_QUEUE_BUFFER_SIZE", 20000)
 			cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 3600000)
-			cfg.Set("OM_MAX_STATE_UPDATES_PER_CALL", 1000)
+			cfg.Set("OM_CACHE_OUT_MAX_PACKED_KEYS", 1000)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -359,7 +359,7 @@ func TestSyntheticBurstReplication(t *testing.T) {
 				cfg.Set("OM_CACHE_IN_QUEUE_BUFFER_SIZE", 10000)
 				cfg.Set("OM_CACHE_TICKET_TTL_MS", 600000)
 				cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 60000)
-				cfg.Set("OM_MAX_STATE_UPDATES_PER_CALL", 1000)
+				cfg.Set("OM_CACHE_OUT_MAX_PACKED_KEYS", 1000)
 
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()

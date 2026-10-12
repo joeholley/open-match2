@@ -138,7 +138,8 @@ func Read() *viper.Viper {
 	cfg.SetDefault("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD", 50)               // In number of update operations
 	cfg.SetDefault("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 500)                  // In milliseconds
 	cfg.SetDefault("OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 500)                // Buffer capacity for the outgoing update request channel
-	cfg.SetDefault("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)          // Pack ticket activations/deactivations from a single call/match and coalesce contiguous same-command outgoing batch requests (up to OM_MAX_STATE_UPDATES_PER_CALL keys per stream entry)
+	cfg.SetDefault("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)          // Pack ticket activations/deactivations from a single call/match and coalesce contiguous same-command outgoing batch requests (up to OM_CACHE_OUT_MAX_PACKED_KEYS keys per stream entry)
+	cfg.SetDefault("OM_CACHE_OUT_MAX_PACKED_KEYS", 500)                  // Maximum number of ticket keys packed into a single outgoing Activate or Deactivate state update entry when OM_CACHE_PACK_TICKET_STATE_UPDATES is enabled
 	cfg.SetDefault("OM_CACHE_TICKET_TTL_MS", 600000)                     // In milliseconds
 	cfg.SetDefault("OM_CACHE_EXPIRATION_INTERVAL_MS", 1000)              // Interval (in ms) between local cache expiration scans
 	cfg.SetDefault("OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE", 5000)    // Maximum number of expired cache entries deleted per expiration cycle (processed in bounded chunks)
@@ -169,6 +170,7 @@ func Read() *viper.Viper {
 		{"OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE", 5000},
 		{"OM_CACHE_IN_QUEUE_BUFFER_SIZE", 20000},
 		{"OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 500},
+		{"OM_CACHE_OUT_MAX_PACKED_KEYS", 500},
 		{"OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS", 60000},
 		{"OM_CACHE_IN_MAX_UPDATES_PER_POLL", 10000},
 		{"OM_MAX_STATE_UPDATES_PER_CALL", 500},

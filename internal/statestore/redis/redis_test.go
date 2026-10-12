@@ -307,6 +307,7 @@ func TestSendUpdatesPackedSkipsEmptyKeys(t *testing.T) {
 	conn := &fakeRedisConn{
 		doResp: []interface{}{
 			[]byte("1700000000030-0"),
+			[]byte("1700000000031-0"),
 			int64(0),
 		},
 	}
@@ -314,6 +315,7 @@ func TestSendUpdatesPackedSkipsEmptyKeys(t *testing.T) {
 
 	updates := []*store.StateUpdate{
 		{
+			// 2 valid keys (even count): padded with trailing "" so XADD has an even number of field/value args.
 			Cmd:  store.Deactivate,
 			Keys: []string{"1700000000000-0", "", "1700000000000-2"},
 		},
@@ -321,24 +323,53 @@ func TestSendUpdatesPackedSkipsEmptyKeys(t *testing.T) {
 			Cmd:  store.Activate,
 			Keys: []string{"", ""},
 		},
+		{
+			// 3 valid keys (odd count): "activate" + 3 keys = 4 field/value tokens (no trailing "" needed).
+			Cmd:  store.Activate,
+			Keys: []string{"1700000000000-3", "1700000000000-4", "1700000000000-5"},
+		},
 	}
 
 	res := rr.SendUpdates(updates)
-	require.Len(t, res, 2)
+	require.Len(t, res, 3)
 
-	// First packed update succeeds with the 2 non-empty keys; second fails with NoTicketKeyErr.
+	// First and third packed updates succeed; second fails with NoTicketKeyErr.
 	assert.NoError(t, res[0].Err)
 	assert.Equal(t, "1700000000030-0", res[0].Result)
 	assert.ErrorIs(t, res[1].Err, NoTicketKeyErr)
+	assert.NoError(t, res[2].Err)
+	assert.Equal(t, "1700000000031-0", res[2].Result)
 
-	// Verify XADD for update[0] has stream key + "*" + 2*(field, key) = 6 args.
-	require.Len(t, conn.sent, 2)
+	// Verify XADD for update[0] (even key count = 2) has stream key + "*" + "deactivate" + 2 keys + "" = 6 args.
+	require.Len(t, conn.sent, 3)
 	assert.Equal(t, "XADD", conn.sent[0].cmd)
 	require.Len(t, conn.sent[0].args, 6)
 	assert.Equal(t, "deactivate", conn.sent[0].args[2])
 	assert.Equal(t, "1700000000000-0", conn.sent[0].args[3])
-	assert.Equal(t, "deactivate", conn.sent[0].args[4])
-	assert.Equal(t, "1700000000000-2", conn.sent[0].args[5])
+	assert.Equal(t, "1700000000000-2", conn.sent[0].args[4])
+	assert.Equal(t, "", conn.sent[0].args[5])
+
+	// Verify XADD for update[2] (odd key count = 3) has stream key + "*" + "activate" + 3 keys = 6 args.
+	assert.Equal(t, "XADD", conn.sent[1].cmd)
+	require.Len(t, conn.sent[1].args, 6)
+	assert.Equal(t, "activate", conn.sent[1].args[2])
+	assert.Equal(t, "1700000000000-3", conn.sent[1].args[3])
+	assert.Equal(t, "1700000000000-4", conn.sent[1].args[4])
+	assert.Equal(t, "1700000000000-5", conn.sent[1].args[5])
+}
+
+func TestFormatRedisCmdForLog(t *testing.T) {
+	shortOddArgs := []interface{}{"om-replication", "*", "activate", "id1", "id2", "id3", "id4", "id5"}
+	assert.Equal(t, "XADD om-replication * activate id1 id2 id3 id4 id5", formatRedisCmdForLog("XADD", shortOddArgs))
+
+	shortEvenPaddedArgs := []interface{}{"om-replication", "*", "activate", "id1", "id2", "id3", "id4", ""}
+	assert.Equal(t, "XADD om-replication * activate id1 id2 id3 id4", formatRedisCmdForLog("XADD", shortEvenPaddedArgs))
+
+	longArgs := []interface{}{"om-replication", "*", "activate", "id1", "id2", "id3", "id4", "id5", "id6", "id7"}
+	assert.Equal(t, "XADD om-replication * activate id1 id2 id3 id4 id5 ...", formatRedisCmdForLog("XADD", longArgs))
+
+	ticketArgs := []interface{}{"om-replication", "*", "ticket", "raw-protobuf-binary-payload"}
+	assert.Equal(t, "XADD om-replication * ticket <27 bytes>", formatRedisCmdForLog("XADD", ticketArgs))
 }
 
 func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
@@ -353,7 +384,7 @@ func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
 						[]byte("1700000000100-0"),
 						[]interface{}{
 							[]byte("deactivate"), []byte("1700000000001-0"),
-							[]byte("deactivate"), []byte("1700000000002-0"),
+							[]byte("1700000000002-0"), []byte(""),
 						},
 					},
 					[]interface{}{
@@ -506,16 +537,22 @@ func TestReplicatorConformance(t *testing.T) {
 						Keys:  []string{"", "1700000000001-0"},
 						Value: "ignored-val",
 					},
+					{
+						Cmd:   store.Activate,
+						Key:   "ignored-key",
+						Keys:  []string{"1700000000003-0", "1700000000004-0", "1700000000005-0"},
+						Value: "ignored-val",
+					},
 				}
 
 				res := rep.SendUpdates(updates)
-				require.Len(t, res, 4)
+				require.Len(t, res, 5)
 				for i := range res {
 					require.NoError(t, res[i].Err)
 				}
 
 				got := rep.GetUpdates()
-				require.Len(t, got, 4)
+				require.Len(t, got, 5)
 
 				assert.Equal(t, store.Activate, got[0].Cmd)
 				assert.Equal(t, "1700000000001-0", got[0].Key)
@@ -540,6 +577,12 @@ func TestReplicatorConformance(t *testing.T) {
 				assert.Nil(t, got[3].Keys)
 				assert.Equal(t, "", got[3].Value)
 				assert.Equal(t, res[3].Result, got[3].ReplId)
+
+				assert.Equal(t, store.Activate, got[4].Cmd)
+				assert.Equal(t, "1700000000003-0", got[4].Key)
+				assert.Equal(t, []string{"1700000000003-0", "1700000000004-0", "1700000000005-0"}, got[4].Keys)
+				assert.Equal(t, "", got[4].Value)
+				assert.Equal(t, res[4].Result, got[4].ReplId)
 			})
 
 			t.Run("AssignRoundTrip", func(t *testing.T) {

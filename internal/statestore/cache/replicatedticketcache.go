@@ -305,8 +305,8 @@ func (tc *ReplicatedTicketCache) OutgoingReplicationQueue(ctx context.Context) {
 				"batch_update_count": len(pipelineRequests),
 			}).Trace("sending state update batch to replicator")
 
-			if tc.Cfg.GetBool("OM_CACHE_PACK_TICKET_STATE_UPDATES") && len(pipelineRequests) > 1 {
-				maxKeysPerUpdate := tc.Cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL")
+			if tc.Cfg.GetBool("OM_CACHE_PACK_TICKET_STATE_UPDATES") && (len(pipelineRequests) > 1 || len(pipelineRequests[0].Update.Keys) > 1) {
+				maxKeysPerUpdate := tc.Cfg.GetInt("OM_CACHE_OUT_MAX_PACKED_KEYS")
 				packedPipeline, requestGroups := mergeRequestsToUpdates(pipelineRequests, maxKeysPerUpdate)
 				otelCacheOutgoingUpdatesPerPoll.Record(ctx, int64(len(packedPipeline)))
 
@@ -409,9 +409,13 @@ func mergeRequestsToUpdates(pipelineRequests []*UpdateRequest, maxKeysPerUpdate 
 	for i, req := range pipelineRequests {
 		switch req.Update.Cmd {
 		case store.Activate, store.Deactivate:
-			var uniqueKeys []string
+			var (
+				uniqueKeys []string
+				seen       map[string]struct{}
+			)
 			if len(req.Update.Keys) > 0 {
-				seen := make(map[string]struct{}, len(req.Update.Keys))
+				seen = make(map[string]struct{}, len(req.Update.Keys))
+				uniqueKeys = make([]string, 0, len(req.Update.Keys))
 				for _, k := range req.Update.Keys {
 					if k == "" {
 						logger.Warn("Skipping empty ticket key in packed activate/deactivate update")
@@ -437,13 +441,13 @@ func mergeRequestsToUpdates(pipelineRequests []*UpdateRequest, maxKeysPerUpdate 
 			}
 
 			if activeUpdate != nil && activeUpdate.Cmd == req.Update.Cmd {
-				var newKeys []string
+				newKeys := make([]string, 0, len(uniqueKeys))
 				for _, k := range uniqueKeys {
 					if _, exists := activeKeySet[k]; !exists {
 						newKeys = append(newKeys, k)
 					}
 				}
-				if len(activeUpdate.Keys)+len(newKeys) <= maxKeysPerUpdate {
+				if len(newKeys) == 0 || len(activeUpdate.Keys)+len(newKeys) <= maxKeysPerUpdate {
 					for _, k := range newKeys {
 						activeKeySet[k] = struct{}{}
 						activeUpdate.Keys = append(activeUpdate.Keys, k)
@@ -455,16 +459,15 @@ func mergeRequestsToUpdates(pipelineRequests []*UpdateRequest, maxKeysPerUpdate 
 				}
 			}
 
-			activeKeySet = make(map[string]struct{}, len(uniqueKeys))
-			keysCopy := make([]string, len(uniqueKeys))
-			for idx, k := range uniqueKeys {
-				activeKeySet[k] = struct{}{}
-				keysCopy[idx] = k
+			if seen != nil {
+				activeKeySet = seen
+			} else {
+				activeKeySet = map[string]struct{}{uniqueKeys[0]: {}}
 			}
 			activeUpdate = &store.StateUpdate{
 				Cmd:  req.Update.Cmd,
-				Key:  keysCopy[0],
-				Keys: keysCopy,
+				Key:  uniqueKeys[0],
+				Keys: uniqueKeys,
 			}
 			packedPipeline = append(packedPipeline, activeUpdate)
 			requestGroups = append(requestGroups, []int{i})
@@ -531,11 +534,14 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 
 			// Put the updates into the replication channel to process.
 			queueStart := time.Now()
+			traceEnabled := logger.Logger.IsLevelEnabled(logrus.TraceLevel)
 			for _, curUpdate := range results {
-				logger.WithFields(logrus.Fields{
-					"update.key":     curUpdate.Key,
-					"update.command": curUpdate.Cmd,
-				}).Trace("queueing incoming update from state storage")
+				if traceEnabled {
+					logger.WithFields(logrus.Fields{
+						"update.key":     curUpdate.Key,
+						"update.command": curUpdate.Cmd,
+					}).Trace("queueing incoming update from state storage")
+				}
 				replStream <- *curUpdate
 			}
 			if len(results) > 0 {

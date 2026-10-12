@@ -62,3 +62,32 @@ func TestStateUpdatePrimaryKey(t *testing.T) {
 	assert.Equal(t, "k2", (&StateUpdate{Keys: []string{"", "k2", "k3"}}).PrimaryKey())
 	assert.Equal(t, "", (&StateUpdate{Keys: []string{"", ""}}).PrimaryKey())
 }
+
+func TestStateUpdateString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   StateUpdate
+		want string
+	}{
+		{
+			name: "short packed keys",
+			in:   StateUpdate{Cmd: Activate, Key: "k1", Keys: []string{"k1", "k2", "k3"}},
+			want: "{Cmd:1 Key:k1 Keys:[k1 k2 k3] Value: ReplId:}",
+		},
+		{
+			name: "truncated packed keys",
+			in:   StateUpdate{Cmd: Deactivate, Key: "k1", Keys: []string{"k1", "k2", "k3", "k4", "k5"}},
+			want: "{Cmd:2 Key:k1 Keys:[k1 k2 k3 ...] Value: ReplId:}",
+		},
+		{
+			name: "binary ticket value payload summarized",
+			in:   StateUpdate{Cmd: Ticket, Key: "1790307871351-0", Value: "raw-protobuf-binary-payload"},
+			want: "{Cmd:0 Key:1790307871351-0 Keys: Value:<27 bytes> ReplId:}",
+		},
+	}
+	for _, tc := range tests {
+		assert.Equal(t, tc.want, tc.in.String(), tc.name)
+	}
+}

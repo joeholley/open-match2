@@ -63,6 +63,27 @@ func (u *StateUpdate) PrimaryKey() string {
 	return ""
 }
 
+const maxLoggedUpdateKeys = 3
+
+// String returns a concise representation of a StateUpdate that truncates
+// packed Keys after the first 3 entries and summarizes binary Value payloads so
+// logging a StateUpdate never dumps hundreds of ticket IDs or raw protobuf bytes.
+func (u StateUpdate) String() string {
+	var keysStr string
+	if len(u.Keys) > maxLoggedUpdateKeys {
+		keysStr = fmt.Sprintf("[%s ...]", strings.Join(u.Keys[:maxLoggedUpdateKeys], " "))
+	} else if len(u.Keys) > 0 {
+		keysStr = fmt.Sprintf("[%s]", strings.Join(u.Keys, " "))
+	}
+
+	valStr := u.Value
+	if u.Cmd == Ticket && len(u.Value) > 0 {
+		valStr = fmt.Sprintf("<%d bytes>", len(u.Value))
+	}
+
+	return fmt.Sprintf("{Cmd:%d Key:%s Keys:%s Value:%s ReplId:%s}", u.Cmd, u.Key, keysStr, valStr, u.ReplId)
+}
+
 // ParseReplIdTimestampMs extracts the millisecond timestamp from a replication ID
 // formatted as "<timestamp_ms>-<seq>".
 func ParseReplIdTimestampMs(replId string) (int64, error) {

@@ -115,10 +115,10 @@ curl -s -X POST "${OM_CORE_URL}/tickets" \
 ### Run Unit, Integration, and Cache Stress Tests
 
 ```bash
-# Fast hermetic unit & race tests (no Docker or Redis required):
-go test -race ./internal/...
+# Fast hermetic unit & race tests across all packages (skips Redis container in main_test.go):
+OM_SKIP_REDIS_TESTS=true go test -race ./...
 
-# Full test suite including main_test.go (requires Docker for testcontainers Redis or local Redis on :6379):
+# Full test suite including Redis integration in main_test.go (requires Docker for testcontainers Redis or local Redis on :6379):
 go test ./...
 
 # Synthetic burst replication & mass-expiration stress test:

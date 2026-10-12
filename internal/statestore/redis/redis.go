@@ -21,8 +21,10 @@
 //     its own Redis-assigned entry ID (`<ms>-<seq>`), which simplifies
 //     watermark tracking and replication. By default each entry holds a single
 //     `<cmd> <value>` pair; when `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`,
-//     homogeneous `activate` or `deactivate` batches may pack multiple
-//     `activate <id>` or `deactivate <id>` field-value pairs into one entry.
+//     homogeneous `activate` or `deactivate` batches pack the command name in
+//     the first field (`activate <id1>` or `deactivate <id1>`) and pack
+//     subsequent ticket IDs across both field and value positions (padded with
+//     a trailing `""` value when the ticket count is even).
 //   - There is a memoryReplicator as well, that aims to reproduce this
 //     redisReplicator's behavior in local memory. If you change anything here,
 //     you'll likely need to update that file too.
@@ -372,10 +374,10 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	// Process all the requested redis commands
 	// If a command cannot be constructed because the update is invalid, add an
 	// error to the output for that update.
+	debugEnabled := logger.Logger.IsLevelEnabled(logrus.DebugLevel)
 	for i, update := range updates {
 		out[i] = &store.StateResponse{Result: "", Err: nil}
-		redisArgs := make([]interface{}, 0)
-		redisArgs = append(redisArgs, "om-replication", "*")
+		var redisArgs []interface{}
 		switch update.Cmd {
 		case store.Ticket:
 			// Validate input
@@ -383,51 +385,42 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 				out[i].Err = NoTicketDataErr
 				continue
 			}
-			redisArgs = append(redisArgs, "ticket")
-			redisArgs = append(redisArgs, update.Value)
-		case store.Activate:
-			// Validate input
-			if len(update.Keys) > 0 {
-				for _, k := range update.Keys {
-					if k == "" {
-						logger.Warn("Skipping empty ticket key in packed activate update")
-						continue
-					}
-					redisArgs = append(redisArgs, "activate", k)
-				}
-				if len(redisArgs) <= 2 {
-					out[i].Err = NoTicketKeyErr
-					continue
-				}
-			} else {
-				if update.Key == "" {
-					out[i].Err = NoTicketKeyErr
-					continue
-				}
-				redisArgs = append(redisArgs, "activate")
-				redisArgs = append(redisArgs, update.Key)
+			redisArgs = []interface{}{"om-replication", "*", "ticket", update.Value}
+		case store.Activate, store.Deactivate:
+			cmdName := "activate"
+			if update.Cmd == store.Deactivate {
+				cmdName = "deactivate"
 			}
-		case store.Deactivate:
 			// Validate input
 			if len(update.Keys) > 0 {
+				capArgs := 3 + len(update.Keys)
+				if capArgs%2 != 0 {
+					capArgs++
+				}
+				redisArgs = make([]interface{}, 0, capArgs)
+				redisArgs = append(redisArgs, "om-replication", "*", cmdName)
 				for _, k := range update.Keys {
 					if k == "" {
-						logger.Warn("Skipping empty ticket key in packed deactivate update")
+						logger.Warnf("Skipping empty ticket key in packed %s update", cmdName)
 						continue
 					}
-					redisArgs = append(redisArgs, "deactivate", k)
+					redisArgs = append(redisArgs, k)
 				}
-				if len(redisArgs) <= 2 {
+				if len(redisArgs) <= 3 {
 					out[i].Err = NoTicketKeyErr
 					continue
+				}
+				// XADD requires field/value pairs after "<stream> *"; pad with an
+				// empty value when "<cmd>" + N keys has an odd token count.
+				if len(redisArgs)%2 != 0 {
+					redisArgs = append(redisArgs, "")
 				}
 			} else {
 				if update.Key == "" {
 					out[i].Err = NoTicketKeyErr
 					continue
 				}
-				redisArgs = append(redisArgs, "deactivate")
-				redisArgs = append(redisArgs, update.Key)
+				redisArgs = []interface{}{"om-replication", "*", cmdName, update.Key}
 			}
 		case store.Assign:
 			// TODO: decide if we want multiple assignments in one redis record
@@ -446,10 +439,7 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 				out[i].Err = NoAssignmentErr
 				continue
 			}
-			redisArgs = append(redisArgs, "assign")
-			redisArgs = append(redisArgs, update.Key)
-			redisArgs = append(redisArgs, "connection")
-			redisArgs = append(redisArgs, update.Value)
+			redisArgs = []interface{}{"om-replication", "*", "assign", update.Key, "connection", update.Value}
 		default:
 			// Something has gone seriously wrong
 			out[i].Err = InvalidInputErr
@@ -458,12 +448,13 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 
 		// The update was validated and the redis command successfully constructed.
 		// Send command to redis.
-		redisCmdWithArgs := fmt.Sprintf("%v %v", redisCmd, strings.Trim(fmt.Sprint(redisArgs), "[]"))
-		logger.Debug(redisCmdWithArgs)
+		if debugEnabled {
+			logger.Debug(formatRedisCmdForLog(redisCmd, redisArgs))
+		}
 		err = rConn.Send(redisCmd, redisArgs...)
 		if err != nil {
 			logger.WithFields(logrus.Fields{
-				"redis_command": redisCmdWithArgs,
+				"redis_command": formatRedisCmdForLog(redisCmd, redisArgs),
 			}).Errorf("Redis error: %v", err)
 		}
 	}
@@ -474,12 +465,13 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	// write batch; om-core enforces exact per-ticket TTLs locally via its
 	// expiration min-heaps.
 	expirationThresh := strconv.FormatInt(time.Now().UnixMilli()-rr.cfg.GetInt64("OM_CACHE_TICKET_TTL_MS"), 10)
-	redisCmdWithArgs := fmt.Sprintf("XTRIM om-replication MINID ~ %v", expirationThresh)
-	logger.Debug(redisCmdWithArgs)
+	if debugEnabled {
+		logger.Debugf("XTRIM om-replication MINID ~ %v", expirationThresh)
+	}
 	err = rConn.Send("XTRIM", "om-replication", "MINID", "~", expirationThresh)
 	if err != nil {
 		logger.WithFields(logrus.Fields{
-			"redis_command": redisCmdWithArgs,
+			"redis_command": fmt.Sprintf("XTRIM om-replication MINID ~ %v", expirationThresh),
 		}).Errorf("Redis error: %v", err)
 	}
 
@@ -540,6 +532,7 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	// Track sentIdx separately from index because updates that failed input
 	// validation (out[index].Err != nil) were never sent via rConn.Send and
 	// therefore have no corresponding entry in rSlice.
+	traceEnabled := logger.Logger.IsLevelEnabled(logrus.TraceLevel)
 	sentIdx := 0
 	for index := 0; index < len(updates); index++ {
 
@@ -548,7 +541,7 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 		// have all the required fields so it was never sent to Redis.
 		if out[index].Err != nil {
 			logger.WithFields(logrus.Fields{
-				"update": updates[index],
+				"update": updates[index].String(),
 			}).Error("an update could not be parsed and was skipped")
 
 			// There is no Redis result to return, so return the update parsing error
@@ -567,15 +560,17 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 				out[index].Err = fmt.Errorf("Redis output string conversion error: %w", err)
 				logger.WithFields(logrus.Fields{
 					"err":    err,
-					"update": updates[index],
+					"update": updates[index].String(),
 				}).Error("Redis returned an error while trying to update")
 			}
 
 			// Successful result.
-			logger.WithFields(logrus.Fields{
-				"update": updates[index],
-				"result": t,
-			}).Tracef("Redis successfully processed update")
+			if traceEnabled {
+				logger.WithFields(logrus.Fields{
+					"update": updates[index].String(),
+					"result": t,
+				}).Tracef("Redis successfully processed update")
+			}
 			out[index].Result = t
 		} else {
 			sentIdx++
@@ -589,6 +584,36 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	}
 
 	return out
+}
+
+const maxLoggedRedisCmdArgs = 2 + 3*2 // "<stream>", "*", plus 3 field/value pairs (6 tokens)
+
+func formatRedisCmdForLog(redisCmd string, redisArgs []interface{}) string {
+	// Ticket creation update ("XADD om-replication * ticket <serialized-pb>"):
+	// summarize the raw binary protobuf payload as "<N bytes>" instead of
+	// dumping unprintable bytes into the log.
+	if len(redisArgs) == 4 && redisArgs[2] == "ticket" {
+		if s, ok := redisArgs[3].(string); ok {
+			return fmt.Sprintf("%s %v %v ticket <%d bytes>", redisCmd, redisArgs[0], redisArgs[1], len(s))
+		}
+	}
+	args := redisArgs
+	// Packed activate/deactivate update with an even number of ticket IDs
+	// ("XADD om-replication * activate <id1> <id2> ... \"\""): strip the
+	// trailing "" padding value used to keep XADD's field/value token count
+	// even so the formatted log string doesn't end with a trailing space.
+	if len(args) > 0 && args[len(args)-1] == "" {
+		args = args[:len(args)-1]
+	}
+	suffix := ""
+	// Packed activate/deactivate update with more than 3 field/value pairs
+	// (> 5 ticket IDs): truncate after the first 3 pairs and append "..."
+	// so large packed batches don't flood the logs.
+	if len(args) > maxLoggedRedisCmdArgs {
+		args = args[:maxLoggedRedisCmdArgs]
+		suffix = " ..."
+	}
+	return fmt.Sprintf("%s %s%s", redisCmd, strings.Trim(fmt.Sprint(args), "[]"), suffix)
 }
 
 // getUpdates performs a blocking read on state (with a configurable timeout read from
@@ -609,25 +634,23 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 
 	// Generate redis command to retrieve updates
 	redisCmd := "XREAD"
-	redisArgs := make([]interface{}, 0)
-	// Max num of updates to get in one go
-	redisArgs = append(redisArgs, "COUNT", rr.cfg.GetString("OM_CACHE_IN_MAX_UPDATES_PER_POLL"))
-	// Timeout when waiting for stream updates (GetUpdates is run
-	// asynchronously, so this doesn't block execution)
-	redisArgs = append(redisArgs, "BLOCK", rr.cfg.GetString("OM_CACHE_IN_WAIT_TIMEOUT_MS"))
-	// Replication stream name
-	redisArgs = append(redisArgs, "STREAMS", "om-replication")
-	// Last ID read from this stream.
-	redisArgs = append(redisArgs, rr.replId)
+	redisArgs := []interface{}{
+		"COUNT", rr.cfg.GetString("OM_CACHE_IN_MAX_UPDATES_PER_POLL"), // Max num of updates to get in one go
+		"BLOCK", rr.cfg.GetString("OM_CACHE_IN_WAIT_TIMEOUT_MS"), // Timeout when waiting for stream updates (GetUpdates is run asynchronously, so this doesn't block execution)
+		"STREAMS", "om-replication", // Replication stream name
+		rr.replId, // Last ID read from this stream
+	}
 
 	// Get redis connection from the read pool
 	rConn := rr.rConnPool.Get()
 	defer rConn.Close()
 
 	// Execute XREAD
-	logger.WithFields(logrus.Fields{
-		"redisCmd": fmt.Sprint(redisCmd, strings.Trim(fmt.Sprint(redisArgs), "[]")),
-	}).Debugf("Executing redis command")
+	if logger.Logger.IsLevelEnabled(logrus.DebugLevel) {
+		logger.WithFields(logrus.Fields{
+			"redisCmd": formatRedisCmdForLog(redisCmd, redisArgs),
+		}).Debug("Executing redis command")
+	}
 	data, err := rConn.Do(redisCmd, redisArgs...)
 	if err != nil {
 		logger.Errorf("Redis error: %v", err)
@@ -672,8 +695,8 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 				}
 
 				// Element 1 is the field/value array in the stream entry
-				// (either a single `<cmd> <value>` pair, or repeated
-				// `activate <id>` / `deactivate <id>` pairs when packed).
+				// (either a single `<cmd> <value>` pair, or packed
+				// `activate <id1> [<id2> <id3> ...]` / `deactivate <id1> [<id2> <id3> ...]`).
 				y, err := redis.Strings(entry[1], nil)
 				if err != nil {
 					logger.Error(err)
@@ -689,25 +712,20 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 					thisUpdate.Cmd = store.Ticket
 					thisUpdate.Key = replId
 					thisUpdate.Value = y[1] // Only argument for a ticket is the ticket PB
-				case "activate":
+				case "activate", "deactivate":
 					thisUpdate.Cmd = store.Activate
-					thisUpdate.Key = y[1] // Ticket ID (or first ticket ID when packed)
-					if len(y) > 2 {
-						keys := make([]string, 0, len(y)/2)
-						for idx := 0; idx+1 < len(y); idx += 2 {
-							keys = append(keys, y[idx+1])
-						}
-						thisUpdate.Keys = keys
+					if y[0] == "deactivate" {
+						thisUpdate.Cmd = store.Deactivate
 					}
-				case "deactivate":
-					thisUpdate.Cmd = store.Deactivate
 					thisUpdate.Key = y[1] // Ticket ID (or first ticket ID when packed)
 					if len(y) > 2 {
-						keys := make([]string, 0, len(y)/2)
-						for idx := 0; idx+1 < len(y); idx += 2 {
-							keys = append(keys, y[idx+1])
+						keys := y[1:]
+						if keys[len(keys)-1] == "" {
+							keys = keys[:len(keys)-1]
 						}
-						thisUpdate.Keys = keys
+						if len(keys) > 1 {
+							thisUpdate.Keys = keys
+						}
 					}
 				case "assign":
 					if len(y) < 4 {

@@ -2,7 +2,7 @@
 
 All configuration in `om-core` follows the 12-factor methodology via environment variables defined in `internal/config/config.go`.
 
-> **Code Modification Rule**: `viper.AutomaticEnv()` in `internal/config/config.go` only reads environment variables that have a registered default via `cfg.SetDefault(...)`. Any new `OM_*` variable added to the codebase **must** have a default set in `config.Read()`. Also note that positive required integer settings (`OM_CACHE_EXPIRATION_INTERVAL_MS`, `OM_CACHE_IN_MAX_APPLY_DURATION_MS`, `OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE`, `OM_CACHE_IN_QUEUE_BUFFER_SIZE`, `OM_CACHE_OUT_QUEUE_BUFFER_SIZE`, `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`, `OM_CACHE_IN_MAX_UPDATES_PER_POLL`, `OM_MAX_STATE_UPDATES_PER_CALL`) automatically reset to their defaults with a warning if set to `<= 0`.
+> **Code Modification Rule**: `viper.AutomaticEnv()` in `internal/config/config.go` only reads environment variables that have a registered default via `cfg.SetDefault(...)`. Any new `OM_*` variable added to the codebase **must** have a default set in `config.Read()`. Also note that positive required integer settings (`OM_CACHE_EXPIRATION_INTERVAL_MS`, `OM_CACHE_IN_MAX_APPLY_DURATION_MS`, `OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE`, `OM_CACHE_IN_QUEUE_BUFFER_SIZE`, `OM_CACHE_OUT_QUEUE_BUFFER_SIZE`, `OM_CACHE_OUT_MAX_PACKED_KEYS`, `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`, `OM_CACHE_IN_MAX_UPDATES_PER_POLL`, `OM_MAX_STATE_UPDATES_PER_CALL`) automatically reset to their defaults with a warning if set to `<= 0`.
 
 ---
 
@@ -50,6 +50,7 @@ All configuration in `om-core` follows the 12-factor methodology via environment
 | `OM_CACHE_EXPIRATION_INTERVAL_MS` | `1000` | Interval (ms) between local min-heap expiration scans. |
 | `OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE` | `5000` | Max expired entries removed per scan cycle (in bounded lock chunks). |
 | `OM_CACHE_PACK_TICKET_STATE_UPDATES` | `false` | Packs multi-ticket `Activate`/`Deactivate` calls and coalesces contiguous same-command outgoing batches into single Redis Stream entries. |
+| `OM_CACHE_OUT_MAX_PACKED_KEYS` | `500` | Max ticket IDs coalesced into a single packed `Activate` or `Deactivate` stream entry when `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`. |
 | `OM_CACHE_OUT_MAX_QUEUE_THRESHOLD` | `50` | Number of outgoing updates that triggers an immediate batch flush to Redis. |
 | `OM_CACHE_OUT_WAIT_TIMEOUT_MS` | `500` | Max wait (ms) to accumulate `OM_CACHE_OUT_MAX_QUEUE_THRESHOLD` outgoing updates before flushing. |
 | `OM_CACHE_OUT_QUEUE_BUFFER_SIZE` | `500` | Channel buffer capacity for outgoing `tc.UpRequests`. |

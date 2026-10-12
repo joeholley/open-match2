@@ -77,6 +77,7 @@ func TestRead(t *testing.T) {
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_WAIT_TIMEOUT_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_QUEUE_BUFFER_SIZE"))
+		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_OUT_MAX_PACKED_KEYS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_EXPIRATION_INTERVAL_MS"))
 		assert.IsType(t, 0, cfg.GetInt("OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE"))
@@ -108,6 +109,7 @@ func TestRead(t *testing.T) {
 			"OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE": 5000,
 			"OM_CACHE_IN_QUEUE_BUFFER_SIZE":             20000,
 			"OM_CACHE_OUT_QUEUE_BUFFER_SIZE":            500,
+			"OM_CACHE_OUT_MAX_PACKED_KEYS":              500,
 			"OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS":   60000,
 			"OM_CACHE_IN_MAX_UPDATES_PER_POLL":          10000,
 			"OM_MAX_STATE_UPDATES_PER_CALL":             500,

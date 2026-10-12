@@ -501,12 +501,15 @@ func validateTicketStateUpdates(logger *logrus.Entry, idValidator *regexp.Regexp
 
 	// Validate ids of requested updates
 	if numReqUpdates > 0 {
+		traceEnabled := logger.Logger.IsLevelEnabled(logrus.TraceLevel)
 		// check each id in the input list, making separate lists of those that are
 		// valid and those that are invalid.
 		for _, id := range ticketIds {
 			if idValidator.MatchString(id) {
 				validIds = append(validIds, id)
-				logger.WithFields(logrus.Fields{"ticket_id": id}).Trace("valid ticket id")
+				if traceEnabled {
+					logger.WithFields(logrus.Fields{"ticket_id": id}).Trace("valid ticket id")
+				}
 			} else {
 				// Generate error details to attach to returned grpc Status
 				invalidIdErrorDetails[id] = InvalidIdErr
@@ -574,8 +577,8 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 		if r.Err != nil {
 			for _, id := range ticketIds {
 				errs[id] = status.Error(codes.Internal, fmt.Errorf("Unable to update ticket %v state to %v : %w", id, requestedStateAsString, r.Err).Error())
-				logger.Error(errs[id])
 			}
+			logger.Errorf("Unable to update %d packed tickets state to %v: %v", len(ticketIds), requestedStateAsString, r.Err)
 		} else if r.Result != "" {
 			maxReplId = r.Result
 		}
@@ -591,6 +594,7 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 
 	// Queue the update requests
 	logger.Trace("queuing updates for ticket state change")
+	traceEnabled := logger.Logger.IsLevelEnabled(logrus.TraceLevel)
 	for i, id := range ticketIds {
 		rChans[i] = make(chan *store.StateResponse, 1)
 		tc.UpRequests <- &cache.UpdateRequest{
@@ -607,9 +611,11 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 				Key: id,
 			},
 		}
-		logger.WithFields(logrus.Fields{
-			"ticket_id": id,
-		}).Trace("generated request to update ticket status")
+		if traceEnabled {
+			logger.WithFields(logrus.Fields{
+				"ticket_id": id,
+			}).Trace("generated request to update ticket status")
+		}
 	}
 
 	// Look through all results for errors.

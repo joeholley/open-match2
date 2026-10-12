@@ -66,7 +66,7 @@
 1. **Write Path (`OutgoingReplicationQueue`)**:
    - RPC handlers (`CreateTicket`, `ActivateTickets`, `DeactivateTickets`, and match roster deactivation in `InvokeMatchmakingFunctions`) enqueue `cache.UpdateRequest` items onto `tc.UpRequests`.
    - `OutgoingReplicationQueue` batches up to `OM_CACHE_OUT_MAX_QUEUE_THRESHOLD` (50) updates or waits up to `OM_CACHE_OUT_WAIT_TIMEOUT_MS` (500 ms) before calling `Replicator.SendUpdates()`.
-   - When `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`, multi-ticket activations/deactivations and contiguous same-command (`Activate` or `Deactivate`) requests are packed into a single Redis Stream entry (up to `OM_MAX_STATE_UPDATES_PER_CALL` keys).
+   - When `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`, multi-ticket activations/deactivations and contiguous same-command (`Activate` or `Deactivate`) requests are packed into a single Redis Stream entry (up to `OM_CACHE_OUT_MAX_PACKED_KEYS` keys).
    - Each Redis pipeline batch appends `XTRIM om-replication MINID ~ <now - OM_CACHE_TICKET_TTL_MS>` for O(1) macro-node stream eviction.
 2. **Read & Apply Path (`IncomingReplicationQueue`)**:
    - Every `om-core` instance continuously polls Redis (`XREAD BLOCK <OM_CACHE_IN_WAIT_TIMEOUT_MS> COUNT <OM_CACHE_IN_MAX_UPDATES_PER_POLL> STREAMS om-replication <last_repl_id>`) from `OM_REDIS_READ_HOST`.

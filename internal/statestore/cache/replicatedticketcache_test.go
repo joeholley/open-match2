@@ -491,6 +491,10 @@ func TestOutgoingReplicationQueueCrossCallerPacking(t *testing.T) {
 	const numCallers = 10
 	cfg := config.Read()
 	cfg.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", true)
+	// Set per-RPC limit < numCallers to verify outgoing coalescing is bounded by
+	// OM_CACHE_OUT_MAX_PACKED_KEYS rather than OM_MAX_STATE_UPDATES_PER_CALL.
+	cfg.Set("OM_MAX_STATE_UPDATES_PER_CALL", 2)
+	cfg.Set("OM_CACHE_OUT_MAX_PACKED_KEYS", 500)
 	cfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 1000)
 	cfg.Set("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD", numCallers)
 	cfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 15)
