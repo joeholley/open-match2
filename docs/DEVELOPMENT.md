@@ -12,7 +12,7 @@ Our target development environment is the default Cloud Shell you get by clickin
 The Open Match maintainers build `core` [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds).  A typical build goes something like this, with the repo cloned,  `gcloud` initialized, and an existing [Docker Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images) called `open-match`:
 ```
 # Update the dependencies to the latest versions and kick off a Cloud Build
-go get -u -t ./... && go mod tidy && go vet ./... && go test -race ./... && gcloud builds submit --async --pack \
+go get $(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}@latest{{end}}' all) && go mod tidy && go vet ./... && go test -race ./... && gcloud builds submit --async --pack \
 image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match/om-core
 ```
 There is no `cloudbuild.yaml` or `Dockerfile` required for this. [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) takes care of everything.
