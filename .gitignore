@@ -45,6 +45,7 @@ go.work.sum
 *~
 *.sublime-project
 *.sublime-workspace
+docs/evaluations
 
 # macOS
 .DS_Store
