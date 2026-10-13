@@ -34,7 +34,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/signal"
 	"regexp"
 	"strconv"
@@ -67,6 +66,54 @@ type redisReplicator struct {
 	cfg             *viper.Viper
 	replId          string
 	replIdValidator *regexp.Regexp
+	ctx             context.Context
+	cancel          context.CancelFunc
+}
+
+// Close releases the signal notification context and closes both the read and
+// write Redis connection pools.
+func (rr *redisReplicator) Close() error {
+	if rr == nil {
+		return nil
+	}
+	if rr.cancel != nil {
+		rr.cancel()
+	}
+	var rErr, wErr error
+	if rr.rConnPool != nil {
+		rErr = rr.rConnPool.Close()
+	}
+	if rr.wConnPool != nil {
+		wErr = rr.wConnPool.Close()
+	}
+	return errors.Join(rErr, wErr)
+}
+
+// resolveDialTimeouts computes the TCP connect, socket read, and socket write
+// timeouts for Redis connections from configuration. If the dedicated
+// OM_REDIS_DIAL_*_TIMEOUT settings are unset or non-positive, it falls back to
+// OM_REDIS_POOL_IDLE_TIMEOUT for backwards compatibility. It also ensures
+// readTimeout is at least OM_CACHE_IN_WAIT_TIMEOUT_MS + 1s so blocking XREAD
+// calls never time out prematurely at the socket layer.
+func resolveDialTimeouts(cfg *viper.Viper) (connectTimeout, readTimeout, writeTimeout time.Duration) {
+	idleTimeout := cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT")
+	connectTimeout = cfg.GetDuration("OM_REDIS_DIAL_CONNECT_TIMEOUT")
+	if connectTimeout <= 0 {
+		connectTimeout = idleTimeout
+	}
+	readTimeout = cfg.GetDuration("OM_REDIS_DIAL_READ_TIMEOUT")
+	if readTimeout <= 0 {
+		readTimeout = idleTimeout
+	}
+	minReadTimeout := time.Duration(cfg.GetInt64("OM_CACHE_IN_WAIT_TIMEOUT_MS"))*time.Millisecond + time.Second
+	if readTimeout < minReadTimeout {
+		readTimeout = minReadTimeout
+	}
+	writeTimeout = cfg.GetDuration("OM_REDIS_DIAL_WRITE_TIMEOUT")
+	if writeTimeout <= 0 {
+		writeTimeout = idleTimeout
+	}
+	return connectTimeout, readTimeout, writeTimeout
 }
 
 // errors returned by inline functions aren't seen by our code and we can't
@@ -76,10 +123,8 @@ type redisReplicator struct {
 //
 //nolint:wrapcheck,cyclop
 func New(cfg *viper.Viper) (*redisReplicator, error) {
-	// Exit on signal
-	ctx, cancel := context.WithCancel(context.Background())
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
+	// Cancel dial backoff retries on SIGTERM or SIGINT.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 
 	var err error
 
@@ -135,6 +180,8 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 		replIdValidator: regexp.MustCompile(`^\d{13}-\d+$`),
 		replId:          initialReplId,
 		cfg:             cfg,
+		ctx:             ctx,
+		cancel:          cancel,
 		rConnPool: &redis.Pool{ // Redis read pool
 			MaxIdle:     cfg.GetInt("OM_REDIS_POOL_MAX_IDLE"),
 			MaxActive:   cfg.GetInt("OM_REDIS_POOL_MAX_ACTIVE"),
@@ -165,55 +212,52 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 				var conn redis.Conn
 				err := backoff.RetryNotify(
 					func() error { // Operation that the backoff module will retry
+						if ctx.Err() != nil {
+							return backoff.Permanent(ctx.Err())
+						}
 
 						// Local closure var
 						var err error
 
-						select {
-						// Check to see if an SIGTERM or SIGINT were received
-						// before executing the dial - if they were, cancel the
-						// context to end the backoff retries.
-						case <-signalChan:
-							cancel()
-						default:
-							// 'conn' here refers to the variable in the enclosing
-							// redis.Pool{Dial: func() (redis.Conn, error)}
-							// scope, which is returned when the dial was successful.
-							// 'err' is the local variable, which
-							// backoff.RetryNotify() evaluates to determine if it
-							// needs to retry this operation.
-							rConnLogger.Debug("dialing Redis read replica")
+						// 'conn' here refers to the variable in the enclosing
+						// redis.Pool{Dial: func() (redis.Conn, error)}
+						// scope, which is returned when the dial was successful.
+						// 'err' is the local variable, which
+						// backoff.RetryNotify() evaluates to determine if it
+						// needs to retry this operation.
+						rConnLogger.Debug("dialing Redis read replica")
 
-							// Dial options
-							dialOptions := []redis.DialOption{
-								redis.DialUsername(cfg.GetString("OM_REDIS_READ_USER")),
-								redis.DialPassword(cfg.GetString("OM_REDIS_READ_PASSWORD")),
-								redis.DialConnectTimeout(cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT")),
-								redis.DialReadTimeout(cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT")),
-							}
-
-							// Add option to use TLS if config flag is set
-							if cfg.GetBool("OM_REDIS_USE_TLS") {
-								rConnLogger.Info("OM_REDIS_USE_TLS is set to true, will attempt to connect to Redis read replica(s) using TLS.")
-								dialOptions = append(dialOptions, redis.DialUseTLS(true))
-							}
-
-							// Skip TLS cert verification if config flag is set
-							// (e.g., for self-signed certs)
-							if cfg.GetBool("OM_REDIS_TLS_SKIP_VERIFY") {
-								rConnLogger.Info("OM_REDIS_TLS_SKIP_VERIFY is set to true, will attempt to connect to Redis read replica(s) using TLS without verifying the TLS certificate.")
-								dialOptions = append(dialOptions, redis.DialTLSSkipVerify(true))
-							}
-
-							conn, err = redis.Dial("tcp",
-								readRedisUrl,
-								dialOptions...,
-							)
-							if err != nil { // Check for error on dial
-								rConnLogger.Error("failure dialing Redis read replica")
-							}
-
+						// Dial options
+						connectTimeout, readTimeout, writeTimeout := resolveDialTimeouts(cfg)
+						dialOptions := []redis.DialOption{
+							redis.DialUsername(cfg.GetString("OM_REDIS_READ_USER")),
+							redis.DialPassword(cfg.GetString("OM_REDIS_READ_PASSWORD")),
+							redis.DialConnectTimeout(connectTimeout),
+							redis.DialReadTimeout(readTimeout),
+							redis.DialWriteTimeout(writeTimeout),
 						}
+
+						// Add option to use TLS if config flag is set
+						if cfg.GetBool("OM_REDIS_USE_TLS") {
+							rConnLogger.Info("OM_REDIS_USE_TLS is set to true, will attempt to connect to Redis read replica(s) using TLS.")
+							dialOptions = append(dialOptions, redis.DialUseTLS(true))
+						}
+
+						// Skip TLS cert verification if config flag is set
+						// (e.g., for self-signed certs)
+						if cfg.GetBool("OM_REDIS_TLS_SKIP_VERIFY") {
+							rConnLogger.Info("OM_REDIS_TLS_SKIP_VERIFY is set to true, will attempt to connect to Redis read replica(s) using TLS without verifying the TLS certificate.")
+							dialOptions = append(dialOptions, redis.DialTLSSkipVerify(true))
+						}
+
+						conn, err = redis.Dial("tcp",
+							readRedisUrl,
+							dialOptions...,
+						)
+						if err != nil { // Check for error on dial
+							rConnLogger.Error("failure dialing Redis read replica")
+						}
+
 						return err
 					},
 					backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(
@@ -247,56 +291,53 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 				var conn redis.Conn
 				err := backoff.RetryNotify(
 					func() error { // Operation that the backoff module will retry
-
-						select {
-						// Check to see if an SIGTERM or SIGINT were received
-						// before executing the dial - if they were, cancel the
-						// context to end the backoff retries.
-						case <-signalChan:
-							cancel()
-						default:
-							// Local closure var
-							var err error
-
-							// 'conn' here refers to the variable in the enclosing
-							// redis.Pool{Dial: func() (redis.Conn, error)}
-							// scope, which is returned when the dial was successful.
-							// 'err' is the local variable, which
-							// backoff.RetryNotify() evaluates to determine if it
-							// needs to retry this operation.
-							wConnLogger.Debug("dialing Redis write instance")
-
-							// Dial options
-							dialOptions := []redis.DialOption{
-								redis.DialUsername(cfg.GetString("OM_REDIS_WRITE_USER")),
-								redis.DialPassword(cfg.GetString("OM_REDIS_WRITE_PASSWORD")),
-								redis.DialConnectTimeout(cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT")),
-								redis.DialReadTimeout(cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT")),
-							}
-
-							// Add option to use TLS if config flag is set
-							if cfg.GetBool("OM_REDIS_USE_TLS") {
-								wConnLogger.Info("OM_REDIS_USE_TLS is set to true, will attempt to connect to Redis write instance using TLS.")
-								dialOptions = append(dialOptions, redis.DialUseTLS(true))
-							}
-
-							// Skip TLS cert verification if config flag is set
-							// (e.g., for self-signed certs)
-							if cfg.GetBool("OM_REDIS_TLS_SKIP_VERIFY") {
-								wConnLogger.Info("OM_REDIS_TLS_SKIP_VERIFY is set to true, will attempt to connect to Redis write instance using TLS without verifying the TLS certificate.")
-								dialOptions = append(dialOptions, redis.DialTLSSkipVerify(true))
-							}
-
-							conn, err = redis.Dial("tcp",
-								writeRedisUrl,
-								dialOptions...,
-							)
-
-							if err != nil { // Check for error on dial
-								wConnLogger.Error("failure dialing Redis write instance")
-							}
-
+						if ctx.Err() != nil {
+							return backoff.Permanent(ctx.Err())
 						}
+
+						// Local closure var
+						var err error
+
+						// 'conn' here refers to the variable in the enclosing
+						// redis.Pool{Dial: func() (redis.Conn, error)}
+						// scope, which is returned when the dial was successful.
+						// 'err' is the local variable, which
+						// backoff.RetryNotify() evaluates to determine if it
+						// needs to retry this operation.
+						wConnLogger.Debug("dialing Redis write instance")
+
+						// Dial options
+						connectTimeout, readTimeout, writeTimeout := resolveDialTimeouts(cfg)
+						dialOptions := []redis.DialOption{
+							redis.DialUsername(cfg.GetString("OM_REDIS_WRITE_USER")),
+							redis.DialPassword(cfg.GetString("OM_REDIS_WRITE_PASSWORD")),
+							redis.DialConnectTimeout(connectTimeout),
+							redis.DialReadTimeout(readTimeout),
+							redis.DialWriteTimeout(writeTimeout),
+						}
+
+						// Add option to use TLS if config flag is set
+						if cfg.GetBool("OM_REDIS_USE_TLS") {
+							wConnLogger.Info("OM_REDIS_USE_TLS is set to true, will attempt to connect to Redis write instance using TLS.")
+							dialOptions = append(dialOptions, redis.DialUseTLS(true))
+						}
+
+						// Skip TLS cert verification if config flag is set
+						// (e.g., for self-signed certs)
+						if cfg.GetBool("OM_REDIS_TLS_SKIP_VERIFY") {
+							wConnLogger.Info("OM_REDIS_TLS_SKIP_VERIFY is set to true, will attempt to connect to Redis write instance using TLS without verifying the TLS certificate.")
+							dialOptions = append(dialOptions, redis.DialTLSSkipVerify(true))
+						}
+
+						conn, err = redis.Dial("tcp",
+							writeRedisUrl,
+							dialOptions...,
+						)
+
+						if err != nil { // Check for error on dial
+							wConnLogger.Error("failure dialing Redis write instance")
+						}
+
 						return err
 					},
 					backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(
@@ -313,7 +354,7 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 
 	// attempt to access Redis hosts during initialization in an effort to fail quickly
 	rConnLogger.Debug("testing read redis connection")
-	rConn, err := rr.rConnPool.GetContext(context.Background())
+	rConn, err := rr.rConnPool.GetContext(ctx)
 	if err == nil {
 		// https://github.com/gomodule/redigo/blob/247f6c0e0a0ea200f727a5280d0d55f6bce6d2e7/redis/pool.go#L204
 		// "If the function completes without error, then the application must
@@ -323,10 +364,11 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 		rConnLogger.WithFields(logrus.Fields{
 			"error": err,
 		}).Debug("read redis connection error")
+		_ = rr.Close()
 		return nil, err
 	}
 	wConnLogger.Debug("testing write redis connection")
-	wConn, err := rr.wConnPool.GetContext(context.Background())
+	wConn, err := rr.wConnPool.GetContext(ctx)
 	if err == nil {
 		// https://github.com/gomodule/redigo/blob/247f6c0e0a0ea200f727a5280d0d55f6bce6d2e7/redis/pool.go#L204
 		// "If the function completes without error, then the application must
@@ -336,11 +378,13 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 		wConnLogger.WithFields(logrus.Fields{
 			"error": err,
 		}).Debug("write redis connection error")
+		_ = rr.Close()
 		return nil, err
 	}
 
 	// Check if the context has been cancelled by SIGINT or SIGTERM.
 	if ctx.Err() != nil {
+		_ = rr.Close()
 		rConnLogger.Fatal("cancellation requested")
 		return nil, ctx.Err()
 	}
@@ -352,8 +396,8 @@ func New(cfg *viper.Viper) (*redisReplicator, error) {
 // replicated to all clients (e.g. other instances of om-core).
 // When using redis, these will be pipelined together as a batch update to improve performance.
 // In addition to the updates sent to the function, it always ends every batch with an XTRIM
-// command to delete all updates older than the ttl configured in the environment variable
-// OM_CACHE_TICKET_TTL_MS.
+// command to delete all updates older than the combined retention window configured in the
+// environment variables OM_CACHE_TICKET_TTL_MS and OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS.
 //
 //nolint:gocognit,cyclop
 func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
@@ -463,8 +507,14 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 	// Use approximate trimming ("~") so Redis can evict whole radix-tree macro
 	// nodes in O(1) instead of scanning and rewriting partial nodes on every
 	// write batch; om-core enforces exact per-ticket TTLs locally via its
-	// expiration min-heaps.
-	expirationThresh := strconv.FormatInt(time.Now().UnixMilli()-rr.cfg.GetInt64("OM_CACHE_TICKET_TTL_MS"), 10)
+	// expiration min-heaps. Align the trim horizon with the initial stream
+	// lookback (OM_CACHE_TICKET_TTL_MS + OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS).
+	expirationThresh := strconv.FormatInt(
+		time.Now().UnixMilli()-
+			rr.cfg.GetInt64("OM_CACHE_TICKET_TTL_MS")-
+			rr.cfg.GetInt64("OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS"),
+		10,
+	)
 	if debugEnabled {
 		logger.Debugf("XTRIM om-replication MINID ~ %v", expirationThresh)
 	}

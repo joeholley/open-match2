@@ -15,8 +15,11 @@
 package redisReplicator
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,11 +74,12 @@ type fakeStreamEntry struct {
 // statefulFakeRedisConn is an in-memory Redis Streams emulator supporting
 // pipelined XADD + XTRIM (via Send + Do("")) and blocking/non-blocking XREAD.
 type statefulFakeRedisConn struct {
-	mu       sync.Mutex
-	pipeline []recordedCmd
-	entries  []fakeStreamEntry
-	lastMs   int64
-	lastSeq  int64
+	mu             sync.Mutex
+	pipeline       []recordedCmd
+	entries        []fakeStreamEntry
+	lastMs         int64
+	lastSeq        int64
+	lastXTrimMinID string
 }
 
 func newStatefulFakeRedisConn() *statefulFakeRedisConn {
@@ -139,7 +143,9 @@ func (c *statefulFakeRedisConn) Do(commandName string, args ...interface{}) (int
 					fmt.Sprint(cmd.args[0]) == "om-replication" &&
 					fmt.Sprint(cmd.args[1]) == "MINID" &&
 					fmt.Sprint(cmd.args[2]) == "~" {
-					minId := fmt.Sprint(cmd.args[3])
+					rawMinId := fmt.Sprint(cmd.args[3])
+					c.lastXTrimMinID = rawMinId
+					minId := rawMinId
 					if !strings.Contains(minId, "-") {
 						minId += "-0"
 					}
@@ -291,15 +297,18 @@ func TestSendUpdatesReplyAlignmentWithSkippedInvalidUpdates(t *testing.T) {
 
 // TestSendUpdatesApproximateXTrimEvictsExpiredEntries verifies that the
 // pipelined "XTRIM om-replication MINID ~ <now - TTL>" command evicts stream
-// entries older than OM_CACHE_TICKET_TTL_MS while preserving unexpired
-// pre-existing entries and newly added entries.
+// entries older than OM_CACHE_TICKET_TTL_MS + OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS
+// while preserving entries within the combined retention window and newly added
+// entries.
 func TestSendUpdatesApproximateXTrimEvictsExpiredEntries(t *testing.T) {
 	conn := newStatefulFakeRedisConn()
 	rr := newTestRedisReplicator(conn)
 	rr.cfg.Set("OM_CACHE_TICKET_TTL_MS", 10000)
+	rr.cfg.Set("OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS", 5000)
 
 	nowMs := time.Now().UnixMilli()
 	expiredID := fmt.Sprintf("%013d-0", nowMs-25000)
+	withinAssignmentTTLID := fmt.Sprintf("%013d-0", nowMs-12000)
 	unexpiredID := fmt.Sprintf("%013d-0", nowMs-2000)
 	conn.entries = append(conn.entries,
 		fakeStreamEntry{
@@ -307,31 +316,49 @@ func TestSendUpdatesApproximateXTrimEvictsExpiredEntries(t *testing.T) {
 			fields: []string{"deactivate", "1700000000000-0"},
 		},
 		fakeStreamEntry{
+			id:     withinAssignmentTTLID,
+			fields: []string{"assign", "1700000000000-0", "connection", "10.0.0.1:7777"},
+		},
+		fakeStreamEntry{
 			id:     unexpiredID,
 			fields: []string{"deactivate", "1700000000000-1"},
 		},
 	)
 
+	beforeMs := time.Now().UnixMilli()
 	res := rr.SendUpdates([]*store.StateUpdate{
 		{
 			Cmd: store.Activate,
 			Key: "1700000000000-2",
 		},
 	})
+	afterMs := time.Now().UnixMilli()
 	require.Len(t, res, 1)
 	require.NoError(t, res[0].Err)
 
-	// Expired entry older than OM_CACHE_TICKET_TTL_MS should be trimmed by XTRIM MINID ~,
-	// while the unexpired pre-existing entry and newly added entry remain in the stream.
-	got := rr.GetUpdates()
-	require.Len(t, got, 2)
-	assert.Equal(t, store.Deactivate, got[0].Cmd)
-	assert.Equal(t, "1700000000000-1", got[0].Key)
-	assert.Equal(t, unexpiredID, got[0].ReplId)
+	// Verify the numeric MINID threshold sent in XTRIM subtracts both
+	// OM_CACHE_TICKET_TTL_MS (10000) and OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS (5000).
+	minIDVal, err := strconv.ParseInt(conn.lastXTrimMinID, 10, 64)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, minIDVal, beforeMs-15000)
+	assert.LessOrEqual(t, minIDVal, afterMs-15000)
 
-	assert.Equal(t, store.Activate, got[1].Cmd)
-	assert.Equal(t, "1700000000000-2", got[1].Key)
-	assert.Equal(t, res[0].Result, got[1].ReplId)
+	// Entry older than OM_CACHE_TICKET_TTL_MS + OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS (15s)
+	// should be trimmed by XTRIM MINID ~, while the entry at 12s (within the combined
+	// 15s window), the entry at 2s, and the newly added entry remain in the stream.
+	got := rr.GetUpdates()
+	require.Len(t, got, 3)
+	assert.Equal(t, store.Assign, got[0].Cmd)
+	assert.Equal(t, "1700000000000-0", got[0].Key)
+	assert.Equal(t, withinAssignmentTTLID, got[0].ReplId)
+
+	assert.Equal(t, store.Deactivate, got[1].Cmd)
+	assert.Equal(t, "1700000000000-1", got[1].Key)
+	assert.Equal(t, unexpiredID, got[1].ReplId)
+
+	assert.Equal(t, store.Activate, got[2].Cmd)
+	assert.Equal(t, "1700000000000-2", got[2].Key)
+	assert.Equal(t, res[0].Result, got[2].ReplId)
 }
 
 // TestSendUpdatesPackedSkipsEmptyKeys verifies that packed Activate/Deactivate
@@ -994,3 +1021,125 @@ func TestReplicatorConformance(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveDialTimeoutsAndCloseLifecycle(t *testing.T) {
+	t.Run("DefaultsDecoupledFromPoolIdleTimeout", func(t *testing.T) {
+		cfg := config.Read()
+		require.Equal(t, time.Minute, cfg.GetDuration("OM_REDIS_POOL_IDLE_TIMEOUT"))
+
+		connectTimeout, readTimeout, writeTimeout := resolveDialTimeouts(cfg)
+		assert.Equal(t, 5*time.Second, connectTimeout)
+		assert.Equal(t, 10*time.Second, readTimeout)
+		assert.Equal(t, 5*time.Second, writeTimeout)
+	})
+
+	t.Run("ReadTimeoutEnforcesMinimumAboveCacheInWaitTimeoutMs", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 15000)
+		cfg.Set("OM_REDIS_DIAL_READ_TIMEOUT", 10*time.Second)
+
+		connectTimeout, readTimeout, writeTimeout := resolveDialTimeouts(cfg)
+		assert.Equal(t, 5*time.Second, connectTimeout)
+		assert.Equal(t, 16*time.Second, readTimeout, "readTimeout must be bumped to at least OM_CACHE_IN_WAIT_TIMEOUT_MS + 1s")
+		assert.Equal(t, 5*time.Second, writeTimeout)
+	})
+
+	t.Run("FallbackToPoolIdleTimeoutWhenDialTimeoutsNonPositive", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_REDIS_POOL_IDLE_TIMEOUT", 45*time.Second)
+		cfg.Set("OM_REDIS_DIAL_CONNECT_TIMEOUT", time.Duration(0))
+		cfg.Set("OM_REDIS_DIAL_READ_TIMEOUT", -1*time.Second)
+		cfg.Set("OM_REDIS_DIAL_WRITE_TIMEOUT", time.Duration(0))
+
+		connectTimeout, readTimeout, writeTimeout := resolveDialTimeouts(cfg)
+		assert.Equal(t, 45*time.Second, connectTimeout)
+		assert.Equal(t, 45*time.Second, readTimeout)
+		assert.Equal(t, 45*time.Second, writeTimeout)
+	})
+
+	t.Run("CloseCancelsContextClosesPoolsAndIsIdempotentAndNilSafe", func(t *testing.T) {
+		var nilReplicator *redisReplicator
+		require.NotPanics(t, func() {
+			assert.NoError(t, nilReplicator.Close())
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		rPool := &redis.Pool{
+			Dial: func() (redis.Conn, error) {
+				return &fakeRedisConn{}, nil
+			},
+		}
+		wPool := &redis.Pool{
+			Dial: func() (redis.Conn, error) {
+				return &fakeRedisConn{}, nil
+			},
+		}
+		rr := &redisReplicator{
+			rConnPool: rPool,
+			wConnPool: wPool,
+			cfg:       config.Read(),
+			ctx:       ctx,
+			cancel:    cancel,
+		}
+
+		require.NoError(t, rr.Close())
+		assert.ErrorIs(t, rr.ctx.Err(), context.Canceled, "Close() must cancel rr.ctx")
+
+		rConn := rr.rConnPool.Get()
+		assert.Error(t, rConn.Err(), "rConnPool must be closed after Close()")
+		_ = rConn.Close()
+
+		wConn := rr.wConnPool.Get()
+		assert.Error(t, wConn.Err(), "wConnPool must be closed after Close()")
+		_ = wConn.Close()
+
+		// Second Close() call is idempotent and does not panic.
+		require.NotPanics(t, func() {
+			assert.NoError(t, rr.Close())
+		})
+	})
+
+	t.Run("FailedNewCleansUpContextAndPoolsWithoutGoroutineLeak", func(t *testing.T) {
+		// Allocate and immediately close an ephemeral TCP port so New(cfg) dials an unreachable port.
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		_, closedPort, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		require.NoError(t, lis.Close())
+
+		cfg := config.Read()
+		cfg.Set("OM_REDIS_READ_HOST", "127.0.0.1")
+		cfg.Set("OM_REDIS_READ_PORT", closedPort)
+		cfg.Set("OM_REDIS_WRITE_HOST", "127.0.0.1")
+		cfg.Set("OM_REDIS_WRITE_PORT", closedPort)
+		cfg.Set("OM_REDIS_DIAL_CONNECT_TIMEOUT", 10*time.Millisecond)
+		cfg.Set("OM_REDIS_DIAL_MAX_BACKOFF_TIMEOUT", 20*time.Millisecond)
+
+		// Perform one warm-up call so Go's stdlib os/signal singleton watchSignalLoop
+		// goroutine (started via sync.Once on the first signal.Notify in the process)
+		// is already initialized before measuring the baseline goroutine count.
+		warmupRR, warmupErr := New(cfg)
+		require.Error(t, warmupErr)
+		assert.Nil(t, warmupRR)
+
+		runtime.GC()
+		beforeGoroutines := runtime.NumGoroutine()
+
+		for i := 0; i < 5; i++ {
+			rr, newErr := New(cfg)
+			require.Error(t, newErr)
+			assert.Nil(t, rr)
+		}
+
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			runtime.GC()
+			if runtime.NumGoroutine() <= beforeGoroutines {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		assert.LessOrEqual(t, runtime.NumGoroutine(), beforeGoroutines, "failed New(cfg) calls must not leak signal-handling goroutines")
+	})
+}
+

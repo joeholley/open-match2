@@ -106,6 +106,9 @@ func TestRead(t *testing.T) {
 
 		expectedDurations := map[string]time.Duration{
 			"OM_REDIS_DIAL_MAX_BACKOFF_TIMEOUT": 2 * time.Minute,
+			"OM_REDIS_DIAL_CONNECT_TIMEOUT":     5 * time.Second,
+			"OM_REDIS_DIAL_READ_TIMEOUT":        10 * time.Second,
+			"OM_REDIS_DIAL_WRITE_TIMEOUT":       5 * time.Second,
 			"OM_REDIS_POOL_IDLE_TIMEOUT":        time.Minute,
 		}
 		for key, want := range expectedDurations {

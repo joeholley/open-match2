@@ -160,6 +160,11 @@ func main() {
 		if err != nil {
 			logger.Fatal(fmt.Errorf("Redis Failure; exiting: %w", err).Error())
 		}
+		defer func() {
+			if closeErr := rr.Close(); closeErr != nil {
+				logger.Warnf("Error closing Redis replicator: %v", closeErr)
+			}
+		}()
 		replicator = rr
 	case "memory":
 		// NOT RECOMMENDED FOR PRODUCTION

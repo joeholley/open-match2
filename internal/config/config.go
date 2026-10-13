@@ -85,6 +85,9 @@ func Read() *viper.Viper {
 	// environment variable, the string needs to match the format expected by
 	// time.ParseDuration() - see https://pkg.go.dev/time#ParseDuration
 	cfg.SetDefault("OM_REDIS_DIAL_MAX_BACKOFF_TIMEOUT", 2*time.Minute)
+	cfg.SetDefault("OM_REDIS_DIAL_CONNECT_TIMEOUT", 5*time.Second)
+	cfg.SetDefault("OM_REDIS_DIAL_READ_TIMEOUT", 10*time.Second)
+	cfg.SetDefault("OM_REDIS_DIAL_WRITE_TIMEOUT", 5*time.Second)
 	// These map directly to the redigo library pool configuration
 	// https://pkg.go.dev/github.com/gomodule/redigo/redis#Pool
 	cfg.SetDefault("OM_REDIS_POOL_MAX_IDLE", 500)
