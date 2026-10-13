@@ -231,6 +231,13 @@ func TestCreateTicket(t *testing.T) {
 			s := status.Convert(err)
 			assert.Equal(t, invalidExpTimeStatus.Code(), s.Code())
 			assert.Contains(t, s.Message(), invalidExpTimeStatus.Message())
+
+			for tcTypeName, tcInstance := range tcs {
+				_, createErr := createTicket(context.Background(), tcInstance, &pb.CreateTicketRequest{Ticket: makeTicket()})
+				createStatus := status.Convert(createErr)
+				assert.Equal(t, invalidExpTimeStatus.Code(), createStatus.Code(), "%v createTicket must preserve InvalidArgument status code", tcTypeName)
+				assert.Contains(t, createStatus.Message(), invalidExpTimeStatus.Message())
+			}
 		})
 	}
 
@@ -327,6 +334,8 @@ func TestCreateTicket(t *testing.T) {
 					assert.True(t, result.GetExpirationTime().IsValid())
 					if reqExpTime != nil {
 						assert.Equal(t, reqExpTime.AsTime(), result.GetExpirationTime().AsTime())
+					} else {
+						assert.Equal(t, result.GetAttributes().GetCreationTime().AsTime().Add(maxTTL), result.GetExpirationTime().AsTime())
 					}
 
 					// Check that the ticket insertion code for the replication layer of
@@ -3073,5 +3082,227 @@ func TestInvokeMMFsDeactivationWaitOrderingAndSemantics(t *testing.T) {
 		require.NoError(t, metricReader.Collect(context.Background(), &rm))
 		_, foundDeact := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "cancelled-stream-mmf", "com.example.m06")
 		assert.False(t, foundDeact, "no ticket deactivations should be recorded for dropped match on cancelled stream")
+	})
+}
+
+// findFloat64HistogramCountAndSum returns the total sample count and sum across
+// all data points of a Float64Histogram metric with the given name.
+func findFloat64HistogramCountAndSum(rm metricdata.ResourceMetrics, metricName string) (uint64, float64, bool) {
+	var count uint64
+	var sum float64
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != metricName {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				continue
+			}
+			for _, dp := range hist.DataPoints {
+				count += dp.Count
+				sum += dp.Sum
+				found = true
+			}
+		}
+	}
+	return count, sum, found
+}
+
+// TestCreateTicketStatusMetricsAndDefaultExpirationFromCreationTime verifies that CreateTicket:
+//  1. Preserves codes.InvalidArgument when validateAndMarshalIncomingTicket rejects an
+//     invalid ExpirationTime (instead of overwriting it with codes.Internal) and does
+//     not record otelTicketSize ("om_core.ticket.size").
+//  2. Only records otelTicketSize ("om_core.ticket.size") when state storage replication
+//     succeeds (results.Err == nil), and does not record it when replication fails.
+//  3. Computes the default ExpirationTime (when ExpirationTime == nil) as
+//     CreationTime + OM_CACHE_TICKET_TTL_MS rather than time.Now() + OM_CACHE_TICKET_TTL_MS,
+//     so a ticket created with an old CreationTime whose (CreationTime + TTL) has already
+//     elapsed is accepted and immediately expired by the cache expiration sweep.
+func TestCreateTicketStatusMetricsAndDefaultExpirationFromCreationTime(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("InvalidExpirationTimePreservesInvalidArgumentAndDoesNotRecordTicketSizeMetric", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.create_ticket_invalid_exp")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		maxTTL := time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))
+		invalidTickets := []*pb.Ticket{
+			{ExpirationTime: timestamppb.New(time.Now().Add(-time.Second))},
+			{ExpirationTime: timestamppb.New(time.Now().Add(2 * maxTTL))},
+			{ExpirationTime: &timestamppb.Timestamp{Seconds: 253402300800, Nanos: 0}},
+		}
+
+		srv := &grpcServer{}
+		for _, tk := range invalidTickets {
+			_, err := srv.CreateTicket(context.Background(), &pb.CreateTicketRequest{Ticket: tk})
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err), "CreateTicket must preserve codes.InvalidArgument from validateAndMarshalIncomingTicket")
+			assert.Contains(t, err.Error(), "specified expiration time not between (now, now +")
+		}
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		count, _, _ := findFloat64HistogramCountAndSum(rm, "om_core.ticket.size")
+		assert.Equal(t, uint64(0), count, "om_core.ticket.size must not be recorded when ticket validation fails")
+	})
+
+	t.Run("ReplicationFailureReturnsErrorAndDoesNotRecordTicketSizeMetricWhileSuccessRecordsSize", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.create_ticket_repl_err")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		simErr := errors.New("simulated ticket storage write failure")
+		globalTestReplicator.setOnSend(func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse {
+			for i, u := range updates {
+				if u.Cmd == store.Ticket {
+					results[i] = &store.StateResponse{
+						Err: simErr,
+					}
+				}
+			}
+			return results
+		})
+		defer globalTestReplicator.setOnSend(nil)
+
+		srv := &grpcServer{}
+		req := &pb.CreateTicketRequest{
+			Ticket: &pb.Ticket{
+				Attributes: &pb.Ticket_FilterableData{
+					Tags: []string{"ranked", "duo"},
+				},
+			},
+		}
+
+		// 1. Failing replication write must return the replication error and record 0 samples in om_core.ticket.size.
+		_, err := srv.CreateTicket(context.Background(), req)
+		require.ErrorIs(t, err, simErr)
+
+		var rmFailed metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rmFailed))
+		countFailed, _, _ := findFloat64HistogramCountAndSum(rmFailed, "om_core.ticket.size")
+		assert.Equal(t, uint64(0), countFailed, "om_core.ticket.size must not be recorded when ticket replication fails")
+
+		// 2. Successful replication write must record 1 sample with positive size in om_core.ticket.size.
+		globalTestReplicator.setOnSend(nil)
+		resp, err := srv.CreateTicket(context.Background(), req)
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.GetTicketId())
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{resp.GetTicketId()},
+			})
+		})
+
+		var rmSuccess metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rmSuccess))
+		countSuccess, sumSuccess, found := findFloat64HistogramCountAndSum(rmSuccess, "om_core.ticket.size")
+		require.True(t, found, "expected om_core.ticket.size histogram data point after successful CreateTicket")
+		assert.Equal(t, uint64(1), countSuccess)
+		assert.Greater(t, sumSuccess, 0.0)
+	})
+
+	t.Run("DefaultExpirationTimeComputedFromCreationTimeAndOldCreationTimeExpiresImmediately", func(t *testing.T) {
+		localCfg := config.Read()
+		localCfg.Set("OM_CACHE_TICKET_TTL_MS", 10000)
+		localCfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 25)
+		localCfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 10)
+		localCfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5)
+		localCfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5)
+		localCfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
+
+		prevCfg := cfg
+		cfg = localCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var capturedOldTicket pb.Ticket
+		var capturedOldTicketMu sync.Mutex
+		customRep := &errorInjectingReplicator{
+			inner: memoryReplicator.New(localCfg),
+		}
+		customRep.setBeforeSend(func(updates []*store.StateUpdate) {
+			for _, u := range updates {
+				if u.Cmd == store.Ticket {
+					var tk pb.Ticket
+					if err := proto.Unmarshal([]byte(u.Value), &tk); err == nil &&
+						tk.GetAttributes().GetCreationTime().AsTime().Equal(time.Unix(0, 0).UTC()) {
+						capturedOldTicketMu.Lock()
+						proto.Merge(&capturedOldTicket, &tk)
+						capturedOldTicketMu.Unlock()
+					}
+				}
+			}
+		})
+
+		localTc := cache.New(localCfg, customRep)
+		go localTc.OutgoingReplicationQueue(ctx)
+		go localTc.IncomingReplicationQueue(ctx)
+
+		ticketTTL := 10000 * time.Millisecond
+		epochCreation := timestamppb.New(time.Unix(0, 0).UTC())
+
+		// 1. Create a ticket with CreationTime = 1970-01-01T00:00:00Z and ExpirationTime = nil.
+		oldResp, err := createTicket(ctx, localTc, &pb.CreateTicketRequest{
+			Ticket: &pb.Ticket{
+				Attributes: &pb.Ticket_FilterableData{
+					CreationTime: epochCreation,
+				},
+			},
+		})
+		require.NoError(t, err)
+		oldTicketID := oldResp.GetTicketId()
+
+		// 2. Create a control ticket with default CreationTime (now) and ExpirationTime = nil.
+		freshResp, err := createTicket(ctx, localTc, &pb.CreateTicketRequest{
+			Ticket: &pb.Ticket{},
+		})
+		require.NoError(t, err)
+		freshTicketID := freshResp.GetTicketId()
+
+		// Verify the marshalled old ticket's ExpirationTime was set to CreationTime + TTL (1970-01-01T00:00:10Z),
+		// not time.Now() + TTL.
+		capturedOldTicketMu.Lock()
+		gotExpTime := capturedOldTicket.GetExpirationTime().AsTime()
+		capturedOldTicketMu.Unlock()
+		assert.Equal(t, time.Unix(0, 0).UTC().Add(ticketTTL), gotExpTime)
+
+		// Wait until both ticket creation updates have been applied by IncomingReplicationQueue.
+		require.Eventually(t, func() bool {
+			return localTc.HasAppliedReplId(oldTicketID) && localTc.HasAppliedReplId(freshTicketID)
+		}, 2*time.Second, 5*time.Millisecond)
+
+		// Because oldTicketID's ExpirationTime (1970 + 10s) has already passed, the
+		// periodic cache expiration sweep removes it from localTc.Tickets while
+		// freshTicketID (now + 10s) remains present.
+		require.Eventually(t, func() bool {
+			_, oldExists := localTc.Tickets.Load(oldTicketID)
+			_, freshExists := localTc.Tickets.Load(freshTicketID)
+			return !oldExists && freshExists
+		}, 2*time.Second, 10*time.Millisecond, "ticket with old CreationTime and nil ExpirationTime must expire immediately while fresh control ticket remains in cache")
 	})
 }

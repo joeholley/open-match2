@@ -220,14 +220,15 @@ func createTicket(parentCtx context.Context, tc *cache.ReplicatedTicketCache, re
 	// Marshal ticket into storage format
 	ticketPb, err := validateAndMarshalIncomingTicket(req)
 	if ticketPb == nil || err != nil {
-		err = status.Error(codes.Internal,
+		code := status.Code(err)
+		if code == codes.Unknown || code == codes.OK {
+			code = codes.Internal
+		}
+		err = status.Error(code,
 			fmt.Errorf("CreateTicket failed to marshal the provided ticket to the state storage format: %w", err).Error())
 		logger.Error(err)
 		return &pb.CreateTicketResponse{}, fmt.Errorf("%w", err)
 	}
-
-	// Record the size of the ticket in kb
-	otelTicketSize.Record(parentCtx, float64(len(ticketPb))/1024.0)
 
 	// Make a results return channel
 	rChan := make(chan *store.StateResponse)
@@ -251,6 +252,10 @@ func createTicket(parentCtx context.Context, tc *cache.ReplicatedTicketCache, re
 
 	// Get the results
 	results := <-rChan
+	if results.Err == nil {
+		// Record the size of the ticket in kb
+		otelTicketSize.Record(parentCtx, float64(len(ticketPb))/1024.0)
+	}
 
 	return &pb.CreateTicketResponse{TicketId: results.Result}, results.Err
 }
@@ -315,11 +320,12 @@ func validateAndMarshalIncomingTicket(req *pb.CreateTicketRequest) ([]byte, erro
 	// Set expiration timestamp if request didn't provide a valid one.
 	//
 	// Matchmakers can request a shorter expiration time than the default, but
-	// not a longer one. The default expiration time is also the maximum allowed:
-	// now + the configured ticket TTL
+	// not a longer one. By default, expiration time is creation time + the
+	// configured ticket TTL, and any explicitly specified expiration time must
+	// fall between now and now + the configured ticket TTL.
 	exTime := req.GetTicket().GetExpirationTime()
-	maxExTime := time.Now().Add(time.Millisecond *
-		time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS")))
+	ticketTTL := time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))
+	maxExTime := time.Now().Add(ticketTTL)
 
 	switch {
 	case exTime == nil:
@@ -327,9 +333,9 @@ func validateAndMarshalIncomingTicket(req *pb.CreateTicketRequest) ([]byte, erro
 		// time and om-core fills it in. (Thus why this logs at debug logging
 		// level while all other recoverable exp time validations failures are warnings)
 		logger.Tracef("ExpirationTime provided is missing; "+
-			"replacing with current time + OM_CACHE_TICKET_TTL_MS (%v)",
+			"replacing with creation time + OM_CACHE_TICKET_TTL_MS (%v)",
 			cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))
-		exTime = timestamppb.New(maxExTime)
+		exTime = timestamppb.New(crTime.AsTime().Add(ticketTTL))
 	case !exTime.IsValid():
 		fallthrough
 	case exTime.AsTime().After(maxExTime):
