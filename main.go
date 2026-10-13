@@ -1309,6 +1309,12 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 	if req.GetAssignmentRoster() == nil || req.GetAssignmentRoster().GetAssignment() == nil {
 		return nil, fmt.Errorf("%w", status.Error(codes.InvalidArgument, "roster with assignment is required"))
 	}
+	numReqUpdates := len(req.GetAssignmentRoster().GetTickets())
+	if numReqUpdates > cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL") {
+		return nil, fmt.Errorf("%w", status.Error(codes.InvalidArgument,
+			fmt.Errorf("%w (configured maximum %v, requested %v)",
+				TooManyUpdatesErr, cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL"), numReqUpdates).Error()))
+	}
 	assignmentPb, err := proto.Marshal(req.GetAssignmentRoster().GetAssignment())
 	if len(assignmentPb) == 0 || err != nil {
 		if err == nil {
@@ -1354,7 +1360,7 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 
 		if results.Err != nil {
 			// Wrap redis error and give it a gRPC internal server error status code
-			err = status.Error(codes.Internal, fmt.Errorf("Unable to delete ticket: %w", results.Err).Error())
+			err = status.Error(codes.Internal, fmt.Errorf("Unable to assign ticket: %w", results.Err).Error())
 			logger.Error(err)
 		}
 	}
@@ -1366,7 +1372,7 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 		otelAssignmentsPerCall.Record(parentCtx, int64(numUpdates))
 	}
 
-	return &pb.CreateAssignmentsResponse{}, nil
+	return &pb.CreateAssignmentsResponse{}, err
 }
 
 // WatchAssignments should be considered deprecated, and is only provided for
@@ -1387,28 +1393,52 @@ func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb
 
 	// var init
 	newestTicketCtime := time.Now()
+	watchCtx, cancel := context.WithCancel(stream.Context())
+	var watchWg sync.WaitGroup
 	updateChan := make(chan *pb.StreamedWatchAssignmentsResponse)
-	defer close(updateChan)
+	defer func() {
+		cancel()
+		watchWg.Wait()
+		close(updateChan)
+	}()
 
 	for _, id := range req.GetTicketIds() {
 		// Launch an asynch goroutine for each ticket ID in the request that just loops,
 		// checking the sync.Map for an assignment. Once one is found, it puts that in the
 		// channel, then exits.
+		watchWg.Add(1)
 		go func(ticketId string) {
+			defer watchWg.Done()
+			var ticker *time.Ticker
+			defer func() {
+				if ticker != nil {
+					ticker.Stop()
+				}
+			}()
 			for {
 				if value, ok := tc.Assignments.Load(ticketId); ok {
 					assignment := value.(*pb.Assignment)
 					logger.Debugf(" watchassignments loop got assignment %v for ticketid: %v",
 						assignment.GetConnection(), ticketId)
-					updateChan <- &pb.StreamedWatchAssignmentsResponse{
+					select {
+					case updateChan <- &pb.StreamedWatchAssignmentsResponse{
 						Assignment: assignment,
 						Id:         ticketId,
+					}:
+					case <-watchCtx.Done():
 					}
 					return
 				}
 				// TODO exp bo + jitter. Not a priority since this API is
 				// marked as deprecated.
-				time.Sleep(1 * time.Second)
+				if ticker == nil {
+					ticker = time.NewTicker(1 * time.Second)
+				}
+				select {
+				case <-watchCtx.Done():
+					return
+				case <-ticker.C:
+				}
 			}
 		}(id)
 
@@ -1442,8 +1472,11 @@ func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb
 				logger.Error(err)
 			}
 		case <-timeout:
-			otelAssignmentWatches.Add(context.Background(), int64(len(req.GetTicketIds())-i))
+			otelAssignmentWatches.Add(context.Background(), -int64(len(req.GetTicketIds())-i))
 			return nil
+		case <-stream.Context().Done():
+			otelAssignmentWatches.Add(context.Background(), -int64(len(req.GetTicketIds())-i))
+			return stream.Context().Err()
 		}
 	}
 

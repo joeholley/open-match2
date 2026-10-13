@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -677,8 +678,15 @@ func TestPackedUpdateTicketsActiveState(t *testing.T) {
 // errorInjectingReplicator wraps a store.StateReplicator and invokes onSend to
 // inject custom per-update errors or modify StateResponse results.
 type errorInjectingReplicator struct {
+	mu     sync.RWMutex
 	inner  store.StateReplicator
 	onSend func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse
+}
+
+func (r *errorInjectingReplicator) setOnSend(fn func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onSend = fn
 }
 
 func (r *errorInjectingReplicator) GetUpdates() []*store.StateUpdate {
@@ -687,8 +695,11 @@ func (r *errorInjectingReplicator) GetUpdates() []*store.StateUpdate {
 
 func (r *errorInjectingReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
 	res := r.inner.SendUpdates(updates)
-	if r.onSend != nil {
-		return r.onSend(updates, res)
+	r.mu.RLock()
+	onSend := r.onSend
+	r.mu.RUnlock()
+	if onSend != nil {
+		return onSend(updates, res)
 	}
 	return res
 }
@@ -1273,7 +1284,10 @@ func newLocalTestTLS(t *testing.T) (serverCreds credentials.TransportCredentials
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{tlsCert}}), &tls.Config{RootCAs: pool}
 }
 
-var globalTestTCOnce sync.Once
+var (
+	globalTestTCOnce     sync.Once
+	globalTestReplicator *errorInjectingReplicator
+)
 
 // ensureGlobalTestTicketCache initializes the package-global tc instance and
 // starts its background replication queue goroutines once per test binary
@@ -1287,8 +1301,11 @@ func ensureGlobalTestTicketCache() {
 		localCfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5)
 		localCfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
 
+		globalTestReplicator = &errorInjectingReplicator{
+			inner: memoryReplicator.New(localCfg),
+		}
 		tc = cache.ReplicatedTicketCache{}
-		tc.Init(localCfg, memoryReplicator.New(localCfg))
+		tc.Init(localCfg, globalTestReplicator)
 		go tc.OutgoingReplicationQueue(context.Background())
 		go tc.IncomingReplicationQueue(context.Background())
 	})
@@ -2109,4 +2126,567 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.buf.String()
+}
+
+// fakeWatchAssignmentsServerStream captures StreamedWatchAssignmentsResponse
+// messages emitted by WatchAssignments for unit test assertions.
+type fakeWatchAssignmentsServerStream struct {
+	grpc.ServerStream
+	ctx       context.Context
+	mu        sync.Mutex
+	responses []*pb.StreamedWatchAssignmentsResponse
+	onSend    func(*pb.StreamedWatchAssignmentsResponse)
+}
+
+func (f *fakeWatchAssignmentsServerStream) Context() context.Context {
+	if f.ctx != nil {
+		return f.ctx
+	}
+	return context.Background()
+}
+
+func (f *fakeWatchAssignmentsServerStream) Send(resp *pb.StreamedWatchAssignmentsResponse) error {
+	f.mu.Lock()
+	f.responses = append(f.responses, resp)
+	onSend := f.onSend
+	f.mu.Unlock()
+	if onSend != nil {
+		onSend(resp)
+	}
+	return nil
+}
+
+// findInt64SumTotal returns the cumulative sum across all data points of an
+// Int64Counter or Int64UpDownCounter metric with the given name.
+func findInt64SumTotal(rm metricdata.ResourceMetrics, metricName string) (int64, bool) {
+	var total int64
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != metricName {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+				found = true
+			}
+		}
+	}
+	return total, found
+}
+
+// findInt64HistogramCountAndSum returns the total sample count and sum across
+// all data points of an Int64Histogram metric with the given name.
+func findInt64HistogramCountAndSum(rm metricdata.ResourceMetrics, metricName string) (uint64, int64, bool) {
+	var count uint64
+	var sum int64
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != metricName {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[int64])
+			if !ok {
+				continue
+			}
+			for _, dp := range hist.DataPoints {
+				count += dp.Count
+				sum += dp.Sum
+				found = true
+			}
+		}
+	}
+	return count, sum, found
+}
+
+// TestCreateAssignmentsValidationReplicationAndMetrics verifies that CreateAssignments:
+//  1. Rejects nil rosters, nil assignments, empty assignments, and rosters exceeding
+//     OM_MAX_STATE_UPDATES_PER_CALL with codes.InvalidArgument (wrapping TooManyUpdatesErr).
+//  2. Replicates valid assignments to tc.Assignments and records otelAssignmentsPerCall
+//     ("om_core.ticket.assignment").
+//  3. Returns codes.Internal ("Empty ticket ID in assignment request!") when any ticket in
+//     the roster has an empty ID instead of swallowing the error, while still replicating
+//     valid tickets in the same roster.
+//  4. Returns codes.Internal ("Unable to assign ticket: ...") when state replication fails.
+func TestCreateAssignmentsValidationReplicationAndMetrics(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("InputValidation", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		subCfg.Set("OM_MAX_STATE_UPDATES_PER_CALL", 2)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		srv := &grpcServer{}
+		ctx := context.Background()
+
+		// 1. Nil AssignmentRoster
+		_, err := srv.CreateAssignments(ctx, &pb.CreateAssignmentsRequest{})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "roster with assignment is required")
+
+		// 2. Nil Assignment inside AssignmentRoster
+		_, err = srv.CreateAssignments(ctx, &pb.CreateAssignmentsRequest{
+			AssignmentRoster: &pb.Roster{
+				Name:    "r1",
+				Tickets: []*pb.Ticket{{Id: "1700000000001-0"}},
+			},
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "roster with assignment is required")
+
+		// 3. Empty Assignment (proto.Marshal produces 0 bytes)
+		_, err = srv.CreateAssignments(ctx, &pb.CreateAssignmentsRequest{
+			AssignmentRoster: &pb.Roster{
+				Name:       "r1",
+				Assignment: &pb.Assignment{},
+				Tickets:    []*pb.Ticket{{Id: "1700000000001-0"}},
+			},
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "roster with non-empty assignment is required")
+
+		// 4. Roster ticket count exceeds OM_MAX_STATE_UPDATES_PER_CALL (3 > 2)
+		_, err = srv.CreateAssignments(ctx, &pb.CreateAssignmentsRequest{
+			AssignmentRoster: &pb.Roster{
+				Name:       "r1",
+				Assignment: &pb.Assignment{Connection: "10.0.0.1:7777"},
+				Tickets: []*pb.Ticket{
+					{Id: "1700000000001-0"},
+					{Id: "1700000000002-0"},
+					{Id: "1700000000003-0"},
+				},
+			},
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), TooManyUpdatesErr.Error())
+		assert.Contains(t, err.Error(), "configured maximum 2, requested 3")
+	})
+
+	t.Run("ValidRosterReplicatesAssignmentsAndRecordsMetric", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.create_assignments_valid")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		ticketID1 := fmt.Sprintf("%013d-501", time.Now().UnixMilli())
+		ticketID2 := fmt.Sprintf("%013d-502", time.Now().UnixMilli())
+		t.Cleanup(func() {
+			tc.Assignments.Delete(ticketID1)
+			tc.Assignments.Delete(ticketID2)
+		})
+
+		_, err := (&grpcServer{}).CreateAssignments(context.Background(), &pb.CreateAssignmentsRequest{
+			AssignmentRoster: &pb.Roster{
+				Name:       "valid_roster",
+				Assignment: &pb.Assignment{Connection: "10.0.0.10:7777"},
+				Tickets: []*pb.Ticket{
+					{Id: ticketID1},
+					{Id: ticketID2},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		require.Eventually(t, func() bool {
+			v1, ok1 := tc.Assignments.Load(ticketID1)
+			v2, ok2 := tc.Assignments.Load(ticketID2)
+			return ok1 && ok2 &&
+				v1.(*pb.Assignment).GetConnection() == "10.0.0.10:7777" &&
+				v2.(*pb.Assignment).GetConnection() == "10.0.0.10:7777"
+		}, 2*time.Second, 5*time.Millisecond)
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		count, sum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.assignment")
+		require.True(t, found, "expected om_core.ticket.assignment histogram data point")
+		assert.Equal(t, uint64(1), count)
+		assert.Equal(t, int64(2), sum)
+	})
+
+	t.Run("EmptyTicketIDInRosterProcessesValidTicketsAndReturnsInternalError", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.create_assignments_empty_id")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		validID := fmt.Sprintf("%013d-503", time.Now().UnixMilli())
+		t.Cleanup(func() {
+			tc.Assignments.Delete(validID)
+		})
+
+		_, err := (&grpcServer{}).CreateAssignments(context.Background(), &pb.CreateAssignmentsRequest{
+			AssignmentRoster: &pb.Roster{
+				Name:       "mixed_roster",
+				Assignment: &pb.Assignment{Connection: "10.0.0.11:7777"},
+				Tickets: []*pb.Ticket{
+					{Id: validID},
+					{Id: ""},
+				},
+			},
+		})
+		require.Error(t, err, "CreateAssignments must return the empty ticket ID error instead of nil")
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.Contains(t, err.Error(), "Empty ticket ID in assignment request!")
+
+		// Valid ticket in the same roster must still be replicated.
+		require.Eventually(t, func() bool {
+			v, ok := tc.Assignments.Load(validID)
+			return ok && v.(*pb.Assignment).GetConnection() == "10.0.0.11:7777"
+		}, 2*time.Second, 5*time.Millisecond)
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		count, sum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.assignment")
+		require.True(t, found)
+		assert.Equal(t, uint64(1), count)
+		assert.Equal(t, int64(1), sum)
+	})
+
+	t.Run("ReplicationFailureReturnsUnableToAssignTicketInternalError", func(t *testing.T) {
+		failingID := fmt.Sprintf("%013d-504", time.Now().UnixMilli())
+		globalTestReplicator.setOnSend(func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse {
+			for i, u := range updates {
+				if u.Cmd == store.Assign && u.Key == failingID {
+					results[i] = &store.StateResponse{
+						Result: failingID,
+						Err:    errors.New("simulated redis assign error"),
+					}
+				}
+			}
+			return results
+		})
+		defer globalTestReplicator.setOnSend(nil)
+		t.Cleanup(func() {
+			tc.Assignments.Delete(failingID)
+		})
+
+		_, err := (&grpcServer{}).CreateAssignments(context.Background(), &pb.CreateAssignmentsRequest{
+			AssignmentRoster: &pb.Roster{
+				Name:       "failing_roster",
+				Assignment: &pb.Assignment{Connection: "10.0.0.12:7777"},
+				Tickets: []*pb.Ticket{
+					{Id: failingID},
+				},
+			},
+		})
+		require.Error(t, err, "CreateAssignments must return replication error instead of swallowing it")
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.Contains(t, err.Error(), "Unable to assign ticket: simulated redis assign error")
+		assert.NotContains(t, err.Error(), "Unable to delete ticket")
+	})
+}
+
+// TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics verifies that WatchAssignments:
+//  1. Streams assignments for all watched tickets when present and leaves
+//     otelAssignmentWatches ("om_core.ticket.assigment.watch") at net 0.
+//  2. On partial delivery followed by TTL timeout (<-timeout), decrements the
+//     remaining (len(req.GetTicketIds()) - i) watches so otelAssignmentWatches
+//     returns to 0 (instead of adding +len-i), cancels and waits for all polling
+//     goroutines before closing updateChan, and does not panic if late assignments
+//     arrive after WatchAssignments returns.
+//  3. When the caller cancels stream.Context() (<-stream.Context().Done()),
+//     unblocks immediately without waiting for the 1s poll interval or TTL timeout,
+//     returns stream.Context().Err(), decrements remaining watches to 0, and cleanly
+//     stops all polling goroutines before closing updateChan.
+func TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("AllTicketsAssignedDeliversAllAndBalancesGauge", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.watch_assignments_all")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		nowMs := time.Now().UnixMilli()
+		id1 := fmt.Sprintf("%013d-601", nowMs)
+		id2 := fmt.Sprintf("%013d-602", nowMs)
+		tc.Assignments.Store(id1, &pb.Assignment{Connection: "10.0.0.21:7777"})
+		tc.Assignments.Store(id2, &pb.Assignment{Connection: "10.0.0.22:7777"})
+		t.Cleanup(func() {
+			tc.Assignments.Delete(id1)
+			tc.Assignments.Delete(id2)
+		})
+
+		stream := &fakeWatchAssignmentsServerStream{ctx: context.Background()}
+		err := (&grpcServer{}).WatchAssignments(&pb.WatchAssignmentsRequest{
+			TicketIds: []string{id1, id2},
+		}, stream)
+		require.NoError(t, err)
+
+		stream.mu.Lock()
+		got := make(map[string]string, len(stream.responses))
+		for _, r := range stream.responses {
+			got[r.GetId()] = r.GetAssignment().GetConnection()
+		}
+		stream.mu.Unlock()
+		assert.Equal(t, map[string]string{
+			id1: "10.0.0.21:7777",
+			id2: "10.0.0.22:7777",
+		}, got)
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
+		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		assert.Equal(t, int64(0), activeWatches, "active watch gauge must return to 0 after all assignments are delivered")
+	})
+
+	t.Run("PartialAssignmentAndTimeoutDecrementsRemainingWatchesWithoutPanicOnLateAssignment", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		subCfg.Set("OM_CACHE_TICKET_TTL_MS", 80)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.watch_assignments_timeout")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		nowMs := time.Now().UnixMilli()
+		id1 := fmt.Sprintf("%013d-603", nowMs)
+		id2 := fmt.Sprintf("%013d-604", nowMs)
+		id3 := fmt.Sprintf("%013d-605", nowMs)
+		// Only id1 is assigned before timeout; id2 and id3 remain unassigned until after WatchAssignments exits.
+		tc.Assignments.Store(id1, &pb.Assignment{Connection: "10.0.0.23:7777"})
+		t.Cleanup(func() {
+			tc.Assignments.Delete(id1)
+			tc.Assignments.Delete(id2)
+			tc.Assignments.Delete(id3)
+		})
+
+		stream := &fakeWatchAssignmentsServerStream{ctx: context.Background()}
+		baselineGoroutines := runtime.NumGoroutine()
+		err := (&grpcServer{}).WatchAssignments(&pb.WatchAssignmentsRequest{
+			TicketIds: []string{id1, id2, id3},
+		}, stream)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, runtime.NumGoroutine(), baselineGoroutines, "WatchAssignments must cancel and wait for all per-ticket polling goroutines before returning")
+
+		stream.mu.Lock()
+		require.Len(t, stream.responses, 1)
+		assert.Equal(t, id1, stream.responses[0].GetId())
+		assert.Equal(t, "10.0.0.23:7777", stream.responses[0].GetAssignment().GetConnection())
+		stream.mu.Unlock()
+
+		// Store late assignments for id2 and id3 after WatchAssignments has timed out
+		// and closed updateChan; if polling goroutines were leaked, they would panic
+		// with "send on closed channel" on their next wakeup.
+		tc.Assignments.Store(id2, &pb.Assignment{Connection: "10.0.0.24:7777"})
+		tc.Assignments.Store(id3, &pb.Assignment{Connection: "10.0.0.25:7777"})
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
+		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		assert.Equal(t, int64(0), activeWatches, "timeout branch must subtract remaining (len-i) watches so gauge returns to 0")
+	})
+
+	t.Run("StreamContextCancellationUnblocksImmediatelyDecrementsGaugeAndStopsGoroutines", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		// Long TTL (10s) ensures only stream context cancellation can unblock WatchAssignments.
+		subCfg.Set("OM_CACHE_TICKET_TTL_MS", 10000)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.watch_assignments_cancel")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		nowMs := time.Now().UnixMilli()
+		id1 := fmt.Sprintf("%013d-606", nowMs)
+		id2 := fmt.Sprintf("%013d-607", nowMs)
+		id3 := fmt.Sprintf("%013d-608", nowMs)
+		// Pre-populate both id1 and id2 while leaving id3 unassigned:
+		// - One pre-populated goroutine delivers the first response on updateChan.
+		// - While WatchAssignments is inside stream.Send (onSend), the second
+		//   pre-populated goroutine is blocked at select { case updateChan <- ...: case <-watchCtx.Done(): }
+		//   and id3's goroutine is blocked at select { case <-watchCtx.Done(): case <-ticker.C: }.
+		tc.Assignments.Store(id1, &pb.Assignment{Connection: "10.0.0.26:7777"})
+		tc.Assignments.Store(id2, &pb.Assignment{Connection: "10.0.0.27:7777"})
+		t.Cleanup(func() {
+			tc.Assignments.Delete(id1)
+			tc.Assignments.Delete(id2)
+			tc.Assignments.Delete(id3)
+		})
+
+		streamCtx, cancelStream := context.WithCancel(context.Background())
+		defer cancelStream()
+
+		stream := &fakeWatchAssignmentsServerStream{
+			ctx: streamCtx,
+			onSend: func(_ *pb.StreamedWatchAssignmentsResponse) {
+				// Allow the sibling pre-populated goroutine to park on updateChan <-
+				// and the unassigned goroutine to park on <-ticker.C before cancelling.
+				time.Sleep(5 * time.Millisecond)
+				cancelStream()
+				// Allow the sibling pre-populated goroutine to observe <-watchCtx.Done()
+				// while WatchAssignments is still inside stream.Send so WatchAssignments
+				// deterministically selects <-stream.Context().Done() on the next iteration.
+				time.Sleep(5 * time.Millisecond)
+			},
+		}
+
+		baselineGoroutines := runtime.NumGoroutine()
+		start := time.Now()
+		err := (&grpcServer{}).WatchAssignments(&pb.WatchAssignmentsRequest{
+			TicketIds: []string{id1, id2, id3},
+		}, stream)
+		elapsed := time.Since(start)
+
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, elapsed, 500*time.Millisecond, "WatchAssignments must unblock immediately on stream.Context().Done() without waiting for 1s poll sleep or 10s TTL")
+		assert.LessOrEqual(t, runtime.NumGoroutine(), baselineGoroutines, "WatchAssignments must cancel and wait for all per-ticket polling goroutines before returning")
+
+		stream.mu.Lock()
+		require.Len(t, stream.responses, 1)
+		assert.Contains(t, []string{id1, id2}, stream.responses[0].GetId())
+		stream.mu.Unlock()
+
+		// Store assignment for id3 after cancellation to confirm polling goroutines exited cleanly.
+		tc.Assignments.Store(id3, &pb.Assignment{Connection: "10.0.0.28:7777"})
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
+		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		assert.Equal(t, int64(0), activeWatches, "stream cancellation branch must subtract remaining (len-i) watches so gauge returns to 0")
+	})
+
+	t.Run("AsyncAssignmentViaCreateAssignmentsDeliversOnTickerPollAndBalancesGauge", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		subCfg.Set("OM_CACHE_TICKET_TTL_MS", 5000)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.watch_assignments_ticker")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		nowMs := time.Now().UnixMilli()
+		id1 := fmt.Sprintf("%013d-609", nowMs)
+		id2 := fmt.Sprintf("%013d-610", nowMs)
+		// Only id1 is pre-assigned before WatchAssignments starts; id2 starts unassigned
+		// so its polling goroutine initializes the 1s time.Ticker and waits on <-ticker.C.
+		tc.Assignments.Store(id1, &pb.Assignment{Connection: "10.0.0.29:7777"})
+		t.Cleanup(func() {
+			tc.Assignments.Delete(id1)
+			tc.Assignments.Delete(id2)
+		})
+
+		srv := &grpcServer{}
+		stream := &fakeWatchAssignmentsServerStream{
+			ctx: context.Background(),
+			onSend: func(resp *pb.StreamedWatchAssignmentsResponse) {
+				if resp.GetId() == id1 {
+					// Give id2's polling goroutine a brief moment to miss the initial
+					// tc.Assignments.Load(id2) and enter <-ticker.C, then assign id2 via CreateAssignments.
+					time.Sleep(15 * time.Millisecond)
+					_, createErr := srv.CreateAssignments(context.Background(), &pb.CreateAssignmentsRequest{
+						AssignmentRoster: &pb.Roster{
+							Name:       "async_roster",
+							Assignment: &pb.Assignment{Connection: "10.0.0.30:7777"},
+							Tickets:    []*pb.Ticket{{Id: id2}},
+						},
+					})
+					assert.NoError(t, createErr)
+				}
+			},
+		}
+
+		baselineGoroutines := runtime.NumGoroutine()
+		err := srv.WatchAssignments(&pb.WatchAssignmentsRequest{
+			TicketIds: []string{id1, id2},
+		}, stream)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, runtime.NumGoroutine(), baselineGoroutines, "WatchAssignments must stop ticker and exit all polling goroutines before returning")
+
+		stream.mu.Lock()
+		got := make(map[string]string, len(stream.responses))
+		for _, r := range stream.responses {
+			got[r.GetId()] = r.GetAssignment().GetConnection()
+		}
+		stream.mu.Unlock()
+		assert.Equal(t, map[string]string{
+			id1: "10.0.0.29:7777",
+			id2: "10.0.0.30:7777",
+		}, got)
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
+		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		assert.Equal(t, int64(0), activeWatches, "active watch gauge must return to 0 after async ticker-polled delivery")
+	})
 }
