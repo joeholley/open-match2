@@ -54,35 +54,42 @@ func In(pool *pb.Pool, ticket *pb.Ticket) bool {
 
 	// CreateTime is validated by Open Match on ticket ingestion and hence
 	// expected to be valid.
-	crTime := filterableFields.GetCreationTime().AsTime()
 	crTimeFilter := pool.GetCreationTimeRangeFilter()
 
 	if crTimeFilter != nil { //nolint:nestif
+		if filterableFields.GetCreationTime() == nil {
+			return false
+		}
+		crTime := filterableFields.GetCreationTime().AsTime()
 
 		// Converting from timestamppb to time.Time for comparison.
 		// filtering is in the performance critical path, so
 		// doing those conversions only once per field is probably (?) faster.
-		crTimeFilterEnd := crTimeFilter.GetEnd().AsTime()
-		crTimeFilterStart := crTimeFilter.GetStart().AsTime()
-
-		// Created before the filter Start time
-		if crTime.Before(crTimeFilterStart) {
-			return false
-		}
-		// Created after the filter End time
-		if crTime.After(crTimeFilterEnd) {
-			return false
-		}
-		// Created on the filter Start timestamp
-		if crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_START || crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_BOTH {
-			if crTime == crTimeFilterStart {
+		if crTimeFilter.GetStart() != nil {
+			crTimeFilterStart := crTimeFilter.GetStart().AsTime()
+			// Created before the filter Start time
+			if crTime.Before(crTimeFilterStart) {
 				return false
 			}
+			// Created on the filter Start timestamp
+			if crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_START || crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_BOTH {
+				if crTime == crTimeFilterStart {
+					return false
+				}
+			}
 		}
-		// Created on the filter End timestamp
-		if crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_END || crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_BOTH {
-			if crTime == crTimeFilterEnd {
+
+		if crTimeFilter.GetEnd() != nil {
+			crTimeFilterEnd := crTimeFilter.GetEnd().AsTime()
+			// Created after the filter End time
+			if crTime.After(crTimeFilterEnd) {
 				return false
+			}
+			// Created on the filter End timestamp
+			if crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_END || crTimeFilter.GetBounds() == pb.Pool_EXCLUDE_BOTH {
+				if crTime == crTimeFilterEnd {
+					return false
+				}
 			}
 		}
 	}

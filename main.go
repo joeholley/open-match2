@@ -791,7 +791,7 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			// Initialize a clean roster for this pool
 			validPools[name] = make([]*pb.Ticket, 0)
 		} else {
-			logger.Error("Unable to fill pool with tickets, invalid: %w", err)
+			logger.Errorf("Unable to fill pool with tickets, invalid: %v", err)
 		}
 	}
 

@@ -99,6 +99,13 @@ func TestValidPoolFilter(t *testing.T) {
 			wantOk: true,
 		},
 		{
+			name: "valid creation time filter with both start and end nil",
+			pool: &pb.Pool{
+				CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{},
+			},
+			wantOk: true,
+		},
+		{
 			name: "invalid creation time filter start",
 			pool: &pb.Pool{
 				CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{

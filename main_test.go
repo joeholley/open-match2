@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1960,6 +1961,10 @@ func TestInvokeMMFsCloseSendEmptyPoolsAndSendError(t *testing.T) {
 					TagPresentFilters: []*pb.Pool_TagPresentFilter{
 						{Tag: "mode-a"},
 					},
+					CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{
+						Start: timestamppb.New(time.Now().Add(-time.Hour)),
+						End:   nil,
+					},
 				},
 				"subset_pool": {
 					Name: "subset_pool",
@@ -1971,6 +1976,12 @@ func TestInvokeMMFsCloseSendEmptyPoolsAndSendError(t *testing.T) {
 					Name: "empty_pool",
 					TagPresentFilters: []*pb.Pool_TagPresentFilter{
 						{Tag: "tag-matching-zero-tickets"},
+					},
+				},
+				"invalid_pool": {
+					Name: "invalid_pool",
+					CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{
+						Start: &timestamppb.Timestamp{Nanos: -1},
 					},
 				},
 			},
@@ -1991,9 +2002,27 @@ func TestInvokeMMFsCloseSendEmptyPoolsAndSendError(t *testing.T) {
 		},
 	}
 
+	var logBuf syncBuffer
+	prevOut := logger.Logger.Out
+	prevLevel := logger.Logger.GetLevel()
+	logger.Logger.SetOutput(&logBuf)
+	logger.Logger.SetLevel(logrus.ErrorLevel)
+	defer func() {
+		logger.Logger.SetLevel(prevLevel)
+		logger.Logger.SetOutput(prevOut)
+	}()
+
 	stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
 	err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
 	require.NoError(t, err)
+
+	// Verify invalid_pool triggered the formatted Errorf log in getFilteredTickets
+	// (main.go:794) without raw "%w" or "%!w" formatting artifacts.
+	loggedOutput := logBuf.String()
+	assert.Contains(t, loggedOutput, "Unable to fill pool with tickets, invalid:")
+	assert.Contains(t, loggedOutput, ".invalid creation time filter start value")
+	assert.NotContains(t, loggedOutput, "%w")
+	assert.NotContains(t, loggedOutput, "%!w")
 
 	// 1. Verify eof-reading-mmf received multiple chunks and terminated its Recv()
 	// loop cleanly on io.EOF (because openAndSendChunks called CloseSend()).
@@ -2061,4 +2090,23 @@ func TestInvokeMMFsCloseSendEmptyPoolsAndSendError(t *testing.T) {
 	eofMatches, found := findInt64SumPointByMMF(rm, "om_core.match.received", "eof-reading-mmf", expectedProfileAttr)
 	require.True(t, found, "expected om_core.match.received data point for eof-reading-mmf")
 	assert.Equal(t, int64(1), eofMatches)
+}
+
+// syncBuffer is a concurrency-safe io.Writer for capturing logrus output
+// across concurrent MMF goroutines under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
