@@ -402,6 +402,12 @@ func deactivateTickets(parentCtx context.Context, logger *logrus.Entry, tc *cach
 	// Send the ticket activation updates.
 	updateStateErrDetails, _ := updateTicketsActiveState(ctx, logger, tc, validTicketIds, store.Deactivate)
 
+	// Record metrics before merging invalidIdErrorDetails into updateStateErrDetails
+	// so invalid ticket IDs are not double-counted in otelFailedIdsPerDeactivateCall.
+	otelDeactivationsPerCall.Record(ctx, int64(len(validTicketIds)))
+	otelInvalidIdsPerDeactivateCall.Record(ctx, int64(len(invalidIdErrorDetails)))
+	otelFailedIdsPerDeactivateCall.Record(ctx, int64(len(updateStateErrDetails)))
+
 	// Attach error details we found while validating ticket IDs and
 	// replicating the updates.
 	maps.Copy(updateStateErrDetails, invalidIdErrorDetails)
@@ -411,13 +417,6 @@ func deactivateTickets(parentCtx context.Context, logger *logrus.Entry, tc *cach
 		} else {
 			err = addErrorDetails(updateStateErrDetails, status.New(codes.Internal, "unable to update ticket state"))
 		}
-	}
-
-	// Record metrics
-	if meter != nil {
-		otelDeactivationsPerCall.Record(ctx, int64(len(validTicketIds)))
-		otelInvalidIdsPerDeactivateCall.Record(ctx, int64(len(invalidIdErrorDetails)))
-		otelFailedIdsPerDeactivateCall.Record(ctx, int64(len(updateStateErrDetails)))
 	}
 
 	return &pb.DeactivateTicketsResponse{}, err
@@ -460,6 +459,12 @@ func activateTickets(parentCtx context.Context, logger *logrus.Entry, tc *cache.
 	// Send the ticket activation updates.
 	updateStateErrDetails, _ := updateTicketsActiveState(ctx, logger, tc, validTicketIds, store.Activate)
 
+	// Record metrics before merging invalidIdErrorDetails into updateStateErrDetails
+	// so invalid ticket IDs are not double-counted in otelFailedIdsPerActivateCall.
+	otelActivationsPerCall.Record(ctx, int64(len(validTicketIds)))
+	otelInvalidIdsPerActivateCall.Record(ctx, int64(len(invalidIdErrorDetails)))
+	otelFailedIdsPerActivateCall.Record(ctx, int64(len(updateStateErrDetails)))
+
 	// Attach error details we found while validating ticket IDs and
 	// replicating the updates.
 	maps.Copy(updateStateErrDetails, invalidIdErrorDetails)
@@ -469,13 +474,6 @@ func activateTickets(parentCtx context.Context, logger *logrus.Entry, tc *cache.
 		} else {
 			err = addErrorDetails(updateStateErrDetails, status.New(codes.Internal, "unable to update ticket state"))
 		}
-	}
-
-	// Record metrics
-	if meter != nil {
-		otelActivationsPerCall.Record(ctx, int64(len(validTicketIds)))
-		otelInvalidIdsPerActivateCall.Record(ctx, int64(len(invalidIdErrorDetails)))
-		otelFailedIdsPerActivateCall.Record(ctx, int64(len(updateStateErrDetails)))
 	}
 
 	return &pb.ActivateTicketsResponse{}, err

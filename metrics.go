@@ -260,8 +260,8 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	}
 
 	otelAssignmentWatches, err = meter.Int64UpDownCounter(
-		metricsNamePrefix+"ticket.assigment.watch",
-		otelmetrics.WithDescription("Number of tickets assignments included in each CreateAssignments() call"),
+		metricsNamePrefix+"ticket.assignment.watch",
+		otelmetrics.WithDescription("Number of tickets currently being watched for assignment"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

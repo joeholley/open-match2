@@ -188,7 +188,6 @@ func (st *Handler) HandleRPC(ctx context.Context, stat stats.RPCStats) {
 		if s.Error != nil {
 			exitStatus, _ := status.FromError(s.Error)
 			otelRpcErrors.Add(ctx, 1, rpcNameAttr, metric.WithAttributes(
-				attribute.String("error", s.Error.Error()),
 				attribute.String("grpc.status", exitStatus.Code().String()),
 			))
 		}

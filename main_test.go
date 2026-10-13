@@ -60,6 +60,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -2435,7 +2436,7 @@ func TestCreateAssignmentsValidationReplicationAndMetrics(t *testing.T) {
 
 // TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics verifies that WatchAssignments:
 //  1. Streams assignments for all watched tickets when present and leaves
-//     otelAssignmentWatches ("om_core.ticket.assigment.watch") at net 0.
+//     otelAssignmentWatches ("om_core.ticket.assignment.watch") at net 0.
 //  2. On partial delivery followed by TTL timeout (<-timeout), decrements the
 //     remaining (len(req.GetTicketIds()) - i) watches so otelAssignmentWatches
 //     returns to 0 (instead of adding +len-i), cancels and waits for all polling
@@ -2491,8 +2492,8 @@ func TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics(t *testing.T) {
 
 		var rm metricdata.ResourceMetrics
 		require.NoError(t, metricReader.Collect(context.Background(), &rm))
-		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
-		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assignment.watch")
+		require.True(t, found, "expected om_core.ticket.assignment.watch data point")
 		assert.Equal(t, int64(0), activeWatches, "active watch gauge must return to 0 after all assignments are delivered")
 	})
 
@@ -2552,8 +2553,8 @@ func TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics(t *testing.T) {
 
 		var rm metricdata.ResourceMetrics
 		require.NoError(t, metricReader.Collect(context.Background(), &rm))
-		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
-		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assignment.watch")
+		require.True(t, found, "expected om_core.ticket.assignment.watch data point")
 		assert.Equal(t, int64(0), activeWatches, "timeout branch must subtract remaining (len-i) watches so gauge returns to 0")
 	})
 
@@ -2635,8 +2636,8 @@ func TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics(t *testing.T) {
 
 		var rm metricdata.ResourceMetrics
 		require.NoError(t, metricReader.Collect(context.Background(), &rm))
-		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
-		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assignment.watch")
+		require.True(t, found, "expected om_core.ticket.assignment.watch data point")
 		assert.Equal(t, int64(0), activeWatches, "stream cancellation branch must subtract remaining (len-i) watches so gauge returns to 0")
 	})
 
@@ -2713,8 +2714,8 @@ func TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics(t *testing.T) {
 
 		var rm metricdata.ResourceMetrics
 		require.NoError(t, metricReader.Collect(context.Background(), &rm))
-		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
-		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
+		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assignment.watch")
+		require.True(t, found, "expected om_core.ticket.assignment.watch data point")
 		assert.Equal(t, int64(0), activeWatches, "active watch gauge must return to 0 after async ticker-polled delivery")
 	})
 }
@@ -3306,3 +3307,345 @@ func TestCreateTicketStatusMetricsAndDefaultExpirationFromCreationTime(t *testin
 		}, 2*time.Second, 10*time.Millisecond, "ticket with old CreationTime and nil ExpirationTime must expire immediately while fresh control ticket remains in cache")
 	})
 }
+
+// TestMetricsRpcErrorsCardinalityActivationDeactivationFailureCountsAndWatchMetric
+// verifies REC-10 (Task M-09):
+//  1. Handler.HandleRPC records om_core.rpc.errors with only bounded ("rpc", "grpc.status")
+//     attributes and never attaches the raw dynamic error string ("error" attribute),
+//     collapsing distinct error messages with the same (rpc, grpc.status) into a single
+//     counter time series.
+//  2. activateTickets and deactivateTickets record otelFailedIdsPerActivateCall and
+//     otelFailedIdsPerDeactivateCall ("*.failures.unspecified") before merging
+//     invalidIdErrorDetails into updateStateErrDetails so invalid ticket IDs are not
+//     double-counted in "*.failures.unspecified", while still returning all invalid and
+//     replication-failed ticket IDs in the gRPC status BadRequest_FieldViolation details.
+//  3. otelAssignmentWatches is registered under "om_core.ticket.assignment.watch" (fixing
+//     the "assigment" typo) with description "Number of tickets currently being watched
+//     for assignment", distinct from "om_core.ticket.assignment".
+func TestMetricsRpcErrorsCardinalityActivationDeactivationFailureCountsAndWatchMetric(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("HandleRPCBoundsRpcErrorsAttributesWithoutRawErrorString", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.m09_rpc_errors")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		h := New()
+		createCtx := h.TagRPC(context.Background(), &stats.RPCTagInfo{
+			FullMethodName: "/openmatch.OpenMatchService/CreateTicket",
+		})
+		activateCtx := h.TagRPC(context.Background(), &stats.RPCTagInfo{
+			FullMethodName: "/openmatch.OpenMatchService/ActivateTickets",
+		})
+
+		t0 := time.Now()
+		// 3 CreateTicket InvalidArgument errors with distinct dynamic error messages.
+		for i := 1; i <= 3; i++ {
+			h.HandleRPC(createCtx, &stats.End{
+				BeginTime: t0,
+				EndTime:   t0.Add(10 * time.Millisecond),
+				Error:     status.Errorf(codes.InvalidArgument, "invalid ticket expiration for ticket-%d at %d", i, t0.UnixNano()+int64(i)),
+			})
+		}
+		// 1 CreateTicket Internal error with dynamic error message.
+		h.HandleRPC(createCtx, &stats.End{
+			BeginTime: t0,
+			EndTime:   t0.Add(15 * time.Millisecond),
+			Error:     status.Errorf(codes.Internal, "redis connection reset on 10.0.0.%d:6379", 42),
+		})
+		// 1 successful CreateTicket call (Error: nil) -> increments rpc.duration but not rpc.errors.
+		h.HandleRPC(createCtx, &stats.End{
+			BeginTime: t0,
+			EndTime:   t0.Add(20 * time.Millisecond),
+			Error:     nil,
+		})
+		// 2 ActivateTickets non-gRPC errors -> status.FromError maps to codes.Unknown.
+		for i := 1; i <= 2; i++ {
+			h.HandleRPC(activateCtx, &stats.End{
+				BeginTime: t0,
+				EndTime:   t0.Add(5 * time.Millisecond),
+				Error:     fmt.Errorf("unexpected transport error #%d", i),
+			})
+		}
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+
+		var foundErrorsMetric, foundDurationMetric bool
+		errorSeries := make(map[string]int64)
+		durationCounts := make(map[string]uint64)
+
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				switch m.Name {
+				case "om_core.rpc.errors":
+					foundErrorsMetric = true
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						_, hasErrorAttr := dp.Attributes.Value(attribute.Key("error"))
+						assert.False(t, hasErrorAttr, "om_core.rpc.errors must not attach unbounded 'error' attribute")
+						assert.Equal(t, 2, dp.Attributes.Len(), "om_core.rpc.errors data point must have exactly 2 attributes (rpc, grpc.status)")
+
+						rpcVal, hasRPC := dp.Attributes.Value(attribute.Key("rpc"))
+						statusVal, hasStatus := dp.Attributes.Value(attribute.Key("grpc.status"))
+						require.True(t, hasRPC)
+						require.True(t, hasStatus)
+						errorSeries[rpcVal.AsString()+"|"+statusVal.AsString()] = dp.Value
+					}
+				case "om_core.rpc.duration":
+					foundDurationMetric = true
+					hist, ok := m.Data.(metricdata.Histogram[float64])
+					require.True(t, ok)
+					for _, dp := range hist.DataPoints {
+						rpcVal, hasRPC := dp.Attributes.Value(attribute.Key("rpc"))
+						require.True(t, hasRPC)
+						durationCounts[rpcVal.AsString()] = dp.Count
+						assert.Greater(t, dp.Sum, 0.0)
+					}
+				}
+			}
+		}
+
+		require.True(t, foundErrorsMetric, "expected om_core.rpc.errors metric")
+		require.True(t, foundDurationMetric, "expected om_core.rpc.duration metric")
+		assert.Equal(t, map[string]int64{
+			"CreateTicket|InvalidArgument": 3,
+			"CreateTicket|Internal":        1,
+			"ActivateTickets|Unknown":      2,
+		}, errorSeries, "distinct dynamic error messages with identical (rpc, grpc.status) must aggregate into bounded series")
+		assert.Equal(t, map[string]uint64{
+			"CreateTicket":    5,
+			"ActivateTickets": 2,
+		}, durationCounts)
+	})
+
+	t.Run("ActivateAndDeactivateTicketsDoNotDoubleCountInvalidIdsInUnspecifiedFailures", func(t *testing.T) {
+		t.Run("MixedValidAndInvalidIdsWithAllValidSucceeding", func(t *testing.T) {
+			metricReader := sdkmetric.NewManualReader()
+			testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+			defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+			testMeter := testMeterProvider.Meter("open_match.core.m09_mixed_all_valid_ok")
+
+			prevMeter := meter
+			registerMetrics(&testMeter)
+			defer func() {
+				if prevMeter != nil {
+					registerMetrics(prevMeter)
+				}
+			}()
+
+			nowMs := time.Now().UnixMilli()
+			valid1 := fmt.Sprintf("%013d-901", nowMs)
+			valid2 := fmt.Sprintf("%013d-902", nowMs)
+			badIDs := []string{"bad-ticket-1", "bad-ticket-2", "bad-ticket-3"}
+			mixedIDs := []string{valid1, badIDs[0], valid2, badIDs[1], badIDs[2]}
+
+			// 1. ActivateTickets with 2 valid IDs + 3 invalid IDs (all valid IDs succeed replication).
+			_, err := activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+				TicketIds: mixedIDs,
+			})
+			require.Error(t, err)
+			stAct := status.Convert(err)
+			assert.Equal(t, codes.InvalidArgument, stAct.Code())
+			assert.ElementsMatch(t, badIDs, getStatusDetailBrvKeys(stAct))
+
+			// 2. DeactivateTickets with 2 valid IDs + 3 invalid IDs (all valid IDs succeed replication).
+			_, err = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: mixedIDs,
+			})
+			require.Error(t, err)
+			stDeact := status.Convert(err)
+			assert.Equal(t, codes.InvalidArgument, stDeact.Code())
+			assert.ElementsMatch(t, badIDs, getStatusDetailBrvKeys(stDeact))
+
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, metricReader.Collect(context.Background(), &rm))
+
+			actReqCount, actReqSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.activation.requests")
+			require.True(t, found)
+			assert.Equal(t, uint64(1), actReqCount)
+			assert.Equal(t, int64(2), actReqSum, "activation.requests must record the 2 valid ticket IDs")
+
+			actInvCount, actInvSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.activation.failures.invalid_id")
+			require.True(t, found)
+			assert.Equal(t, uint64(1), actInvCount)
+			assert.Equal(t, int64(3), actInvSum, "activation.failures.invalid_id must record the 3 invalid ticket IDs")
+
+			actFailCount, actFailSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.activation.failures.unspecified")
+			require.True(t, found)
+			assert.Equal(t, uint64(1), actFailCount)
+			assert.Equal(t, int64(0), actFailSum, "activation.failures.unspecified must be 0 when all valid IDs succeed (never double-counting the 3 invalid IDs)")
+
+			deactReqCount, deactReqSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.deactivation.requests")
+			require.True(t, found)
+			assert.Equal(t, uint64(1), deactReqCount)
+			assert.Equal(t, int64(2), deactReqSum, "deactivation.requests must record the 2 valid ticket IDs")
+
+			deactInvCount, deactInvSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.deactivation.failures.invalid_id")
+			require.True(t, found)
+			assert.Equal(t, uint64(1), deactInvCount)
+			assert.Equal(t, int64(3), deactInvSum, "deactivation.failures.invalid_id must record the 3 invalid ticket IDs")
+
+			deactFailCount, deactFailSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.deactivation.failures.unspecified")
+			require.True(t, found)
+			assert.Equal(t, uint64(1), deactFailCount)
+			assert.Equal(t, int64(0), deactFailSum, "deactivation.failures.unspecified must be 0 when all valid IDs succeed (never double-counting the 3 invalid IDs)")
+		})
+
+		t.Run("MixedValidAndInvalidIdsWithSubsetOfValidFailingReplication", func(t *testing.T) {
+			metricReader := sdkmetric.NewManualReader()
+			testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+			defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+			testMeter := testMeterProvider.Meter("open_match.core.m09_mixed_subset_repl_fail")
+
+			prevMeter := meter
+			registerMetrics(&testMeter)
+			defer func() {
+				if prevMeter != nil {
+					registerMetrics(prevMeter)
+				}
+			}()
+
+			localCfg := config.Read()
+			localCfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
+			localCfg.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			nowMs := time.Now().UnixMilli()
+			validOK := fmt.Sprintf("%013d-911", nowMs)
+			validFail1 := fmt.Sprintf("%013d-912", nowMs)
+			validFail2 := fmt.Sprintf("%013d-913", nowMs)
+			invalidIDs := []string{"invalid-id-1", "invalid-id-2", "invalid-id-3", "invalid-id-4"}
+
+			selectiveRep := &errorInjectingReplicator{
+				inner: memoryReplicator.New(localCfg),
+				onSend: func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse {
+					for i, u := range updates {
+						if u.Key == validFail1 || u.Key == validFail2 {
+							results[i] = &store.StateResponse{
+								Result: u.Key,
+								Err:    fmt.Errorf("simulated replication failure for %s", u.Key),
+							}
+						}
+					}
+					return results
+				},
+			}
+			localTc := cache.New(localCfg, selectiveRep)
+			go localTc.OutgoingReplicationQueue(ctx)
+
+			mixedInput := []string{
+				validOK,
+				invalidIDs[0],
+				validFail1,
+				invalidIDs[1],
+				validFail2,
+				invalidIDs[2],
+				invalidIDs[3],
+			}
+			expectedViolationKeys := []string{
+				validFail1,
+				validFail2,
+				invalidIDs[0],
+				invalidIDs[1],
+				invalidIDs[2],
+				invalidIDs[3],
+			}
+
+			// 1. ActivateTickets: 3 valid IDs (1 succeeds, 2 fail replication) + 4 invalid IDs.
+			_, err := activateTickets(ctx, testLogger, localTc, &pb.ActivateTicketsRequest{
+				TicketIds: mixedInput,
+			})
+			require.Error(t, err)
+			stAct := status.Convert(err)
+			assert.Equal(t, codes.InvalidArgument, stAct.Code())
+			assert.ElementsMatch(t, expectedViolationKeys, getStatusDetailBrvKeys(stAct),
+				"returned status details must still include all 6 failed keys (2 replication failures + 4 invalid IDs)")
+
+			// 2. DeactivateTickets: 3 valid IDs (1 succeeds, 2 fail replication) + 4 invalid IDs.
+			_, err = deactivateTickets(ctx, testLogger, localTc, &pb.DeactivateTicketsRequest{
+				TicketIds: mixedInput,
+			})
+			require.Error(t, err)
+			stDeact := status.Convert(err)
+			assert.Equal(t, codes.InvalidArgument, stDeact.Code())
+			assert.ElementsMatch(t, expectedViolationKeys, getStatusDetailBrvKeys(stDeact),
+				"returned status details must still include all 6 failed keys (2 replication failures + 4 invalid IDs)")
+
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, metricReader.Collect(context.Background(), &rm))
+
+			_, actReqSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.activation.requests")
+			require.True(t, found)
+			assert.Equal(t, int64(3), actReqSum, "activation.requests must record the 3 valid ticket IDs")
+
+			_, actInvSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.activation.failures.invalid_id")
+			require.True(t, found)
+			assert.Equal(t, int64(4), actInvSum, "activation.failures.invalid_id must record the 4 invalid ticket IDs")
+
+			_, actFailSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.activation.failures.unspecified")
+			require.True(t, found)
+			assert.Equal(t, int64(2), actFailSum, "activation.failures.unspecified must record only the 2 replication failures (not 2+4=6)")
+
+			_, deactReqSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.deactivation.requests")
+			require.True(t, found)
+			assert.Equal(t, int64(3), deactReqSum, "deactivation.requests must record the 3 valid ticket IDs")
+
+			_, deactInvSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.deactivation.failures.invalid_id")
+			require.True(t, found)
+			assert.Equal(t, int64(4), deactInvSum, "deactivation.failures.invalid_id must record the 4 invalid ticket IDs")
+
+			_, deactFailSum, found := findInt64HistogramCountAndSum(rm, "om_core.ticket.deactivation.failures.unspecified")
+			require.True(t, found)
+			assert.Equal(t, int64(2), deactFailSum, "deactivation.failures.unspecified must record only the 2 replication failures (not 2+4=6)")
+		})
+	})
+
+	t.Run("AssignmentWatchMetricNameAndDescription", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.m09_watch_metric")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		ctx := context.Background()
+		otelAssignmentsPerCall.Record(ctx, 2)
+		otelAssignmentWatches.Add(ctx, 3)
+		otelAssignmentWatches.Add(ctx, -3)
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(ctx, &rm))
+
+		descriptions := make(map[string]string)
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				descriptions[m.Name] = m.Description
+			}
+		}
+
+		assert.NotContains(t, descriptions, "om_core.ticket.assigment.watch", "misspelled om_core.ticket.assigment.watch metric must not be registered")
+		require.Contains(t, descriptions, "om_core.ticket.assignment.watch", "expected corrected om_core.ticket.assignment.watch metric")
+		assert.Equal(t, "Number of tickets currently being watched for assignment", descriptions["om_core.ticket.assignment.watch"])
+		assert.Equal(t, "Number of tickets assignments included in each CreateAssignments() call", descriptions["om_core.ticket.assignment"])
+	})
+}
+
