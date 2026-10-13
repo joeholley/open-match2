@@ -1204,39 +1204,45 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 						return
 					}
 
-					// Kick off deactivation
-					logger.Tracef("deactivating tickets in %v", res.GetId())
-					errs, maxReplId := updateTicketsActiveState(ctx, logger, &tc, ticketIdsToDeactivate, store.Deactivate)
-					if len(errs) > 0 {
-						logger.Errorf("Error deactivating match %v tickets: %v", res.GetId(), errs)
-					}
-					otelMmfTicketDeactivations.Add(ctx, int64(len(ticketIdsToDeactivate)-len(errs)),
-						metric.WithAttributes(
-							attribute.String("mmf.name", mmf.GetName()),
-							attribute.String("profile.name", profileName),
-						),
-					)
-
-					logger.Tracef("Done requesting deactivation of tickets in %v", res.GetId())
-
-					// Select the last ticket ID in the match whose deactivation
-					// write succeeded. If every ticket write failed, do not
-					// block waiting for replication that can never arrive.
-					targetTicketId := ""
-					for idx := len(ticketIdsToDeactivate) - 1; idx >= 0; idx-- {
-						candidateId := ticketIdsToDeactivate[idx]
-						if _, failed := errs[candidateId]; !failed {
-							targetTicketId = candidateId
-							break
+					deactivateMatchTickets := func(annotateOnTimeout bool) {
+						// Kick off deactivation
+						logger.Tracef("deactivating tickets in %v", res.GetId())
+						errs, maxReplId := updateTicketsActiveState(ctx, logger, &tc, ticketIdsToDeactivate, store.Deactivate)
+						if len(errs) > 0 {
+							logger.Errorf("Error deactivating match %v tickets: %v", res.GetId(), errs)
 						}
+						otelMmfTicketDeactivations.Add(ctx, int64(len(ticketIdsToDeactivate)-len(errs)),
+							metric.WithAttributes(
+								attribute.String("mmf.name", mmf.GetName()),
+								attribute.String("profile.name", profileName),
+							),
+						)
+
+						logger.Tracef("Done requesting deactivation of tickets in %v", res.GetId())
+
+						// Select the last ticket ID in the match whose deactivation
+						// write succeeded. If every ticket write failed, do not
+						// block waiting for replication that can never arrive.
+						targetTicketId := ""
+						for idx := len(ticketIdsToDeactivate) - 1; idx >= 0; idx-- {
+							candidateId := ticketIdsToDeactivate[idx]
+							if _, failed := errs[candidateId]; !failed {
+								targetTicketId = candidateId
+								break
+							}
+						}
+
+						waitForMatchDeactivation(ctx, logger, &tc, res, mmf.GetName(), profileName, targetTicketId, maxReplId, annotateOnTimeout)
 					}
+
+					deactivationWait := cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT")
 
 					// Option 1 (default): Wait for deactivation to complete
 					// BEFORE returning the match. If waiting for replication
 					// times out, annotate res.Extensions[MatchDeactivationTimeoutExtensionKey]
 					// before queueing res on matchChan.
-					if cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
-						waitForMatchDeactivation(ctx, logger, &tc, res, mmf.GetName(), profileName, targetTicketId, maxReplId, true)
+					if deactivationWait {
+						deactivateMatchTickets(true)
 						logger.Trace("ticket deactivations complete, returning match")
 					}
 
@@ -1261,8 +1267,8 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					// goroutine when deactivation is complete. Only use this
 					// setting if you throughly understand this code, and the
 					// state storage replication code!
-					if !cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
-						waitForMatchDeactivation(ctx, logger, &tc, res, mmf.GetName(), profileName, targetTicketId, maxReplId, false)
+					if !deactivationWait {
+						deactivateMatchTickets(false)
 						logger.Trace("ticket deactivations complete for previously returned match")
 					}
 				}(resultCopy) // End of match return & ticket deactivation goroutine

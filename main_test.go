@@ -675,12 +675,20 @@ func TestPackedUpdateTicketsActiveState(t *testing.T) {
 	}
 }
 
-// errorInjectingReplicator wraps a store.StateReplicator and invokes onSend to
-// inject custom per-update errors or modify StateResponse results.
+// errorInjectingReplicator wraps a store.StateReplicator and invokes beforeSend
+// (before delegating to inner.SendUpdates) and onSend (after delegating to
+// inner.SendUpdates) to synchronize or inject custom per-update errors in tests.
 type errorInjectingReplicator struct {
-	mu     sync.RWMutex
-	inner  store.StateReplicator
-	onSend func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse
+	mu         sync.RWMutex
+	inner      store.StateReplicator
+	beforeSend func(updates []*store.StateUpdate)
+	onSend     func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse
+}
+
+func (r *errorInjectingReplicator) setBeforeSend(fn func(updates []*store.StateUpdate)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.beforeSend = fn
 }
 
 func (r *errorInjectingReplicator) setOnSend(fn func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse) {
@@ -694,6 +702,12 @@ func (r *errorInjectingReplicator) GetUpdates() []*store.StateUpdate {
 }
 
 func (r *errorInjectingReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
+	r.mu.RLock()
+	beforeSend := r.beforeSend
+	r.mu.RUnlock()
+	if beforeSend != nil {
+		beforeSend(updates)
+	}
 	res := r.inner.SendUpdates(updates)
 	r.mu.RLock()
 	onSend := r.onSend
@@ -1150,13 +1164,14 @@ func TestBuildChunkedRequestsPreservesEmptyPoolsAndClonesIndependently(t *testin
 	})
 }
 
-// fakeInvokeMMFServerStream is an in-processpb.OpenMatchService_InvokeMatchmakingFunctionsServer
+// fakeInvokeMMFServerStream is an in-process pb.OpenMatchService_InvokeMatchmakingFunctionsServer
 // test double that records matches streamed back to the caller.
 type fakeInvokeMMFServerStream struct {
 	grpc.ServerStream
 	ctx     context.Context
 	mu      sync.Mutex
 	matches []*pb.Match
+	onSend  func(*pb.StreamedMmfResponse)
 }
 
 func (f *fakeInvokeMMFServerStream) Context() context.Context {
@@ -1165,9 +1180,13 @@ func (f *fakeInvokeMMFServerStream) Context() context.Context {
 
 func (f *fakeInvokeMMFServerStream) Send(resp *pb.StreamedMmfResponse) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if resp.GetMatch() != nil {
 		f.matches = append(f.matches, resp.GetMatch())
+	}
+	onSend := f.onSend
+	f.mu.Unlock()
+	if onSend != nil {
+		onSend(resp)
 	}
 	return nil
 }
@@ -2688,5 +2707,371 @@ func TestWatchAssignmentsDeliveryTimeoutCancellationAndMetrics(t *testing.T) {
 		activeWatches, found := findInt64SumTotal(rm, "om_core.ticket.assigment.watch")
 		require.True(t, found, "expected om_core.ticket.assigment.watch data point")
 		assert.Equal(t, int64(0), activeWatches, "active watch gauge must return to 0 after async ticker-polled delivery")
+	})
+}
+
+// TestInvokeMMFsDeactivationWaitOrderingAndSemantics verifies the ordering and
+// behavioral contract of OM_MATCH_TICKET_DEACTIVATION_WAIT in InvokeMatchmakingFunctions:
+//  1. When OM_MATCH_TICKET_DEACTIVATION_WAIT=false, matches are queued onto
+//     matchChan and streamed to the caller BEFORE updateTicketsActiveState and
+//     waitForMatchDeactivation complete, while still completing ticket
+//     deactivation asynchronously before InvokeMatchmakingFunctions returns.
+//  2. When OM_MATCH_TICKET_DEACTIVATION_WAIT=true, updateTicketsActiveState and
+//     waitForMatchDeactivation complete BEFORE the match is queued onto matchChan
+//     and streamed to the caller.
+//  3. When OM_MATCH_TICKET_DEACTIVATION_WAIT=false and the caller's stream.Context()
+//     is already cancelled when the match arrives from the MMF, the match is
+//     dropped before matchChan <- res and its tickets are not deactivated.
+func TestInvokeMMFsDeactivationWaitOrderingAndSemantics(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("DeactivationWaitFalseStreamsMatchBeforeDeactivationWriteCompletes", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		subCfg.Set("OM_MATCH_TICKET_DEACTIVATION_WAIT", false)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.deactivation_wait_false")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		createResp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.NoError(t, err)
+		ticketID := createResp.GetTicketId()
+		t.Cleanup(func() {
+			globalTestReplicator.setBeforeSend(nil)
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{ticketID},
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+
+		_, err = activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: []string{ticketID},
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
+
+		// Block the store.Deactivate replication write for ticketID until the
+		// caller stream has already received the match via stream.Send.
+		// Under the old code (where updateTicketsActiveState ran synchronously
+		// before matchChan <- res even when OM_MATCH_TICKET_DEACTIVATION_WAIT=false),
+		// stream.Send could never be reached while beforeSend blocked, causing
+		// the 1s safety timer below to fire and fail the test deterministically.
+		matchStreamedToCaller := make(chan struct{})
+		var closeOnce sync.Once
+		var deactivateBlockedUntilAfterStreamSend atomic.Bool
+		var timedOutWaitingForStreamSend atomic.Bool
+
+		globalTestReplicator.setBeforeSend(func(updates []*store.StateUpdate) {
+			for _, u := range updates {
+				if u.Cmd == store.Deactivate && (u.Key == ticketID || len(u.Keys) > 0) {
+					select {
+					case <-matchStreamedToCaller:
+						deactivateBlockedUntilAfterStreamSend.Store(true)
+					case <-time.After(time.Second):
+						timedOutWaitingForStreamSend.Store(true)
+					}
+					return
+				}
+			}
+		})
+		defer globalTestReplicator.setBeforeSend(nil)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		mmfSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "match-deactivation-wait-false",
+					Rosters: map[string]*pb.Roster{
+						"roster": {
+							Name:    "roster",
+							Tickets: []*pb.Ticket{{Id: ticketID}},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		var wasInactiveAtStreamSend atomic.Bool
+		var streamSendObserved atomic.Bool
+		stream := &fakeInvokeMMFServerStream{
+			ctx: context.Background(),
+			onSend: func(_ *pb.StreamedMmfResponse) {
+				_, inactive := tc.InactiveSet.Load(ticketID)
+				wasInactiveAtStreamSend.Store(inactive)
+				streamSendObserved.Store(true)
+				closeOnce.Do(func() {
+					close(matchStreamedToCaller)
+				})
+			},
+		}
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m06.wait_false",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "async-deact-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+
+		assert.True(t, streamSendObserved.Load(), "expected match to be delivered to stream.Send")
+		assert.False(t, timedOutWaitingForStreamSend.Load(), "OM_MATCH_TICKET_DEACTIVATION_WAIT=false must stream match before updateTicketsActiveState blocks")
+		assert.True(t, deactivateBlockedUntilAfterStreamSend.Load(), "store.Deactivate write must unblock via matchStreamedToCaller closed inside stream.Send")
+		assert.False(t, wasInactiveAtStreamSend.Load(), "ticket must still be active at the moment stream.Send delivers the match when OM_MATCH_TICKET_DEACTIVATION_WAIT=false")
+
+		stream.mu.Lock()
+		require.Len(t, stream.matches, 1)
+		assert.Equal(t, "match-deactivation-wait-false", stream.matches[0].GetId())
+		assert.NotContains(t, stream.matches[0].GetExtensions(), MatchDeactivationTimeoutExtensionKey)
+		stream.mu.Unlock()
+
+		// By the time InvokeMatchmakingFunctions returns, tdwg.Wait() has waited
+		// for the asynchronous deactivation to complete and replicate to tc.InactiveSet.
+		_, inactiveAfterReturn := tc.InactiveSet.Load(ticketID)
+		assert.True(t, inactiveAfterReturn, "ticket must be deactivated in tc.InactiveSet before InvokeMatchmakingFunctions returns")
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		deactCount, found := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "async-deact-mmf", "com.example.m06")
+		require.True(t, found, "expected om_core.mmf.deactivations data point")
+		assert.Equal(t, int64(1), deactCount)
+	})
+
+	t.Run("DeactivationWaitTrueWaitsForLocalReplicationBeforeStreamingMatch", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		subCfg.Set("OM_MATCH_TICKET_DEACTIVATION_WAIT", true)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		createResp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.NoError(t, err)
+		ticketID := createResp.GetTicketId()
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{ticketID},
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+
+		_, err = activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: []string{ticketID},
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		mmfSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "match-deactivation-wait-true",
+					Rosters: map[string]*pb.Roster{
+						"roster": {
+							Name:    "roster",
+							Tickets: []*pb.Ticket{{Id: ticketID}},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		var wasInactiveAtStreamSend atomic.Bool
+		var streamSendObserved atomic.Bool
+		stream := &fakeInvokeMMFServerStream{
+			ctx: context.Background(),
+			onSend: func(_ *pb.StreamedMmfResponse) {
+				_, inactive := tc.InactiveSet.Load(ticketID)
+				wasInactiveAtStreamSend.Store(inactive)
+				streamSendObserved.Store(true)
+			},
+		}
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m06.wait_true",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "sync-deact-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+
+		assert.True(t, streamSendObserved.Load(), "expected match to be delivered to stream.Send")
+		assert.True(t, wasInactiveAtStreamSend.Load(), "ticket must already be deactivated in tc.InactiveSet when stream.Send is called with OM_MATCH_TICKET_DEACTIVATION_WAIT=true")
+	})
+
+	t.Run("DeactivationWaitFalseSkipsDeactivationWhenCallerStreamAlreadyCancelled", func(t *testing.T) {
+		prevCfg := cfg
+		subCfg := config.Read()
+		subCfg.Set("OM_MATCH_TICKET_DEACTIVATION_WAIT", false)
+		cfg = subCfg
+		defer func() {
+			cfg = prevCfg
+		}()
+
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.deactivation_wait_false_cancelled")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		createResp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.NoError(t, err)
+		ticketID := createResp.GetTicketId()
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{ticketID},
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+
+		_, err = activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: []string{ticketID},
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		mmfSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "match-dropped-on-cancelled-stream",
+					Rosters: map[string]*pb.Roster{
+						"roster": {
+							Name:    "roster",
+							Tickets: []*pb.Ticket{{Id: ticketID}},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		stream := &fakeInvokeMMFServerStream{ctx: cancelledCtx}
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m06.wait_false_cancelled",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "cancelled-stream-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+
+		stream.mu.Lock()
+		assert.Empty(t, stream.matches, "match must not be queued when stream.Context() is already cancelled")
+		stream.mu.Unlock()
+
+		// Because OM_MATCH_TICKET_DEACTIVATION_WAIT=false checks stream.Context().Err()
+		// before matchChan <- res and before deactivateMatchTickets(false), the
+		// unstreamed match's ticket remains active.
+		_, inactive := tc.InactiveSet.Load(ticketID)
+		assert.False(t, inactive, "ticket from dropped match must remain active when OM_MATCH_TICKET_DEACTIVATION_WAIT=false and stream is already cancelled")
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		_, foundDeact := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "cancelled-stream-mmf", "com.example.m06")
+		assert.False(t, foundDeact, "no ticket deactivations should be recorded for dropped match on cancelled stream")
 	})
 }
