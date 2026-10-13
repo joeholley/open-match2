@@ -1184,6 +1184,7 @@ type fakeInvokeMMFServerStream struct {
 	mu      sync.Mutex
 	matches []*pb.Match
 	onSend  func(*pb.StreamedMmfResponse)
+	sendErr func(*pb.StreamedMmfResponse) error
 }
 
 func (f *fakeInvokeMMFServerStream) Context() context.Context {
@@ -1192,10 +1193,18 @@ func (f *fakeInvokeMMFServerStream) Context() context.Context {
 
 func (f *fakeInvokeMMFServerStream) Send(resp *pb.StreamedMmfResponse) error {
 	f.mu.Lock()
+	sendErrFn := f.sendErr
+	onSend := f.onSend
+	f.mu.Unlock()
+	if sendErrFn != nil {
+		if err := sendErrFn(resp); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
 	if resp.GetMatch() != nil {
 		f.matches = append(f.matches, resp.GetMatch())
 	}
-	onSend := f.onSend
 	f.mu.Unlock()
 	if onSend != nil {
 		onSend(resp)
@@ -3891,5 +3900,986 @@ func TestGracefulShutdownAndContextCancellation(t *testing.T) {
 		assert.Error(t, httpErr, "HTTP listener must be closed after start() returns")
 	})
 }
+
+// TestServerPanicRecoveryInterceptors verifies that unaryPanicRecoveryInterceptor
+// and streamPanicRecoveryInterceptor in server.go pass normal calls through
+// unchanged and recover from handler panics with codes.Internal ("internal server error").
+func TestServerPanicRecoveryInterceptors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("UnaryPanicRecoveryInterceptor", func(t *testing.T) {
+		t.Parallel()
+		info := &grpc.UnaryServerInfo{FullMethod: "/openmatch.OpenMatchService/CreateTicket"}
+
+		// 1. Normal unary handler passes response and nil error through.
+		expectedResp := &pb.CreateTicketResponse{TicketId: "1790307871351-1"}
+		resp, err := unaryPanicRecoveryInterceptor(
+			context.Background(),
+			&pb.CreateTicketRequest{},
+			info,
+			func(_ context.Context, _ any) (any, error) {
+				return expectedResp, nil
+			},
+		)
+		require.NoError(t, err)
+		assert.Same(t, expectedResp, resp)
+
+		// 2. Panicking unary handler recovers and returns codes.Internal.
+		resp, err = unaryPanicRecoveryInterceptor(
+			context.Background(),
+			&pb.CreateTicketRequest{},
+			info,
+			func(_ context.Context, _ any) (any, error) {
+				panic("simulated unary handler panic")
+			},
+		)
+		assert.Nil(t, resp)
+		require.Error(t, err)
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.Contains(t, err.Error(), "internal server error")
+	})
+
+	t.Run("StreamPanicRecoveryInterceptor", func(t *testing.T) {
+		t.Parallel()
+		info := &grpc.StreamServerInfo{FullMethod: "/openmatch.OpenMatchService/InvokeMatchmakingFunctions"}
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+
+		// 1. Normal stream handler passes nil error through.
+		var called bool
+		err := streamPanicRecoveryInterceptor(
+			&grpcServer{},
+			stream,
+			info,
+			func(_ any, _ grpc.ServerStream) error {
+				called = true
+				return nil
+			},
+		)
+		require.NoError(t, err)
+		assert.True(t, called)
+
+		// 2. Panicking stream handler recovers and returns codes.Internal.
+		err = streamPanicRecoveryInterceptor(
+			&grpcServer{},
+			stream,
+			info,
+			func(_ any, _ grpc.ServerStream) error {
+				panic("simulated stream handler panic")
+			},
+		)
+		require.Error(t, err)
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.Contains(t, err.Error(), "internal server error")
+	})
+}
+
+// TestAnnotateMatchDeactivationTimeout verifies that annotateMatchDeactivationTimeout:
+//  1. Is a safe no-op when match is nil.
+//  2. Initializes match.Extensions when nil and sets MatchDeactivationTimeoutExtensionKey to BoolValue(true).
+//  3. Preserves pre-existing match.Extensions entries when setting MatchDeactivationTimeoutExtensionKey.
+func TestAnnotateMatchDeactivationTimeout(t *testing.T) {
+	t.Parallel()
+
+	// 1. Nil match is a no-op and does not panic.
+	assert.NotPanics(t, func() {
+		annotateMatchDeactivationTimeout(nil)
+	})
+
+	// 2. Match with nil Extensions map initializes map and sets BoolValue(true).
+	mNilExt := &pb.Match{Id: "match-nil-ext"}
+	annotateMatchDeactivationTimeout(mNilExt)
+	require.NotNil(t, mNilExt.GetExtensions())
+	rawExt, exists := mNilExt.GetExtensions()[MatchDeactivationTimeoutExtensionKey]
+	require.True(t, exists)
+	var flag wrapperspb.BoolValue
+	require.NoError(t, rawExt.UnmarshalTo(&flag))
+	assert.True(t, flag.GetValue())
+
+	// 3. Match with pre-existing Extensions preserves existing entries.
+	existingAny, err := anypb.New(wrapperspb.String("custom-mmf-metadata"))
+	require.NoError(t, err)
+	mWithExt := &pb.Match{
+		Id: "match-with-ext",
+		Extensions: map[string]*anypb.Any{
+			"custom": existingAny,
+		},
+	}
+	annotateMatchDeactivationTimeout(mWithExt)
+	assert.Equal(t, existingAny, mWithExt.GetExtensions()["custom"])
+	rawExt2, exists := mWithExt.GetExtensions()[MatchDeactivationTimeoutExtensionKey]
+	require.True(t, exists)
+	var flag2 wrapperspb.BoolValue
+	require.NoError(t, rawExt2.UnmarshalTo(&flag2))
+	assert.True(t, flag2.GetValue())
+}
+
+// TestInvokeMMFsValidationMultiChunkFanOutErrorsAndEdgeCases verifies Task M-11
+// coverage across InvokeMatchmakingFunctions:
+//  1. Input validation rejects nil Profile and nil Mmfs with codes.InvalidArgument.
+//  2. Multi-chunk splitting (> 4MB combined pool ticket protobuf size) splits
+//     filtered pools across multiple ChunkedMmfRunRequest messages while preserving
+//     empty pools in every chunk, reassembling all tickets without loss or
+//     duplication, and recording om_core.profile.chunks, om_core.profile.pools,
+//     and om_core.cache.tickets.available.
+//  3. Fan-out error paths for MatchmakingFunctionSpec_REST and invalid MMF host
+//     URIs record om_core.mmf.failures without blocking a healthy sibling gRPC MMF.
+//  4. Matches containing zero tickets or only invalid ticket IDs skip ticket
+//     deactivation and are not forwarded to the caller stream, while valid
+//     matches in the same stream are deactivated and forwarded.
+//  5. When stream.Send returns an error in the fan-in goroutine while stream.Context()
+//     is still active, the fan-in goroutine drains remaining matches from matchChan
+//     so InvokeMatchmakingFunctions completes without deadlocking.
+func TestInvokeMMFsValidationMultiChunkFanOutErrorsAndEdgeCases(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("ValidationRejectsNilProfileAndNilMmfs", func(t *testing.T) {
+		srv := &grpcServer{}
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+
+		err := srv.InvokeMatchmakingFunctions(&pb.MmfRequest{
+			Profile: nil,
+			Mmfs:    []*pb.MatchmakingFunctionSpec{{Name: "mmf"}},
+		}, stream)
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "profile is required")
+
+		err = srv.InvokeMatchmakingFunctions(&pb.MmfRequest{
+			Profile: &pb.Profile{Name: "com.example.m11.validation"},
+			Mmfs:    nil,
+		}, stream)
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "list of mmfs to invoke is required")
+	})
+
+	t.Run("MultiChunkSplittingOver4MBStreamsAllChunksAndReassemblesPool", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.m11_multichunk")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		// Create and activate 45 tickets each carrying a 100KB StringArgs payload
+		// (~4.5MB total > maxPbSize of 4,000,000 bytes) so InvokeMatchmakingFunctions
+		// splits large_pool across 2 chunks.
+		const numTickets = 45
+		largePayload := strings.Repeat("p", 100*1000)
+		createdIDs := make([]string, 0, numTickets)
+		for i := 0; i < numTickets; i++ {
+			resp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{
+				Ticket: &pb.Ticket{
+					Attributes: &pb.Ticket_FilterableData{
+						Tags:       []string{"m11-multichunk"},
+						StringArgs: map[string]string{"blob": largePayload},
+					},
+				},
+			})
+			require.NoError(t, err)
+			createdIDs = append(createdIDs, resp.GetTicketId())
+		}
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: createdIDs,
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 3*time.Second, 5*time.Millisecond)
+		})
+
+		_, err := activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: createdIDs,
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == numTickets
+		}, 3*time.Second, 5*time.Millisecond)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		mmfSrv := &testChunkInspectingMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "multichunk-match-1",
+					Rosters: map[string]*pb.Roster{
+						"r": {
+							Name:    "r",
+							Tickets: []*pb.Ticket{{Id: createdIDs[0]}},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m11.multichunk_profile",
+				Pools: map[string]*pb.Pool{
+					"large_pool": {
+						Name: "large_pool",
+						TagPresentFilters: []*pb.Pool_TagPresentFilter{
+							{Tag: "m11-multichunk"},
+						},
+					},
+					"empty_pool": {
+						Name: "empty_pool",
+						TagPresentFilters: []*pb.Pool_TagPresentFilter{
+							{Tag: "m11-nonexistent-tag"},
+						},
+					},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "multichunk-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+
+		mmfSrv.mu.Lock()
+		chunks := append([]*pb.ChunkedMmfRunRequest(nil), mmfSrv.receivedChunks...)
+		sawEOF := mmfSrv.sawEOF
+		mmfSrv.mu.Unlock()
+
+		assert.True(t, sawEOF, "MMF server must observe io.EOF after all chunks are sent")
+		require.Len(t, chunks, 2, "45x100KB tickets (~4.5MB) must be split into 2 chunks under the 4MB maxPbSize threshold")
+
+		var reassembledIDs []string
+		for idx, ch := range chunks {
+			assert.Equal(t, int32(2), ch.GetNumChunks(), "chunk %d must report NumChunks == 2", idx)
+			pools := ch.GetProfile().GetPools()
+			require.Contains(t, pools, "large_pool")
+			require.Contains(t, pools, "empty_pool", "empty_pool must still be present in chunk %d", idx)
+			assert.Empty(t, pools["empty_pool"].GetParticipants().GetTickets())
+			for _, tk := range pools["large_pool"].GetParticipants().GetTickets() {
+				reassembledIDs = append(reassembledIDs, tk.GetId())
+			}
+		}
+		assert.ElementsMatch(t, createdIDs, reassembledIDs, "reassembled chunks must contain all 45 active tickets without duplicates or drops")
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		chunkCount, chunkSum, found := findInt64HistogramCountAndSum(rm, "om_core.profile.chunks")
+		require.True(t, found)
+		assert.Equal(t, uint64(1), chunkCount)
+		assert.Equal(t, int64(2), chunkSum)
+
+		poolCount, poolSum, found := findInt64HistogramCountAndSum(rm, "om_core.profile.pools")
+		require.True(t, found)
+		assert.Equal(t, uint64(1), poolCount)
+		assert.Equal(t, int64(2), poolSum)
+
+		availCount, availSum, found := findInt64HistogramCountAndSum(rm, "om_core.cache.tickets.available")
+		require.True(t, found)
+		assert.Equal(t, uint64(1), availCount)
+		assert.Equal(t, int64(numTickets), availSum)
+	})
+
+	t.Run("RESTMmfAndInvalidHostURIRecordMmfFailuresWhileHealthyGrpcMmfSucceeds", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.m11_rest_and_bad_uri")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		resp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.NoError(t, err)
+		ticketID := resp.GetTicketId()
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{ticketID},
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+		_, err = activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: []string{ticketID},
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		healthySrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "healthy-match-m11",
+					Rosters: map[string]*pb.Roster{
+						"r": {
+							Name:    "r",
+							Tickets: []*pb.Ticket{{Id: ticketID}},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, healthySrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m11.fanout_errors",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "rest-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_REST,
+				},
+				{
+					Name: "bad-uri-mmf",
+					Host: "http://bad\x7fhost",
+					Port: 50051,
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+				{
+					Name: "healthy-grpc-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+
+		stream.mu.Lock()
+		require.Len(t, stream.matches, 1)
+		assert.Equal(t, "healthy-match-m11", stream.matches[0].GetId())
+		stream.mu.Unlock()
+
+		const expectedProfileAttr = "com.example.m11"
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+
+		restFailures, found := findInt64SumPointByMMF(rm, "om_core.mmf.failures", "rest-mmf", expectedProfileAttr)
+		require.True(t, found, "expected om_core.mmf.failures for rest-mmf")
+		assert.Equal(t, int64(1), restFailures)
+
+		badURIFailures, found := findInt64SumPointByMMF(rm, "om_core.mmf.failures", "bad-uri-mmf", expectedProfileAttr)
+		require.True(t, found, "expected om_core.mmf.failures for bad-uri-mmf")
+		assert.Equal(t, int64(1), badURIFailures)
+
+		_, foundHealthyFailure := findInt64SumPointByMMF(rm, "om_core.mmf.failures", "healthy-grpc-mmf", expectedProfileAttr)
+		assert.False(t, foundHealthyFailure)
+	})
+
+	t.Run("MatchWithOnlyInvalidOrEmptyTicketsSkipsDeactivationAndDoesNotForward", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.m11_invalid_match_tickets")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		resp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.NoError(t, err)
+		validTicketID := resp.GetTicketId()
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{validTicketID},
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+		_, err = activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: []string{validTicketID},
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 1
+		}, 2*time.Second, 5*time.Millisecond)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		mmfSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id:      "empty-rosters-match",
+					Rosters: map[string]*pb.Roster{},
+				},
+				{
+					Id: "only-invalid-ticket-ids-match",
+					Rosters: map[string]*pb.Roster{
+						"r": {
+							Name: "r",
+							Tickets: []*pb.Ticket{
+								{Id: "not-a-valid-repl-id"},
+								{Id: ""},
+							},
+						},
+					},
+				},
+				{
+					Id: "valid-plus-invalid-ticket-match",
+					Rosters: map[string]*pb.Roster{
+						"r": {
+							Name: "r",
+							Tickets: []*pb.Ticket{
+								{Id: "malformed-id-ignored"},
+								{Id: validTicketID},
+							},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m11.invalid_match_tickets",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "mixed-matches-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+
+		stream.mu.Lock()
+		require.Len(t, stream.matches, 1, "matches with zero valid ticket IDs must be skipped and not forwarded")
+		assert.Equal(t, "valid-plus-invalid-ticket-match", stream.matches[0].GetId())
+		stream.mu.Unlock()
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+		deactCount, found := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "mixed-matches-mmf", "com.example.m11")
+		require.True(t, found)
+		assert.Equal(t, int64(1), deactCount)
+	})
+
+	t.Run("FanInStreamSendErrorDrainsRemainingMatchesWithoutDeadlock", func(t *testing.T) {
+		var ticketIDs []string
+		for i := 0; i < 3; i++ {
+			resp, err := createTicket(context.Background(), &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+			require.NoError(t, err)
+			ticketIDs = append(ticketIDs, resp.GetTicketId())
+		}
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: ticketIDs,
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+		_, err := activateTickets(context.Background(), testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: ticketIDs,
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 3
+		}, 2*time.Second, 5*time.Millisecond)
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		_, portStr, err := net.SplitHostPort(lis.Addr().String())
+		require.NoError(t, err)
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+
+		mmfSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "drain-match-1",
+					Rosters: map[string]*pb.Roster{
+						"r": {Name: "r", Tickets: []*pb.Ticket{{Id: ticketIDs[0]}}},
+					},
+				},
+				{
+					Id: "drain-match-2",
+					Rosters: map[string]*pb.Roster{
+						"r": {Name: "r", Tickets: []*pb.Ticket{{Id: ticketIDs[1]}}},
+					},
+				},
+				{
+					Id: "drain-match-3",
+					Rosters: map[string]*pb.Roster{
+						"r": {Name: "r", Tickets: []*pb.Ticket{{Id: ticketIDs[2]}}},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		var sendCalls atomic.Int32
+		stream := &fakeInvokeMMFServerStream{
+			ctx: context.Background(),
+			sendErr: func(_ *pb.StreamedMmfResponse) error {
+				sendCalls.Add(1)
+				return errors.New("simulated client stream broken pipe")
+			},
+		}
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m11.fanin_drain",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "drain-mmf",
+					Host: "http://127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		}()
+
+		select {
+		case invokeErr := <-done:
+			require.NoError(t, invokeErr)
+		case <-time.After(3 * time.Second):
+			t.Fatal("InvokeMatchmakingFunctions deadlocked when stream.Send returned an error")
+		}
+
+		assert.Equal(t, int32(1), sendCalls.Load(), "fan-in goroutine must stop calling stream.Send after the first send error and drain remaining matches from matchChan")
+		stream.mu.Lock()
+		assert.Empty(t, stream.matches)
+		stream.mu.Unlock()
+	})
+}
+
+func TestParseMMFURLAndSchemelessInvokeMMFs(t *testing.T) {
+	t.Run("ParseMMFURLTableDrivenCases", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			spec        *pb.MatchmakingFunctionSpec
+			wantScheme  string
+			wantHost    string
+			wantErrSub  string
+		}{
+			{
+				name: "SchemeLessHostnameAndPort",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "localhost",
+					Port: 50522,
+				},
+				wantScheme: "http",
+				wantHost:   "localhost:50522",
+			},
+			{
+				name: "SchemeLessIPv4AndPort",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "127.0.0.1",
+					Port: 50055,
+				},
+				wantScheme: "http",
+				wantHost:   "127.0.0.1:50055",
+			},
+			{
+				name: "SchemeLessBracketedIPv6AndPort",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "[::1]",
+					Port: 50522,
+				},
+				wantScheme: "http",
+				wantHost:   "[::1]:50522",
+			},
+			{
+				name: "SchemeLessBareIPv6AndPort",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "::1",
+					Port: 50522,
+				},
+				wantScheme: "http",
+				wantHost:   "[::1]:50522",
+			},
+			{
+				name: "SchemeLessHostWithEmbeddedPortAndZeroPortField",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "localhost:50522",
+					Port: 0,
+				},
+				wantScheme: "http",
+				wantHost:   "localhost:50522",
+			},
+			{
+				name: "SchemeLessHostWithEmbeddedPortAndExplicitPortOverride",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "localhost:8080",
+					Port: 50522,
+				},
+				wantScheme: "http",
+				wantHost:   "localhost:50522",
+			},
+			{
+				name: "HTTPSCloudRunURLWithZeroPortDefaultsTo443",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "https://my-mmf-service.a.run.app",
+					Port: 0,
+				},
+				wantScheme: "https",
+				wantHost:   "my-mmf-service.a.run.app:443",
+			},
+			{
+				name: "HTTPURLWithZeroPortDefaultsTo80",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://mmf-internal.default.svc.cluster.local",
+					Port: 0,
+				},
+				wantScheme: "http",
+				wantHost:   "mmf-internal.default.svc.cluster.local:80",
+			},
+			{
+				name: "HTTPURLWithEmbeddedPortAndZeroPortField",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://127.0.0.1:50055",
+					Port: 0,
+				},
+				wantScheme: "http",
+				wantHost:   "127.0.0.1:50055",
+			},
+			{
+				name: "HTTPSURLWithEmbeddedPortAndZeroPortField",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "https://my-mmf.example.com:8443",
+					Port: 0,
+				},
+				wantScheme: "https",
+				wantHost:   "my-mmf.example.com:8443",
+			},
+			{
+				name: "HTTPSURLWithExplicitPortOverridesDefault",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "https://my-mmf.example.com",
+					Port: 8443,
+				},
+				wantScheme: "https",
+				wantHost:   "my-mmf.example.com:8443",
+			},
+			{
+				name: "HostWithLeadingAndTrailingWhitespace",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "  localhost  ",
+					Port: 50522,
+				},
+				wantScheme: "http",
+				wantHost:   "localhost:50522",
+			},
+			{
+				name:       "NilSpecReturnsError",
+				spec:       nil,
+				wantErrSub: "mmf specification is nil",
+			},
+			{
+				name: "EmptyHostReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "   ",
+					Port: 50522,
+				},
+				wantErrSub: "mmf host is empty",
+			},
+			{
+				name: "NegativePortReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "localhost",
+					Port: -1,
+				},
+				wantErrSub: "mmf port -1 is out of valid range [0, 65535]",
+			},
+			{
+				name: "PortAbove65535ReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "localhost",
+					Port: 70000,
+				},
+				wantErrSub: "mmf port 70000 is out of valid range [0, 65535]",
+			},
+			{
+				name: "UnsupportedSchemeReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "ftp://localhost",
+					Port: 50522,
+				},
+				wantErrSub: "unsupported mmf url scheme \"ftp\"",
+			},
+			{
+				name: "EmptyHostnameWithSchemeReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://",
+					Port: 50522,
+				},
+				wantErrSub: "has empty hostname",
+			},
+			{
+				name: "EmptyHostnameWithLeadingColonReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: ":50522",
+					Port: 0,
+				},
+				wantErrSub: "has empty hostname",
+			},
+			{
+				name: "EmbeddedZeroPortReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://localhost:0",
+					Port: 0,
+				},
+				wantErrSub: "invalid port \"0\" in mmf host",
+			},
+			{
+				name: "EmbeddedPortAbove65535ReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://localhost:70000",
+					Port: 0,
+				},
+				wantErrSub: "invalid port \"70000\" in mmf host",
+			},
+			{
+				name: "EmbeddedNonNumericPortReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://localhost:abc",
+					Port: 0,
+				},
+				wantErrSub: "invalid port",
+			},
+			{
+				name: "ControlCharacterInHostReturnsError",
+				spec: &pb.MatchmakingFunctionSpec{
+					Host: "http://bad\x7fhost",
+					Port: 50522,
+				},
+				wantErrSub: "invalid control character",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				u, err := parseMMFURL(tc.spec)
+				if tc.wantErrSub != "" {
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), tc.wantErrSub)
+					assert.Nil(t, u)
+					return
+				}
+				require.NoError(t, err)
+				require.NotNil(t, u)
+				assert.Equal(t, tc.wantScheme, u.Scheme)
+				assert.Equal(t, tc.wantHost, u.Host)
+			})
+		}
+	})
+
+	t.Run("InvokeMMFsConnectsToSchemelessHostAndEmbeddedPortWithZeroPortField", func(t *testing.T) {
+		ensureGlobalTestTicketCache()
+		ctx := context.Background()
+
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(ctx) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.m14_schemeless_mmf")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		// Create and activate two tickets so each MMF can match and auto-deactivate one.
+		ticketIDs := make([]string, 2)
+		for i := range ticketIDs {
+			res, err := createTicket(ctx, &tc, &pb.CreateTicketRequest{
+				Ticket: &pb.Ticket{
+					Attributes: &pb.Ticket_FilterableData{
+						CreationTime: timestamppb.Now(),
+					},
+				},
+			})
+			require.NoError(t, err)
+			ticketIDs[i] = res.GetTicketId()
+		}
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: ticketIDs,
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+		_, err := activateTickets(ctx, testLogger, &tc, &pb.ActivateTicketsRequest{TicketIds: ticketIDs})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 2
+		}, 2*time.Second, 5*time.Millisecond)
+
+		startInProcessMMF := func(t *testing.T, matchID string, matchedTicketID string) int {
+			t.Helper()
+			lis, lisErr := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, lisErr)
+			port := lis.Addr().(*net.TCPAddr).Port
+
+			srv := grpc.NewServer()
+			pb.RegisterMatchMakingFunctionServiceServer(srv, &testMidStreamErrorMMFServer{
+				matches: []*pb.Match{
+					{
+						Id: matchID,
+						Rosters: map[string]*pb.Roster{
+							"team": {
+								Name:    "team",
+								Tickets: []*pb.Ticket{{Id: matchedTicketID}},
+							},
+						},
+					},
+				},
+			})
+			go func() {
+				_ = srv.Serve(lis)
+			}()
+			t.Cleanup(func() {
+				srv.Stop()
+				_ = lis.Close()
+			})
+			return port
+		}
+
+		port1 := startInProcessMMF(t, "match-schemeless-host", ticketIDs[0])
+		port2 := startInProcessMMF(t, "match-embedded-port-zero-field", ticketIDs[1])
+
+		stream := &fakeInvokeMMFServerStream{ctx: ctx}
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.m14.schemeless_and_default_port",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					// Scheme-less host ("127.0.0.1") with explicit Port field (matching README / tutorial docs).
+					Name: "mmf-schemeless-host",
+					Host: "127.0.0.1",
+					Port: int32(port1),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+				{
+					// Scheme-less host with embedded port ("127.0.0.1:<port>") and omitted Port field (Port: 0).
+					Name: "mmf-embedded-port-zero-field",
+					Host: fmt.Sprintf("127.0.0.1:%d", port2),
+					Port: 0,
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		invokeErr := (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, invokeErr)
+
+		// Both MMFs should have succeeded and returned their respective matches.
+		stream.mu.Lock()
+		gotMatchIDs := make([]string, 0, len(stream.matches))
+		for _, m := range stream.matches {
+			gotMatchIDs = append(gotMatchIDs, m.GetId())
+		}
+		stream.mu.Unlock()
+		assert.ElementsMatch(t, []string{"match-schemeless-host", "match-embedded-port-zero-field"}, gotMatchIDs)
+
+		// Both matched tickets should have been auto-deactivated.
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 0
+		}, 2*time.Second, 5*time.Millisecond)
+
+		// Both MMFs should have recorded 1 deactivation and 0 failures.
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(ctx, &rm))
+		for _, mmfName := range []string{"mmf-schemeless-host", "mmf-embedded-port-zero-field"} {
+			deactCount, found := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", mmfName, "com.example.m14")
+			require.True(t, found, "expected deactivation metric for %s", mmfName)
+			assert.Equal(t, int64(1), deactCount)
+			_, failFound := findInt64SumPointByMMF(rm, "om_core.mmf.failures", mmfName, "com.example.m14")
+			assert.False(t, failFound, "expected 0 failures for %s", mmfName)
+		}
+	})
+}
+
+
 
 

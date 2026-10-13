@@ -25,6 +25,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -761,6 +762,69 @@ func buildChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*p
 	return chunkedRequest
 }
 
+// parseMMFURL normalizes and validates the connection endpoint from an
+// MatchmakingFunctionSpec into a *url.URL whose Scheme is "http" or "https"
+// and whose Host is formatted as "hostname:port".
+//
+// Supported forms:
+//   - Scheme-less host ("localhost", "127.0.0.1", "[::1]") with Port > 0 (or
+//     Port == 0, which defaults to port 80 for http).
+//   - Scheme-prefixed host ("http://localhost", "https://my-mmf.a.run.app")
+//     with an explicit Port > 0 or Port == 0 (defaulting to 443 for https and
+//     80 for http when the host string does not already specify a port).
+//   - Host with an embedded port ("localhost:50522", "http://localhost:50522")
+//     when Port == 0 (or overridden if Port > 0 is explicitly set).
+func parseMMFURL(mmf *pb.MatchmakingFunctionSpec) (*url.URL, error) {
+	if mmf == nil {
+		return nil, errors.New("mmf specification is nil")
+	}
+	rawHost := strings.TrimSpace(mmf.GetHost())
+	if rawHost == "" {
+		return nil, errors.New("mmf host is empty")
+	}
+	port := mmf.GetPort()
+	if port < 0 || port > 65535 {
+		return nil, fmt.Errorf("mmf port %d is out of valid range [0, 65535]", port)
+	}
+	if !strings.Contains(rawHost, "://") {
+		if ip := net.ParseIP(rawHost); ip != nil && strings.Contains(rawHost, ":") {
+			rawHost = "[" + rawHost + "]"
+		}
+		rawHost = "http://" + rawHost
+	}
+	mmfUrl, err := url.Parse(rawHost)
+	if err != nil {
+		return nil, err
+	}
+	if mmfUrl.Scheme != "http" && mmfUrl.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported mmf url scheme %q (expected http or https)", mmfUrl.Scheme)
+	}
+	hostname := mmfUrl.Hostname()
+	if hostname == "" {
+		return nil, fmt.Errorf("mmf host %q has empty hostname", mmf.GetHost())
+	}
+	urlPort := mmfUrl.Port()
+	if urlPort != "" {
+		parsedPort, convErr := strconv.Atoi(urlPort)
+		if convErr != nil || parsedPort <= 0 || parsedPort > 65535 {
+			return nil, fmt.Errorf("invalid port %q in mmf host %q", urlPort, mmf.GetHost())
+		}
+	}
+
+	resolvedPort := urlPort
+	if port > 0 {
+		resolvedPort = strconv.Itoa(int(port))
+	} else if resolvedPort == "" {
+		if mmfUrl.Scheme == "https" {
+			resolvedPort = "443"
+		} else {
+			resolvedPort = "80"
+		}
+	}
+	mmfUrl.Host = net.JoinHostPort(hostname, resolvedPort)
+	return mmfUrl, nil
+}
+
 // InvokeMatchmakingFunctions loops through each Pool in the provided Profile,
 // applying the filters inside and adding participating tickets to those pools.
 // It then attempts to connect to every matchmaking function in the provided
@@ -978,7 +1042,7 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			var err error
 
 			// Parse the connection URI
-			mmfUrl, err := url.Parse(fmt.Sprintf("%v:%v", mmf.GetHost(), mmf.GetPort()))
+			mmfUrl, err := parseMMFURL(mmf)
 			if err != nil {
 				err = status.Error(codes.Internal,
 					fmt.Errorf("Failed to parse mmf host uri %v: %w", mmf.GetHost(), err).Error())
