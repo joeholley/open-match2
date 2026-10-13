@@ -32,10 +32,10 @@ var (
 		"component":  "statestore",
 		"replicator": "memory",
 	})
-	NoTicketKeyErr          = errors.New("Missing ticket key")
-	NoTicketDataErr         = errors.New("No ticket data")
-	NoAssignmentErr         = errors.New("Missing assignment")
-	InvalidInputErr         = errors.New("Invalid input")
+	NoTicketKeyErr          = store.NoTicketKeyErr
+	NoTicketDataErr         = store.NoTicketDataErr
+	NoAssignmentErr         = store.NoAssignmentErr
+	InvalidInputErr         = store.InvalidInputErr
 	FullReplicationQueueErr = errors.New("Replication queue full")
 )
 

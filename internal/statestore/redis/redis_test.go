@@ -901,28 +901,44 @@ func TestReplicatorConformance(t *testing.T) {
 				errRes := rep.SendUpdates(errUpdates)
 				require.Len(t, errRes, len(errUpdates))
 
-				assert.Error(t, errRes[0].Err)
+				assert.ErrorIs(t, errRes[0].Err, store.NoTicketDataErr)
+				assert.ErrorIs(t, errRes[0].Err, NoTicketDataErr)
+				assert.ErrorIs(t, errRes[0].Err, memoryReplicator.NoTicketDataErr)
 				assert.Equal(t, "t-err", errRes[0].Result)
 
-				assert.Error(t, errRes[1].Err)
+				assert.ErrorIs(t, errRes[1].Err, store.NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[1].Err, NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[1].Err, memoryReplicator.NoTicketKeyErr)
 				assert.Equal(t, "", errRes[1].Result)
 
-				assert.Error(t, errRes[2].Err)
+				assert.ErrorIs(t, errRes[2].Err, store.NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[2].Err, NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[2].Err, memoryReplicator.NoTicketKeyErr)
 				assert.Equal(t, "", errRes[2].Result)
 
-				assert.Error(t, errRes[3].Err)
+				assert.ErrorIs(t, errRes[3].Err, store.NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[3].Err, NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[3].Err, memoryReplicator.NoTicketKeyErr)
 				assert.Equal(t, "", errRes[3].Result)
 
-				assert.Error(t, errRes[4].Err)
+				assert.ErrorIs(t, errRes[4].Err, store.NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[4].Err, NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[4].Err, memoryReplicator.NoTicketKeyErr)
 				assert.Equal(t, "", errRes[4].Result)
 
-				assert.Error(t, errRes[5].Err)
+				assert.ErrorIs(t, errRes[5].Err, store.NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[5].Err, NoTicketKeyErr)
+				assert.ErrorIs(t, errRes[5].Err, memoryReplicator.NoTicketKeyErr)
 				assert.Equal(t, "", errRes[5].Result)
 
-				assert.Error(t, errRes[6].Err)
+				assert.ErrorIs(t, errRes[6].Err, store.NoAssignmentErr)
+				assert.ErrorIs(t, errRes[6].Err, NoAssignmentErr)
+				assert.ErrorIs(t, errRes[6].Err, memoryReplicator.NoAssignmentErr)
 				assert.Equal(t, "1700000000009-0", errRes[6].Result)
 
-				assert.Error(t, errRes[7].Err)
+				assert.ErrorIs(t, errRes[7].Err, store.InvalidInputErr)
+				assert.ErrorIs(t, errRes[7].Err, InvalidInputErr)
+				assert.ErrorIs(t, errRes[7].Err, memoryReplicator.InvalidInputErr)
 				assert.Equal(t, "bad-cmd-key", errRes[7].Result)
 
 				mixedBatch := []*store.StateUpdate{
@@ -936,7 +952,9 @@ func TestReplicatorConformance(t *testing.T) {
 				assert.NoError(t, mixedRes[0].Err)
 				assert.True(t, rep.GetReplIdValidator().MatchString(mixedRes[0].Result))
 
-				assert.Error(t, mixedRes[1].Err)
+				assert.ErrorIs(t, mixedRes[1].Err, store.NoAssignmentErr)
+				assert.ErrorIs(t, mixedRes[1].Err, NoAssignmentErr)
+				assert.ErrorIs(t, mixedRes[1].Err, memoryReplicator.NoAssignmentErr)
 				assert.Equal(t, "1700000000011-0", mixedRes[1].Result)
 
 				assert.NoError(t, mixedRes[2].Err)

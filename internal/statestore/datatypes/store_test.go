@@ -21,8 +21,9 @@ import (
 )
 
 // TestParseReplIdTimestampMs verifies that ParseReplIdTimestampMs extracts the
-// millisecond Unix timestamp prefix from a "<ms>-<seq>" or bare "<ms>"
-// replication ID, and returns an error when the prefix is empty or non-numeric.
+// millisecond Unix timestamp from a valid "<ms>-<seq>" replication ID and
+// rejects bare timestamps, empty strings, non-numeric or missing sequence
+// suffixes, extra segments, and negative numbers.
 func TestParseReplIdTimestampMs(t *testing.T) {
 	t.Parallel()
 
@@ -30,18 +31,28 @@ func TestParseReplIdTimestampMs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1790307871351), ts)
 
-	tsBare, err := ParseReplIdTimestampMs("1790307871351")
+	tsZero, err := ParseReplIdTimestampMs("0-0")
 	require.NoError(t, err)
-	assert.Equal(t, int64(1790307871351), tsBare)
+	assert.Equal(t, int64(0), tsZero)
 
-	_, err = ParseReplIdTimestampMs("")
-	assert.Error(t, err)
-
-	_, err = ParseReplIdTimestampMs("-12")
-	assert.Error(t, err)
-
-	_, err = ParseReplIdTimestampMs("not-a-timestamp")
-	assert.Error(t, err)
+	for _, invalid := range []string{
+		"",
+		"1790307871351",
+		"1790307871351-",
+		"-12",
+		"not-a-timestamp",
+		"not-a-timestamp-0",
+		"1790307871351-abc",
+		"1790307871351-not-a-seq",
+		"1790307871351-0-1",
+		"1790307871351--1",
+		"-1790307871351-0",
+		"+1790307871351-0",
+		"1790307871351-+0",
+	} {
+		_, err = ParseReplIdTimestampMs(invalid)
+		assert.Errorf(t, err, "expected ParseReplIdTimestampMs(%q) to fail", invalid)
+	}
 }
 
 // TestCompareReplIds verifies numeric ordering of "<timestampMs>-<seq>"
@@ -69,6 +80,40 @@ func TestCompareReplIds(t *testing.T) {
 	// Fallback to lexicographical strings.Compare when an ID lacks "-<seq>" (e.g., initial bare timestamp).
 	assert.Equal(t, -1, CompareReplIds("1790307871350", "1790307871351-0"))
 	assert.Equal(t, 1, CompareReplIds("1790307871351-0", "1790307871350"))
+
+	// Fallback to lexicographical strings.Compare when an ID has a negative or signed timestamp/sequence.
+	assert.Equal(t, -1, CompareReplIds("-1790307871351-0", "1790307871351-0"))
+	assert.Equal(t, -1, CompareReplIds("1790307871351--1", "1790307871351-0"))
+	// If "+1790307871351-0" were parsed numerically, it would equal "1790307871351-0" (0);
+	// falling back to strings.Compare yields -1 because '+' (0x2B) < '1' (0x31).
+	assert.Equal(t, -1, CompareReplIds("+1790307871351-0", "1790307871351-0"))
+	assert.Equal(t, -1, CompareReplIds("1790307871351-+0", "1790307871351-0"))
+}
+
+// TestCanonicalSentinelErrors verifies that the canonical sentinel errors
+// exported by package store are non-nil, distinct, and preserve their expected
+// messages.
+func TestCanonicalSentinelErrors(t *testing.T) {
+	t.Parallel()
+
+	require.Error(t, NoTicketKeyErr)
+	assert.Equal(t, "Missing ticket key", NoTicketKeyErr.Error())
+
+	require.Error(t, NoTicketDataErr)
+	assert.Equal(t, "No ticket data", NoTicketDataErr.Error())
+
+	require.Error(t, NoAssignmentErr)
+	assert.Equal(t, "Missing assignment", NoAssignmentErr.Error())
+
+	require.Error(t, InvalidInputErr)
+	assert.Equal(t, "Invalid input", InvalidInputErr.Error())
+
+	sentinels := []error{NoTicketKeyErr, NoTicketDataErr, NoAssignmentErr, InvalidInputErr}
+	for i := 0; i < len(sentinels); i++ {
+		for j := i + 1; j < len(sentinels); j++ {
+			assert.NotErrorIs(t, sentinels[i], sentinels[j])
+		}
+	}
 }
 
 // TestStateUpdatePrimaryKey verifies that PrimaryKey returns Key when set,

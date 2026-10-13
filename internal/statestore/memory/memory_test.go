@@ -128,76 +128,88 @@ func TestSendUpdatesValidationErrorsAndResultContract(t *testing.T) {
 	rc := New(newTestConfig(100, 100, 20))
 
 	cases := []struct {
-		name    string
-		update  *store.StateUpdate
-		wantErr error
-		wantKey string
+		name         string
+		update       *store.StateUpdate
+		wantErr      error
+		wantStoreErr error
+		wantKey      string
 	}{
 		{
-			name:    "Ticket missing value with empty key",
-			update:  &store.StateUpdate{Cmd: store.Ticket, Value: ""},
-			wantErr: NoTicketDataErr,
-			wantKey: "",
+			name:         "Ticket missing value with empty key",
+			update:       &store.StateUpdate{Cmd: store.Ticket, Value: ""},
+			wantErr:      NoTicketDataErr,
+			wantStoreErr: store.NoTicketDataErr,
+			wantKey:      "",
 		},
 		{
-			name:    "Ticket missing value with caller key",
-			update:  &store.StateUpdate{Cmd: store.Ticket, Key: "caller-ticket-key", Value: ""},
-			wantErr: NoTicketDataErr,
-			wantKey: "caller-ticket-key",
+			name:         "Ticket missing value with caller key",
+			update:       &store.StateUpdate{Cmd: store.Ticket, Key: "caller-ticket-key", Value: ""},
+			wantErr:      NoTicketDataErr,
+			wantStoreErr: store.NoTicketDataErr,
+			wantKey:      "caller-ticket-key",
 		},
 		{
-			name:    "Activate missing key and keys",
-			update:  &store.StateUpdate{Cmd: store.Activate},
-			wantErr: NoTicketKeyErr,
-			wantKey: "",
+			name:         "Activate missing key and keys",
+			update:       &store.StateUpdate{Cmd: store.Activate},
+			wantErr:      NoTicketKeyErr,
+			wantStoreErr: store.NoTicketKeyErr,
+			wantKey:      "",
 		},
 		{
-			name:    "Activate packed all empty keys",
-			update:  &store.StateUpdate{Cmd: store.Activate, Keys: []string{"", ""}},
-			wantErr: NoTicketKeyErr,
-			wantKey: "",
+			name:         "Activate packed all empty keys",
+			update:       &store.StateUpdate{Cmd: store.Activate, Keys: []string{"", ""}},
+			wantErr:      NoTicketKeyErr,
+			wantStoreErr: store.NoTicketKeyErr,
+			wantKey:      "",
 		},
 		{
-			name:    "Activate packed all empty keys with fallback Key set",
-			update:  &store.StateUpdate{Cmd: store.Activate, Key: "fallback-act-key", Keys: []string{"", ""}},
-			wantErr: NoTicketKeyErr,
-			wantKey: "fallback-act-key",
+			name:         "Activate packed all empty keys with fallback Key set",
+			update:       &store.StateUpdate{Cmd: store.Activate, Key: "fallback-act-key", Keys: []string{"", ""}},
+			wantErr:      NoTicketKeyErr,
+			wantStoreErr: store.NoTicketKeyErr,
+			wantKey:      "fallback-act-key",
 		},
 		{
-			name:    "Deactivate missing key and keys",
-			update:  &store.StateUpdate{Cmd: store.Deactivate},
-			wantErr: NoTicketKeyErr,
-			wantKey: "",
+			name:         "Deactivate missing key and keys",
+			update:       &store.StateUpdate{Cmd: store.Deactivate},
+			wantErr:      NoTicketKeyErr,
+			wantStoreErr: store.NoTicketKeyErr,
+			wantKey:      "",
 		},
 		{
-			name:    "Deactivate packed all empty keys",
-			update:  &store.StateUpdate{Cmd: store.Deactivate, Keys: []string{""}},
-			wantErr: NoTicketKeyErr,
-			wantKey: "",
+			name:         "Deactivate packed all empty keys",
+			update:       &store.StateUpdate{Cmd: store.Deactivate, Keys: []string{""}},
+			wantErr:      NoTicketKeyErr,
+			wantStoreErr: store.NoTicketKeyErr,
+			wantKey:      "",
 		},
 		{
-			name:    "Assign missing key",
-			update:  &store.StateUpdate{Cmd: store.Assign, Key: "", Value: "10.0.0.1:7777"},
-			wantErr: NoTicketKeyErr,
-			wantKey: "",
+			name:         "Assign missing key",
+			update:       &store.StateUpdate{Cmd: store.Assign, Key: "", Value: "10.0.0.1:7777"},
+			wantErr:      NoTicketKeyErr,
+			wantStoreErr: store.NoTicketKeyErr,
+			wantKey:      "",
 		},
 		{
-			name:    "Assign missing value",
-			update:  &store.StateUpdate{Cmd: store.Assign, Key: "ticket-42", Value: ""},
-			wantErr: NoAssignmentErr,
-			wantKey: "ticket-42",
+			name:         "Assign missing value",
+			update:       &store.StateUpdate{Cmd: store.Assign, Key: "ticket-42", Value: ""},
+			wantErr:      NoAssignmentErr,
+			wantStoreErr: store.NoAssignmentErr,
+			wantKey:      "ticket-42",
 		},
 		{
-			name:    "Invalid command with single key",
-			update:  &store.StateUpdate{Cmd: 999, Key: "bad-cmd-key"},
-			wantErr: InvalidInputErr,
-			wantKey: "bad-cmd-key",
+			name:         "Invalid command with single key",
+			update:       &store.StateUpdate{Cmd: 999, Key: "bad-cmd-key"},
+			wantErr:      InvalidInputErr,
+			wantStoreErr: store.InvalidInputErr,
+			wantKey:      "bad-cmd-key",
 		},
 		{
-			name:    "Invalid command with packed keys",
-			update:  &store.StateUpdate{Cmd: -1, Keys: []string{"", "bad-packed-key", "other"}},
-			wantErr: InvalidInputErr,
-			wantKey: "bad-packed-key",
+			name:         "Invalid command with packed keys",
+			update:       &store.StateUpdate{Cmd: -1, Keys: []string{"", "bad-packed-key", "other"}},
+			wantErr:      InvalidInputErr,
+			wantStoreErr: store.InvalidInputErr,
+			wantKey:      "bad-packed-key",
 		},
 	}
 
@@ -210,6 +222,7 @@ func TestSendUpdatesValidationErrorsAndResultContract(t *testing.T) {
 	require.Len(t, res, len(cases))
 	for i, tc := range cases {
 		assert.ErrorIs(t, res[i].Err, tc.wantErr, tc.name)
+		assert.ErrorIs(t, res[i].Err, tc.wantStoreErr, tc.name)
 		assert.Equal(t, tc.wantKey, res[i].Result, tc.name)
 		assert.Equal(t, tc.update.PrimaryKey(), res[i].Result, tc.name)
 	}

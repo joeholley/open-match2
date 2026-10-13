@@ -14,10 +14,20 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+)
+
+// Canonical sentinel errors returned by StateReplicator implementations when
+// validating incoming StateUpdate entries.
+var (
+	NoTicketKeyErr  = errors.New("Missing ticket key")
+	NoTicketDataErr = errors.New("No ticket data")
+	NoAssignmentErr = errors.New("Missing assignment")
+	InvalidInputErr = errors.New("Invalid input")
 )
 
 // An enum for the type of operations that the replication queue can process.
@@ -87,28 +97,24 @@ func (u StateUpdate) String() string {
 // ParseReplIdTimestampMs extracts the millisecond timestamp from a replication ID
 // formatted as "<timestamp_ms>-<seq>".
 func ParseReplIdTimestampMs(replId string) (int64, error) {
-	parts := strings.Split(replId, "-")
-	if len(parts) == 0 || parts[0] == "" {
+	ts, _, ok := parseReplId(replId)
+	if !ok {
 		return 0, fmt.Errorf("invalid replication ID %q", replId)
-	}
-	ts, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid replication ID %q: %w", replId, err)
 	}
 	return ts, nil
 }
 
 func parseReplId(replId string) (int64, int64, bool) {
 	parts := strings.Split(replId, "-")
-	if len(parts) != 2 {
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || parts[0][0] == '+' || parts[1][0] == '+' {
 		return 0, 0, false
 	}
 	ts, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
+	if err != nil || ts < 0 {
 		return 0, 0, false
 	}
 	seq, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
+	if err != nil || seq < 0 {
 		return 0, 0, false
 	}
 	return ts, seq, true
