@@ -30,26 +30,43 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// TestMain initializes no-op OpenTelemetry cache metrics once before running
+// the package's unit tests and benchmarks.
 func TestMain(m *testing.M) {
 	meter := noop.NewMeterProvider().Meter("cache-test")
 	RegisterMetrics(&meter)
 	os.Exit(m.Run())
 }
 
+// TestWaitForDeactivationViaInactiveSetAndWatermark verifies that
+// WaitForDeactivation returns true when the target ticket is present in
+// InactiveSet, when the applied replication watermark has already passed
+// targetReplId, or as soon as recordApplied advances past targetReplId, and
+// returns false on empty inputs or timeout.
 func TestWaitForDeactivationViaInactiveSetAndWatermark(t *testing.T) {
 	t.Parallel()
 
 	tc := New(config.Read(), nil)
+
+	// Case 0: Empty ticketId and empty targetReplId returns false immediately,
+	// and HasAppliedReplId("") is false.
+	assert.False(t, tc.HasAppliedReplId(""))
+	assert.False(t, tc.WaitForDeactivation("", "", 10*time.Millisecond))
 
 	// Case 1: Ticket already in InactiveSet returns immediately.
 	tc.applyUpdate(&store.StateUpdate{Cmd: store.Deactivate, Key: "1790307871351-1"}, nil, nil)
 	assert.True(t, tc.WaitForDeactivation("1790307871351-1", "", 50*time.Millisecond))
 
 	// Case 2: Ticket expired/removed from InactiveSet, but watermark has passed targetReplId.
+	// Also verify recordApplied is monotonic and ignores older or empty ReplIds.
 	tc.recordApplied("1790307871400-5")
+	tc.recordApplied("1790307871400-2")
+	tc.recordApplied("")
+	assert.Equal(t, "1790307871400-5", tc.AppliedReplId())
 	assert.True(t, tc.WaitForDeactivation("1790307871351-2", "1790307871400-3", 50*time.Millisecond))
 
 	// Case 3: Wakes immediately when recordApplied advances past targetReplId.
@@ -65,6 +82,10 @@ func TestWaitForDeactivationViaInactiveSetAndWatermark(t *testing.T) {
 	assert.False(t, tc.WaitForDeactivation("1790307871351-4", "1790307871999-0", 30*time.Millisecond))
 }
 
+// TestEndToEndMemoryReplicationWatermark verifies that a Deactivate update sent
+// through OutgoingReplicationQueue is polled and applied by
+// IncomingReplicationQueue, populating InactiveSet and advancing the
+// AppliedReplId watermark.
 func TestEndToEndMemoryReplicationWatermark(t *testing.T) {
 	t.Parallel()
 
@@ -95,10 +116,18 @@ func TestEndToEndMemoryReplicationWatermark(t *testing.T) {
 	require.NoError(t, res.Err)
 	require.NotEmpty(t, res.Result)
 
-	assert.True(t, tc.WaitForDeactivation("1790307871351-12", res.Result, 2*time.Second))
+	// Wait specifically on the replication watermark (empty ticketId) so that
+	// recordApplied(lastReplId) is guaranteed to have completed before checking
+	// both HasAppliedReplId and InactiveSet.
+	assert.True(t, tc.WaitForDeactivation("", res.Result, 2*time.Second))
 	assert.True(t, tc.HasAppliedReplId(res.Result))
+	_, isInactive := tc.InactiveSet.Load("1790307871351-12")
+	assert.True(t, isInactive)
 }
 
+// TestFullPollUsesTunableFullPollWait verifies that when GetUpdates returns a
+// full batch (equal to OM_CACHE_IN_MAX_UPDATES_PER_POLL), the poller sleeps for
+// OM_CACHE_IN_FULL_POLL_WAIT_MS rather than the longer partial or idle waits.
 func TestFullPollUsesTunableFullPollWait(t *testing.T) {
 	t.Parallel()
 
@@ -156,11 +185,15 @@ func TestFullPollUsesTunableFullPollWait(t *testing.T) {
 
 	// If full polls waited OM_CACHE_IN_WAIT_TIMEOUT_MS or OM_CACHE_IN_POLL_WAIT_MS (2000ms),
 	// 3 polls would take >4s. With OM_CACHE_IN_FULL_POLL_WAIT_MS=15ms, all 5 updates should
-	// be applied in well under 500ms.
+	// be applied in well under 600ms.
 	require.True(t, tc.WaitForDeactivation("1790307871351-5", lastReplId, 600*time.Millisecond))
 	assert.Less(t, time.Since(start), 600*time.Millisecond)
 }
 
+// TestPartialPollUsesPollWaitInsteadOfIdleWaitTimeout verifies that when
+// GetUpdates returns a non-empty partial batch (< OM_CACHE_IN_MAX_UPDATES_PER_POLL),
+// the poller sleeps for OM_CACHE_IN_POLL_WAIT_MS rather than the idle
+// OM_CACHE_IN_WAIT_TIMEOUT_MS before polling again.
 func TestPartialPollUsesPollWaitInsteadOfIdleWaitTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -221,6 +254,9 @@ func TestPartialPollUsesPollWaitInsteadOfIdleWaitTimeout(t *testing.T) {
 	assert.Less(t, time.Since(start), 400*time.Millisecond)
 }
 
+// immediateEmptyReplicator is a test StateReplicator whose GetUpdates() returns
+// nil immediately without blocking, simulating an early-returning empty poll
+// (such as a transient Redis XREAD error).
 type immediateEmptyReplicator struct {
 	polls     atomic.Int64
 	validator *regexp.Regexp
@@ -239,6 +275,10 @@ func (r *immediateEmptyReplicator) GetReplIdValidator() *regexp.Regexp {
 	return r.validator
 }
 
+// TestEmptyPollReturningEarlyThrottlesToWaitTimeout verifies that when
+// GetUpdates() returns an empty slice earlier than OM_CACHE_IN_WAIT_TIMEOUT_MS,
+// the polling loop sleeps for the remaining wait timeout rather than spinning
+// in an unthrottled tight loop.
 func TestEmptyPollReturningEarlyThrottlesToWaitTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -261,12 +301,23 @@ func TestEmptyPollReturningEarlyThrottlesToWaitTimeout(t *testing.T) {
 	tc := New(cfg, rep)
 	go tc.IncomingReplicationQueue(ctx)
 
+	// Wait for the poller goroutine to execute its first poll before starting
+	// the 100ms measurement window so goroutine startup latency is excluded.
+	require.Eventually(t, func() bool {
+		return rep.polls.Load() >= 1
+	}, time.Second, time.Millisecond)
+
+	baselinePolls := rep.polls.Load()
 	time.Sleep(100 * time.Millisecond)
-	polls := rep.polls.Load()
-	assert.GreaterOrEqual(t, polls, int64(2), "expected at least 2 polls in 100ms with 40ms wait timeout")
-	assert.LessOrEqual(t, polls, int64(5), "expected early-returning empty polls to be throttled by OM_CACHE_IN_WAIT_TIMEOUT_MS (got %d polls in 100ms)", polls)
+	deltaPolls := rep.polls.Load() - baselinePolls
+	assert.GreaterOrEqual(t, deltaPolls, int64(1), "expected at least 1 additional poll in 100ms with 40ms wait timeout")
+	assert.LessOrEqual(t, deltaPolls, int64(4), "expected early-returning empty polls to be throttled by OM_CACHE_IN_WAIT_TIMEOUT_MS (got %d additional polls in 100ms)", deltaPolls)
 }
 
+// TestPackedTicketStateUpdates verifies that when
+// OM_CACHE_PACK_TICKET_STATE_UPDATES=true, packed multi-key Activate and
+// Deactivate updates transition all referenced tickets between InactiveSet and
+// ActiveTickets in a single replication entry.
 func TestPackedTicketStateUpdates(t *testing.T) {
 	t.Parallel()
 
@@ -284,14 +335,61 @@ func TestPackedTicketStateUpdates(t *testing.T) {
 	go tc.OutgoingReplicationQueue(ctx)
 	go tc.IncomingReplicationQueue(ctx)
 
-	matchTickets := []string{
-		"1790307871351-10",
-		"1790307871351-11",
-		"1790307871351-12",
-		"1790307871351-13",
+	// 1. Create 4 tickets via Cmd: store.Ticket so they exist in tc.Tickets.
+	ticketBytes, err := proto.Marshal(&pb.Ticket{
+		ExpirationTime: timestamppb.New(time.Now().Add(5 * time.Minute)),
+	})
+	require.NoError(t, err)
+
+	const numTickets = 4
+	createChan := make(chan *store.StateResponse, numTickets)
+	for i := 0; i < numTickets; i++ {
+		tc.UpRequests <- &UpdateRequest{
+			Ctx:         ctx,
+			ResultsChan: createChan,
+			EnqueuedAt:  time.Now(),
+			Update: store.StateUpdate{
+				Cmd:   store.Ticket,
+				Value: string(ticketBytes),
+			},
+		}
+	}
+	matchTickets := make([]string, numTickets)
+	for i := 0; i < numTickets; i++ {
+		res := <-createChan
+		require.NoError(t, res.Err)
+		require.NotEmpty(t, res.Result)
+		matchTickets[i] = res.Result
 	}
 
-	// 1. Send a single packed Deactivate update for all 4 tickets.
+	// 2. Send a single packed Activate update for all 4 tickets and verify they
+	// are removed from InactiveSet and added to ActiveTickets.
+	actChan1 := make(chan *store.StateResponse, 1)
+	tc.UpRequests <- &UpdateRequest{
+		Ctx:         ctx,
+		ResultsChan: actChan1,
+		EnqueuedAt:  time.Now(),
+		Update: store.StateUpdate{
+			Cmd:  store.Activate,
+			Key:  matchTickets[0],
+			Keys: matchTickets,
+		},
+	}
+	actRes1 := <-actChan1
+	require.NoError(t, actRes1.Err)
+	require.NotEmpty(t, actRes1.Result)
+
+	require.Eventually(t, func() bool {
+		return tc.HasAppliedReplId(actRes1.Result)
+	}, 2*time.Second, 10*time.Millisecond)
+	assert.Len(t, tc.SnapshotActiveTickets(), numTickets)
+	for _, id := range matchTickets {
+		_, isInactive := tc.InactiveSet.Load(id)
+		assert.False(t, isInactive, "expected ticket %s to be removed from InactiveSet after packed activation", id)
+	}
+
+	// 3. Send a single packed Deactivate update for all 4 tickets and verify they
+	// are added to InactiveSet and removed from ActiveTickets.
 	rChan := make(chan *store.StateResponse, 1)
 	tc.UpRequests <- &UpdateRequest{
 		Ctx:         ctx,
@@ -307,17 +405,18 @@ func TestPackedTicketStateUpdates(t *testing.T) {
 	require.NoError(t, deactRes.Err)
 	require.NotEmpty(t, deactRes.Result)
 
-	require.True(t, tc.WaitForDeactivation(matchTickets[len(matchTickets)-1], deactRes.Result, 2*time.Second))
+	require.True(t, tc.WaitForDeactivation("", deactRes.Result, 2*time.Second))
+	assert.Empty(t, tc.SnapshotActiveTickets())
 	for _, id := range matchTickets {
 		_, isInactive := tc.InactiveSet.Load(id)
 		assert.True(t, isInactive, "expected ticket %s to be in InactiveSet after packed deactivation", id)
 	}
 
-	// 2. Send a single packed Activate update for all 4 tickets.
-	actChan := make(chan *store.StateResponse, 1)
+	// 4. Send another packed Activate update and verify all 4 tickets return to ActiveTickets.
+	actChan2 := make(chan *store.StateResponse, 1)
 	tc.UpRequests <- &UpdateRequest{
 		Ctx:         ctx,
-		ResultsChan: actChan,
+		ResultsChan: actChan2,
 		EnqueuedAt:  time.Now(),
 		Update: store.StateUpdate{
 			Cmd:  store.Activate,
@@ -325,20 +424,25 @@ func TestPackedTicketStateUpdates(t *testing.T) {
 			Keys: matchTickets,
 		},
 	}
-	actRes := <-actChan
-	require.NoError(t, actRes.Err)
-	require.NotEmpty(t, actRes.Result)
+	actRes2 := <-actChan2
+	require.NoError(t, actRes2.Err)
+	require.NotEmpty(t, actRes2.Result)
 
-	// Wait until the packed activation replication ID has been applied.
 	require.Eventually(t, func() bool {
-		return tc.HasAppliedReplId(actRes.Result)
+		return tc.HasAppliedReplId(actRes2.Result)
 	}, 2*time.Second, 10*time.Millisecond)
+	assert.Len(t, tc.SnapshotActiveTickets(), numTickets)
 	for _, id := range matchTickets {
 		_, isInactive := tc.InactiveSet.Load(id)
-		assert.False(t, isInactive, "expected ticket %s to be removed from InactiveSet after packed activation", id)
+		assert.False(t, isInactive, "expected ticket %s to be removed from InactiveSet after second packed activation", id)
 	}
 }
 
+// TestMergeRequestsToUpdates verifies the pure request-coalescing logic used by
+// OutgoingReplicationQueue when OM_CACHE_PACK_TICKET_STATE_UPDATES is enabled:
+// contiguous same-command runs are coalesced and deduplicated, interleaved
+// commands break runs to preserve causal order, empty-key requests are isolated,
+// and maxKeysPerUpdate splits oversized runs.
 func TestMergeRequestsToUpdates(t *testing.T) {
 	t.Parallel()
 
@@ -456,6 +560,9 @@ func TestMergeRequestsToUpdates(t *testing.T) {
 	})
 }
 
+// spyReplicator wraps a store.StateReplicator and records deep copies of every
+// batch passed to SendUpdates so tests can inspect how OutgoingReplicationQueue
+// coalesced requests.
 type spyReplicator struct {
 	inner       store.StateReplicator
 	mu          sync.Mutex
@@ -485,15 +592,17 @@ func (s *spyReplicator) GetReplIdValidator() *regexp.Regexp {
 	return s.inner.GetReplIdValidator()
 }
 
+// TestOutgoingReplicationQueueCrossCallerPacking verifies that when multiple
+// concurrent callers enqueue individual Deactivate UpdateRequests into
+// UpRequests, OutgoingReplicationQueue coalesces them into a single packed
+// SendUpdates call and fans the resulting ReplId out to all callers.
 func TestOutgoingReplicationQueueCrossCallerPacking(t *testing.T) {
 	t.Parallel()
 
 	const numCallers = 10
 	cfg := config.Read()
 	cfg.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", true)
-	// Set per-RPC limit < numCallers to verify outgoing coalescing is bounded by
-	// OM_CACHE_OUT_MAX_PACKED_KEYS rather than OM_MAX_STATE_UPDATES_PER_CALL.
-	cfg.Set("OM_MAX_STATE_UPDATES_PER_CALL", 2)
+	// OutgoingReplicationQueue bounds packed key count by OM_CACHE_OUT_MAX_PACKED_KEYS.
 	cfg.Set("OM_CACHE_OUT_MAX_PACKED_KEYS", 500)
 	cfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 1000)
 	cfg.Set("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD", numCallers)
@@ -552,6 +661,8 @@ func TestOutgoingReplicationQueueCrossCallerPacking(t *testing.T) {
 	spy.mu.Unlock()
 }
 
+// baselineSetDifference computes the reference active ticket set (Tickets \ InactiveSet)
+// by scanning both sync.Maps directly.
 func baselineSetDifference(tickets, inactiveSet *sync.Map) []*pb.Ticket {
 	out := make([]*pb.Ticket, 0)
 	tickets.Range(func(id, val any) bool {
@@ -565,6 +676,8 @@ func baselineSetDifference(tickets, inactiveSet *sync.Map) []*pb.Ticket {
 	return out
 }
 
+// snapshotToTicketSlice converts the []any slice returned by
+// SnapshotActiveTickets() into a typed []*pb.Ticket slice for assertions.
 func snapshotToTicketSlice(snap []any) []*pb.Ticket {
 	out := make([]*pb.Ticket, 0, len(snap))
 	for _, v := range snap {
@@ -575,10 +688,10 @@ func snapshotToTicketSlice(snap []any) []*pb.Ticket {
 	return out
 }
 
-// TestActiveTicketsEquivalenceSynchronous drives updates synchronously (R7) via
+// TestActiveTicketsEquivalenceSynchronous drives updates synchronously via
 // applyUpdate and expireCacheEntries across Ticket -> Activate -> Deactivate ->
 // Activate -> Expire transitions, verifying that SnapshotActiveTickets() always
-// matches the exact set of *pb.Ticket pointers from setDifference(&Tickets, &InactiveSet).
+// matches the exact set of *pb.Ticket pointers fromTickets \ InactiveSet.
 func TestActiveTicketsEquivalenceSynchronous(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Read()
@@ -622,7 +735,7 @@ func TestActiveTicketsEquivalenceSynchronous(t *testing.T) {
 	assertEquivalent("after packed Activate [id2, id3, nonExistentId]")
 	assert.Len(t, tc.SnapshotActiveTickets(), 3)
 
-	// Step 4: Deactivate id1 and id3 (packed), then re-activate id1, then deactivate id3 again.
+	// Step 4: Deactivate id1 and id3 (packed), then re-activate id1 (leaving id3 inactive).
 	tc.applyUpdate(&store.StateUpdate{Cmd: store.Deactivate, Key: id1, Keys: []string{id1, id3}}, nil, nil)
 	assertEquivalent("after packed Deactivate [id1, id3]")
 	tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Key: id1}, nil, nil)
@@ -637,6 +750,10 @@ func TestActiveTicketsEquivalenceSynchronous(t *testing.T) {
 	assert.Same(t, t1, active[0])
 }
 
+// TestOrderedExpirationAndGauges verifies min-heap expiration ordering across
+// InactiveSet, Tickets, ActiveTickets, and Assignments, accurate OTEL gauge
+// counts under duplicate updates, per-cycle deletion bounding, and multi-chunk
+// lock release/re-acquisition when expiring more than expirationLockChunkSize entries.
 func TestOrderedExpirationAndGauges(t *testing.T) {
 	ctx := context.Background()
 
@@ -761,8 +878,35 @@ func TestOrderedExpirationAndGauges(t *testing.T) {
 		assert.Equal(t, int64(0), atomic.LoadInt64(&TicketCount))
 		assert.Equal(t, int64(0), atomic.LoadInt64(&InactiveCount))
 	})
+
+	t.Run("multi-chunk expiration across more than 256 expired entries", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_TICKET_TTL_MS", 10000)
+		cfg.Set("OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE", 1000)
+
+		tc := New(cfg, nil)
+		now := time.Now()
+		expiredMs := now.UnixMilli() - 20000
+
+		const totalExpired = 300 // > expirationLockChunkSize (256)
+		for i := 0; i < totalExpired; i++ {
+			id := fmt.Sprintf("%013d-%d", expiredMs, i+1)
+			tk := &pb.Ticket{Id: id, ExpirationTime: timestamppb.New(now.Add(-time.Second))}
+			tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id}, tk, nil)
+			if i%2 == 0 {
+				tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Key: id}, nil, nil)
+			}
+		}
+
+		tc.expireCacheEntries(ctx)
+		assert.Equal(t, int64(0), atomic.LoadInt64(&TicketCount))
+		assert.Equal(t, int64(0), atomic.LoadInt64(&InactiveCount))
+		assert.Empty(t, tc.SnapshotActiveTickets())
+	})
 }
 
+// faultInjectingReplicator wraps a store.StateReplicator and allows tests to
+// mutate or truncate the []*store.StateResponse slice returned by SendUpdates.
 type faultInjectingReplicator struct {
 	inner  store.StateReplicator
 	mutate func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse
@@ -784,6 +928,11 @@ func (f *faultInjectingReplicator) GetReplIdValidator() *regexp.Regexp {
 	return f.inner.GetReplIdValidator()
 }
 
+// TestOutgoingReplicationQueueDefensiveFallbacks verifies that if a
+// StateReplicator returns a nil StateResponse element or fewer results than
+// requested (in either unpacked or packed mode), OutgoingReplicationQueue
+// synthesizes an explicit error response attributed to each affected request's
+// PrimaryKey so waiting callers never hang or panic.
 func TestOutgoingReplicationQueueDefensiveFallbacks(t *testing.T) {
 	t.Parallel()
 

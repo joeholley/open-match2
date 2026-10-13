@@ -15,6 +15,7 @@ package memoryReplicator
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// newTestConfig returns an isolated Viper configuration with the given
+// in-memory replication poll batch size, channel buffer capacity, and idle poll timeout.
 func newTestConfig(maxUpdatesPerPoll, queueBufferSize, waitTimeoutMs int) *viper.Viper {
 	cfg := viper.New()
 	cfg.Set("OM_CACHE_IN_MAX_UPDATES_PER_POLL", maxUpdatesPerPoll)
@@ -33,6 +36,10 @@ func newTestConfig(maxUpdatesPerPoll, queueBufferSize, waitTimeoutMs int) *viper
 	return cfg
 }
 
+// TestSendAndGetUpdatesRoundTrip verifies that valid Ticket, Activate,
+// Deactivate (single-key and packed multi-key), and Assign updates sent through
+// SendUpdates receive valid monotonically increasing ReplIds and round-trip
+// through GetUpdates with expected normalized fields.
 func TestSendAndGetUpdatesRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -111,6 +118,10 @@ func TestSendAndGetUpdatesRoundTrip(t *testing.T) {
 	}, got[5])
 }
 
+// TestSendUpdatesValidationErrorsAndResultContract verifies that invalid state
+// updates are rejected with the appropriate sentinel error, return
+// update.PrimaryKey() in Result for per-ticket error attribution, and are never
+// enqueued onto the replication channel.
 func TestSendUpdatesValidationErrorsAndResultContract(t *testing.T) {
 	t.Parallel()
 
@@ -209,6 +220,9 @@ func TestSendUpdatesValidationErrorsAndResultContract(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+// TestSendUpdatesDoesNotMutateInput verifies that SendUpdates clones and
+// normalizes StateUpdate structs internally without mutating caller-owned
+// structs or slices.
 func TestSendUpdatesDoesNotMutateInput(t *testing.T) {
 	t.Parallel()
 
@@ -285,6 +299,10 @@ func TestSendUpdatesDoesNotMutateInput(t *testing.T) {
 	assert.Equal(t, expected, inputs)
 }
 
+// TestFieldNormalizationMatchesRedisRoundTrip verifies that memoryReplicator
+// strips extraneous fields (such as caller-supplied Key/Keys on Ticket, single
+// packed Keys slice, or extraneous Value on Activate/Deactivate) identically to
+// the Redis stream serialization format.
 func TestFieldNormalizationMatchesRedisRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -368,6 +386,10 @@ func TestFieldNormalizationMatchesRedisRoundTrip(t *testing.T) {
 	assert.Equal(t, res[4].Result, got[4].ReplId)
 }
 
+// TestConcurrentSendUpdatesStrictOrderingAndMonotonicClockRegression verifies
+// that concurrent SendUpdates callers enqueue updates in strictly increasing
+// ReplId order even when wall-clock time regresses behind replTS, and that
+// advancing past replTS resets the sequence number to "-0".
 func TestConcurrentSendUpdatesStrictOrderingAndMonotonicClockRegression(t *testing.T) {
 	t.Parallel()
 
@@ -376,7 +398,7 @@ func TestConcurrentSendUpdatesStrictOrderingAndMonotonicClockRegression(t *testi
 	const updatesPerBatch = 3
 	totalUpdates := workers * batchesPerWorker * updatesPerBatch
 
-	rc := New(newTestConfig(totalUpdates, totalUpdates, 50))
+	rc := New(newTestConfig(totalUpdates+1, totalUpdates+1, 50))
 
 	// Simulate wall-clock regression by setting replTS slightly in the future
 	// before concurrent callers run; generated IDs must still be strictly monotonic.
@@ -406,18 +428,42 @@ func TestConcurrentSendUpdatesStrictOrderingAndMonotonicClockRegression(t *testi
 	}
 	wg.Wait()
 
+	// Now move replTS into the past to verify that when the wall clock advances
+	// past replTS, getReplId() advances replTS and resets replCount to 0 ("-0").
+	rc.mu.Lock()
+	rc.replTS = time.Now().Add(-time.Second)
+	rc.mu.Unlock()
+
+	advanceRes := rc.SendUpdates([]*store.StateUpdate{{Cmd: store.Activate, Key: "k-after-clock-advance"}})
+	require.Len(t, advanceRes, 1)
+	require.NoError(t, advanceRes[0].Err)
+	assert.True(t, strings.HasSuffix(advanceRes[0].Result, "-0"), "expected sequence counter to reset to -0 when wall clock advances past replTS, got %s", advanceRes[0].Result)
+
 	got := rc.GetUpdates()
-	require.Len(t, got, totalUpdates)
-	for i := 1; i < len(got); i++ {
+	require.Len(t, got, totalUpdates+1)
+	for i := 1; i < len(got)-1; i++ {
 		assert.Equal(t, -1, store.CompareReplIds(got[i-1].ReplId, got[i].ReplId),
 			"out-of-order ReplIds at index %d: %s vs %s", i, got[i-1].ReplId, got[i].ReplId)
 	}
 }
 
+// TestSendUpdatesFullChannelNonBlocking verifies that when the internal
+// replication channel is at capacity, SendUpdates returns FullReplicationQueueErr
+// immediately without blocking, attributes the error to each update's PrimaryKey,
+// and rolls back replTS/replCount so failed sends do not leave sequence gaps.
 func TestSendUpdatesFullChannelNonBlocking(t *testing.T) {
 	t.Parallel()
 
 	rc := New(newTestConfig(2, 2, 20))
+
+	// Pin replTS in the future so all updates in this test share the same
+	// millisecond prefix, allowing exact sequence counter verification.
+	rc.mu.Lock()
+	pinnedTS := time.Now().Add(10 * time.Second)
+	rc.replTS = pinnedTS
+	rc.replCount = 0
+	rc.mu.Unlock()
+	prefix := fmt.Sprintf("%013d-", pinnedTS.UnixMilli())
 
 	res := rc.SendUpdates([]*store.StateUpdate{
 		{Cmd: store.Activate, Key: "k1"},
@@ -426,8 +472,11 @@ func TestSendUpdatesFullChannelNonBlocking(t *testing.T) {
 	require.Len(t, res, 2)
 	require.NoError(t, res[0].Err)
 	require.NoError(t, res[1].Err)
+	assert.Equal(t, prefix+"1", res[0].Result)
+	assert.Equal(t, prefix+"2", res[1].Result)
 
-	// Queue is now at capacity (2). Sending more updates must fail immediately without blocking.
+	// Queue is now at capacity (2). Sending more updates must fail immediately without blocking
+	// and must roll back replCount so sequence numbers 3 and 4 are not burned.
 	overflowRes := rc.SendUpdates([]*store.StateUpdate{
 		{Cmd: store.Activate, Key: "overflow-1"},
 		{Cmd: store.Deactivate, Keys: []string{"", "overflow-2"}},
@@ -438,7 +487,7 @@ func TestSendUpdatesFullChannelNonBlocking(t *testing.T) {
 	assert.ErrorIs(t, overflowRes[1].Err, FullReplicationQueueErr)
 	assert.Equal(t, "overflow-2", overflowRes[1].Result)
 
-	// Drain existing items and verify subsequent send succeeds with strictly greater ReplId.
+	// Drain existing items and verify subsequent send receives exact sequence "-3" (rolled back).
 	drained := rc.GetUpdates()
 	require.Len(t, drained, 2)
 	assert.Equal(t, "k1", drained[0].Key)
@@ -449,9 +498,12 @@ func TestSendUpdatesFullChannelNonBlocking(t *testing.T) {
 	})
 	require.Len(t, afterDrainRes, 1)
 	require.NoError(t, afterDrainRes[0].Err)
-	assert.Equal(t, -1, store.CompareReplIds(res[1].Result, afterDrainRes[0].Result))
+	assert.Equal(t, prefix+"3", afterDrainRes[0].Result, "failed overflow sends must roll back replCount")
 }
 
+// TestGetUpdatesTimeoutAndBatching verifies that GetUpdates returns a non-nil
+// empty slice after OM_CACHE_IN_WAIT_TIMEOUT_MS when the queue is empty, and
+// drains at most OM_CACHE_IN_MAX_UPDATES_PER_POLL items per call when buffered.
 func TestGetUpdatesTimeoutAndBatching(t *testing.T) {
 	t.Parallel()
 

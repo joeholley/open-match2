@@ -16,55 +16,88 @@ package filter
 
 import (
 	"testing"
+	"time"
 
-	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"github.com/googleforgames/open-match2/v2/internal/filter/testcases"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// TestMeetsCriteria validates that tickets are correctly included/excluded
-// from a pool based on that pool's filters (i.e. it validates the filter
-// works as expected).
+// TestMeetsCriteria validates that tickets are correctly included in or excluded
+// from a pool based on that pool's DoubleRangeFilters, StringEqualsFilters,
+// TagPresentFilters, and CreationTimeRangeFilter criteria.
 func TestMeetsCriteria(t *testing.T) {
-	// Check that when a ticket meets filter criteria, it is included.
-	testInclusion := func(t *testing.T, pool *pb.Pool, ticket *pb.Ticket) {
-		if !In(pool, ticket) {
-			t.Error("ticket should be included in the pool")
+	t.Run("Included", func(t *testing.T) {
+		for _, tc := range testcases.IncludedTestCases() {
+			tc := tc
+			t.Run(tc.Name, func(t *testing.T) {
+				if !In(tc.Pool, tc.Ticket) {
+					t.Error("ticket should be included in the pool")
+				}
+			})
 		}
-	}
+	})
 
-	for _, tc := range testcases.IncludedTestCases() {
-		tc := tc
-		t.Run(tc.Name, func(t *testing.T) {
-			testInclusion(t, tc.Pool, tc.Ticket)
-		})
-	}
-
-	// Check that when a ticket fails filter criteria, it is excluded.
-	testExclusion := func(t *testing.T, pool *pb.Pool, ticket *pb.Ticket) {
-		if In(pool, ticket) {
-			t.Error("ticket should be excluded from the pool")
+	t.Run("Excluded", func(t *testing.T) {
+		for _, tc := range testcases.ExcludedTestCases() {
+			tc := tc
+			t.Run(tc.Name, func(t *testing.T) {
+				if In(tc.Pool, tc.Ticket) {
+					t.Error("ticket should be excluded from the pool")
+				}
+			})
 		}
-	}
-
-	for _, tc := range testcases.ExcludedTestCases() {
-		tc := tc
-		t.Run(tc.Name, func(t *testing.T) {
-			testExclusion(t, tc.Pool, tc.Ticket)
-		})
-	}
+	})
 }
 
-// TestValidPoolFilter runs the pool filter validation function with known
-// invalid values to make sure the validation function correctly rejects them.
+// TestValidPoolFilter verifies that ValidatePoolFilters accepts pools with nil
+// or valid CreationTimeRangeFilter bounds and rejects pools whose Start or End
+// timestamp is invalid according to protobuf timestamp rules.
 func TestValidPoolFilter(t *testing.T) {
+	now := timestamppb.New(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	later := timestamppb.New(time.Date(2025, 1, 1, 1, 0, 0, 0, time.UTC))
+
 	type testcase struct {
-		name string
-		pool *pb.Pool
-		err  error
+		name   string
+		pool   *pb.Pool
+		wantOk bool
+		err    error
 	}
 	tcs := []testcase{
+		{
+			name:   "valid pool without creation time filter",
+			pool:   &pb.Pool{Name: "no-time-filter"},
+			wantOk: true,
+		},
+		{
+			name: "valid creation time filter with start and end",
+			pool: &pb.Pool{
+				CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{
+					Start: now,
+					End:   later,
+				},
+			},
+			wantOk: true,
+		},
+		{
+			name: "valid creation time filter with start only",
+			pool: &pb.Pool{
+				CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{
+					Start: now,
+				},
+			},
+			wantOk: true,
+		},
+		{
+			name: "valid creation time filter with end only",
+			pool: &pb.Pool{
+				CreationTimeRangeFilter: &pb.Pool_CreationTimeRangeFilter{
+					End: later,
+				},
+			},
+			wantOk: true,
+		},
 		{
 			name: "invalid creation time filter start",
 			pool: &pb.Pool{
@@ -72,7 +105,8 @@ func TestValidPoolFilter(t *testing.T) {
 					Start: &timestamppb.Timestamp{Nanos: -1},
 				},
 			},
-			err: InvalidCreationTimeFilterStartErrorStatus,
+			wantOk: false,
+			err:    InvalidCreationTimeFilterStartErrorStatus,
 		},
 		{
 			name: "invalid creation time filter end",
@@ -81,21 +115,21 @@ func TestValidPoolFilter(t *testing.T) {
 					End: &timestamppb.Timestamp{Nanos: -1},
 				},
 			},
-			err: InvalidCreationTimeFilterEndErrorStatus,
+			wantOk: false,
+			err:    InvalidCreationTimeFilterEndErrorStatus,
 		},
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			ok, err := ValidatePoolFilters(tc.pool)
-
-			require.False(t, ok)
-			require.Error(t, err)
-
-			require.ErrorIs(t, err, tc.err)
-			//s := status.Convert(err)
-			//require.Equal(t, tc.code, s.Code())
-			//require.Equal(t, tc.msg, s.Message())
+			require.Equal(t, tc.wantOk, ok)
+			if tc.err != nil {
+				require.ErrorIs(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }

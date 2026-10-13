@@ -106,8 +106,8 @@ func snapshotActiveTicketsBench(tc *ReplicatedTicketCache) []any {
 }
 
 // populateFreshCacheForExpireBench seeds the 99% non-expired entries into
-// Tickets, InactiveSet, and Assignments and initializes the expiration heaps
-// prior to timing.
+// Tickets, InactiveSet, ActiveTickets (half active, half inactive), and
+// Assignments and initializes the expiration heaps prior to timing.
 func populateFreshCacheForExpireBench(tc *ReplicatedTicketCache, total int, now time.Time, ticketTtlMs int64) {
 	expiredCount := total / 100
 	freshCreationMs := now.UnixMilli()
@@ -121,20 +121,30 @@ func populateFreshCacheForExpireBench(tc *ReplicatedTicketCache, total int, now 
 			ExpirationTime: freshProtoTs,
 		}
 		tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id}, t, nil)
+		if i%2 == 0 {
+			tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Key: id}, nil, nil)
+		}
 		tc.applyUpdate(&store.StateUpdate{Cmd: store.Assign, Key: id}, nil, assignPb)
 	}
 }
 
 // seedExpiredSliceForExpireBench inserts the 1% (expiredCount) expired entries
-// into Tickets, InactiveSet, Assignments, and their expiration heaps so each
-// benchmarked expireCacheEntries call pops and deletes the 1% expired fraction.
+// into Tickets, InactiveSet, ActiveTickets (half activated so both inactiveHeap
+// and ticketHeap perform real map deletions), Assignments, and their expiration
+// heaps so each benchmarked expireCacheEntries call pops and deletes the 1% expired fraction.
 func seedExpiredSliceForExpireBench(tc *ReplicatedTicketCache, expiredCount int, expiredTicketIds, expiredAssignIds []string, expiredTickets []*pb.Ticket, assignPb *pb.Assignment) {
 	for i := 0; i < expiredCount; i++ {
 		tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: expiredTicketIds[i]}, expiredTickets[i], nil)
+		if i%2 == 0 {
+			tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Key: expiredTicketIds[i]}, nil, nil)
+		}
 		tc.applyUpdate(&store.StateUpdate{Cmd: store.Assign, Key: expiredAssignIds[i]}, nil, assignPb)
 	}
 }
 
+// BenchmarkExpireCacheEntries measures the latency and allocations of
+// expireCacheEntries when sweeping a 1% expired fraction from caches of 10,000
+// and 50,000 tickets and assignments.
 func BenchmarkExpireCacheEntries(b *testing.B) {
 	for _, total := range []int{10000, 50000} {
 		b.Run(fmt.Sprintf("N=%d", total), func(b *testing.B) {
@@ -180,6 +190,9 @@ func BenchmarkExpireCacheEntries(b *testing.B) {
 	}
 }
 
+// BenchmarkActiveTicketsSnapshot measures parallel read throughput and
+// allocations of SnapshotActiveTickets() on a cache with 50,000 total tickets
+// (25,000 active, 25,000 inactive).
 func BenchmarkActiveTicketsSnapshot(b *testing.B) {
 	const (
 		totalTickets    = 50000
@@ -223,6 +236,9 @@ func BenchmarkActiveTicketsSnapshot(b *testing.B) {
 	})
 }
 
+// BenchmarkReplicationThroughput compares end-to-end deactivation replication
+// throughput and allocations between unpacked (packed=false) and packed
+// (packed=true) modes under a simulated 500µs send/poll network RTT.
 func BenchmarkReplicationThroughput(b *testing.B) {
 	for _, packed := range []bool{false, true} {
 		b.Run(fmt.Sprintf("packed=%v", packed), func(b *testing.B) {
@@ -335,6 +351,9 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 	}
 }
 
+// TestSyntheticBurstReplication stress-tests ReplicatedTicketCache under high
+// concurrent match deactivation bursts (packed and unpacked) and simultaneous
+// mass ticket expiration without WaitForDeactivation timeouts.
 func TestSyntheticBurstReplication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping burst load test in short mode")
@@ -388,7 +407,19 @@ func TestSyntheticBurstReplication(t *testing.T) {
 
 				// 1. Concurrently create and activate 1,000 tickets across 25 match groups.
 				ticketIdsByMatch := make([][]string, numMatches)
-				var createWg sync.WaitGroup
+				var (
+					createWg        sync.WaitGroup
+					phase1Mu        sync.Mutex
+					maxPhase1ReplId string
+				)
+				recordPhase1Repl := func(replId string) {
+					phase1Mu.Lock()
+					if store.CompareReplIds(replId, maxPhase1ReplId) > 0 {
+						maxPhase1ReplId = replId
+					}
+					phase1Mu.Unlock()
+				}
+
 				for m := 0; m < numMatches; m++ {
 					m := m
 					ticketIdsByMatch[m] = make([]string, ticketsPerMatch)
@@ -409,9 +440,10 @@ func TestSyntheticBurstReplication(t *testing.T) {
 						}
 						for i := 0; i < ticketsPerMatch; i++ {
 							res := <-createChan
-							require.NoError(t, res.Err)
-							require.NotEmpty(t, res.Result)
-							ticketIdsByMatch[m][i] = res.Result
+							if assert.NoError(t, res.Err) && assert.NotEmpty(t, res.Result) {
+								ticketIdsByMatch[m][i] = res.Result
+								recordPhase1Repl(res.Result)
+							}
 						}
 
 						// Activate the created tickets for this group.
@@ -428,7 +460,9 @@ func TestSyntheticBurstReplication(t *testing.T) {
 								},
 							}
 							actRes := <-actChan
-							require.NoError(t, actRes.Err)
+							if assert.NoError(t, actRes.Err) {
+								recordPhase1Repl(actRes.Result)
+							}
 						} else {
 							actChan := make(chan *store.StateResponse, ticketsPerMatch)
 							for _, id := range ticketIdsByMatch[m] {
@@ -444,12 +478,22 @@ func TestSyntheticBurstReplication(t *testing.T) {
 							}
 							for i := 0; i < ticketsPerMatch; i++ {
 								actRes := <-actChan
-								require.NoError(t, actRes.Err)
+								if assert.NoError(t, actRes.Err) {
+									recordPhase1Repl(actRes.Result)
+								}
 							}
 						}
 					}()
 				}
 				createWg.Wait()
+
+				// Wait until all 1,000 ticket creations and activations have been applied
+				// in the cache before starting the deactivation burst.
+				require.NotEmpty(t, maxPhase1ReplId)
+				require.Eventually(t, func() bool {
+					return tc.HasAppliedReplId(maxPhase1ReplId)
+				}, 5*time.Second, 10*time.Millisecond)
+				assert.Len(t, tc.SnapshotActiveTickets(), totalTickets)
 
 				// 2. Drive concurrent match deactivation bursts (25 matches x 40 tickets = 1,000 deactivations)
 				// while also streaming concurrent background ticket creations.
@@ -485,8 +529,9 @@ func TestSyntheticBurstReplication(t *testing.T) {
 					}
 					for i := 0; i < 100; i++ {
 						res := <-extraChan
-						require.NoError(t, res.Err)
-						recordRepl(res.Result)
+						if assert.NoError(t, res.Err) {
+							recordRepl(res.Result)
+						}
 					}
 				}()
 
@@ -509,11 +554,12 @@ func TestSyntheticBurstReplication(t *testing.T) {
 								},
 							}
 							res := <-rChan
-							require.NoError(t, res.Err)
-							recordRepl(res.Result)
-							for _, id := range ids {
-								if !tc.WaitForDeactivation(id, res.Result, 5*time.Second) {
-									atomic.AddInt64(&timeoutCount, 1)
+							if assert.NoError(t, res.Err) {
+								recordRepl(res.Result)
+								for _, id := range ids {
+									if !tc.WaitForDeactivation(id, res.Result, 5*time.Second) {
+										atomic.AddInt64(&timeoutCount, 1)
+									}
 								}
 							}
 						} else {
@@ -532,8 +578,7 @@ func TestSyntheticBurstReplication(t *testing.T) {
 							var matchMaxRepl string
 							for range ids {
 								res := <-rChan
-								require.NoError(t, res.Err)
-								if store.CompareReplIds(res.Result, matchMaxRepl) > 0 {
+								if assert.NoError(t, res.Err) && store.CompareReplIds(res.Result, matchMaxRepl) > 0 {
 									matchMaxRepl = res.Result
 								}
 							}
@@ -554,6 +599,7 @@ func TestSyntheticBurstReplication(t *testing.T) {
 					return tc.HasAppliedReplId(highestRepl)
 				}, 5*time.Second, 10*time.Millisecond, "expected AppliedReplId (%s) to reach highestRepl (%s)", tc.AppliedReplId(), highestRepl)
 
+				assert.Empty(t, tc.SnapshotActiveTickets())
 				for m := 0; m < numMatches; m++ {
 					for _, id := range ticketIdsByMatch[m] {
 						_, isInactive := tc.InactiveSet.Load(id)
@@ -672,9 +718,10 @@ func TestSyntheticBurstReplication(t *testing.T) {
 						},
 					}
 					res := <-rChan
-					require.NoError(t, res.Err)
-					if !tc.WaitForDeactivation(keys[len(keys)-1], res.Result, 3*time.Second) {
-						atomic.AddInt64(&streamTimeouts, 1)
+					if assert.NoError(t, res.Err) {
+						if !tc.WaitForDeactivation(keys[len(keys)-1], res.Result, 3*time.Second) {
+							atomic.AddInt64(&streamTimeouts, 1)
+						}
 					}
 					time.Sleep(workerPauseBetweenSend)
 				}

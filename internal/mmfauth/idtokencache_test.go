@@ -30,6 +30,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// sliceTokenSource is a thread-safe test oauth2.TokenSource that returns
+// preconfigured tokens in order (clamping at the last token) or a fixed error,
+// while counting the number of Token() invocations.
 type sliceTokenSource struct {
 	mu     sync.Mutex
 	tokens []*oauth2.Token
@@ -57,21 +60,33 @@ func (s *sliceTokenSource) Token() (*oauth2.Token, error) {
 	return s.tokens[i], nil
 }
 
+func (s *sliceTokenSource) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestIDTokenCache_CachesWhileValid_Concurrent verifies that concurrent Token()
+// calls for multiple audiences create at most one TokenSource per audience and
+// serve the cached valid token without re-invoking the underlying TokenSource.
 func TestIDTokenCache_CachesWhileValid_Concurrent(t *testing.T) {
 	t.Parallel()
 
 	var factoryCalls sync.Map // audience -> *atomic.Int32
+	var sources sync.Map      // audience -> *sliceTokenSource
 	cache := NewIDTokenCache(func(_ context.Context, audience string) (oauth2.TokenSource, error) {
 		val, _ := factoryCalls.LoadOrStore(audience, &atomic.Int32{})
 		n := val.(*atomic.Int32).Add(1)
-		return &sliceTokenSource{
+		src := &sliceTokenSource{
 			tokens: []*oauth2.Token{
 				{
 					AccessToken: fmt.Sprintf("tok-%s-%d", audience, n),
 					Expiry:      time.Now().Add(time.Hour),
 				},
 			},
-		}, nil
+		}
+		sources.Store(audience, src)
+		return src, nil
 	})
 
 	audiences := []string{"https://mmf-fifo.a.run.app", "https://mmf-debug.a.run.app"}
@@ -82,8 +97,9 @@ func TestIDTokenCache_CachesWhileValid_Concurrent(t *testing.T) {
 		go func(a string) {
 			defer wg.Done()
 			tok, err := cache.Token(a)
-			require.NoError(t, err)
-			assert.Equal(t, fmt.Sprintf("tok-%s-1", a), tok.AccessToken)
+			if assert.NoError(t, err) {
+				assert.Equal(t, fmt.Sprintf("tok-%s-1", a), tok.AccessToken)
+			}
 		}(aud)
 	}
 	wg.Wait()
@@ -92,51 +108,110 @@ func TestIDTokenCache_CachesWhileValid_Concurrent(t *testing.T) {
 		val, ok := factoryCalls.Load(aud)
 		require.True(t, ok)
 		assert.Equal(t, int32(1), val.(*atomic.Int32).Load(), "expected factory to be called once for %s", aud)
+
+		srcVal, ok := sources.Load(aud)
+		require.True(t, ok)
+		assert.Equal(t, 1, srcVal.(*sliceTokenSource).callCount(), "expected underlying TokenSource.Token() to be called only once while token is valid for %s", aud)
 	}
 }
 
+// TestIDTokenCache_ExpiredTokenRefreshesFromSource verifies that when a cached
+// token expires, Token() first attempts to refresh from the existing TokenSource,
+// and falls back to recreating a new TokenSource if the existing source fails.
 func TestIDTokenCache_ExpiredTokenRefreshesFromSource(t *testing.T) {
 	t.Parallel()
 
-	var factoryCalls atomic.Int32
-	src := &sliceTokenSource{
-		tokens: []*oauth2.Token{
-			{
-				// Expires within oauth2's 10s expiryDelta, so Valid() is false.
-				AccessToken: "expired-tok",
-				Expiry:      time.Now().Add(-time.Minute),
-			},
-			{
-				AccessToken: "fresh-from-same-source",
-				Expiry:      time.Now().Add(time.Hour),
-			},
-		},
-	}
+	t.Run("RefreshesFromExistingSourceWhenValid", func(t *testing.T) {
+		t.Parallel()
 
-	cache := NewIDTokenCache(func(_ context.Context, _ string) (oauth2.TokenSource, error) {
-		factoryCalls.Add(1)
-		return src, nil
+		var factoryCalls atomic.Int32
+		src := &sliceTokenSource{
+			tokens: []*oauth2.Token{
+				{
+					// Expires within oauth2's 10s expiryDelta, so Valid() is false.
+					AccessToken: "expired-tok",
+					Expiry:      time.Now().Add(-time.Minute),
+				},
+				{
+					AccessToken: "fresh-from-same-source",
+					Expiry:      time.Now().Add(time.Hour),
+				},
+			},
+		}
+
+		cache := NewIDTokenCache(func(_ context.Context, _ string) (oauth2.TokenSource, error) {
+			factoryCalls.Add(1)
+			return src, nil
+		})
+
+		// First call gets "expired-tok" from mintFreshLocked.
+		tok1, err := cache.Token("https://mmf.a.run.app")
+		require.NoError(t, err)
+		assert.Equal(t, "expired-tok", tok1.AccessToken)
+		assert.Equal(t, int32(1), factoryCalls.Load())
+
+		// Second call sees tok1.Valid() == false and pulls the next token from the existing source.
+		tok2, err := cache.Token("https://mmf.a.run.app")
+		require.NoError(t, err)
+		assert.Equal(t, "fresh-from-same-source", tok2.AccessToken)
+		assert.Equal(t, int32(1), factoryCalls.Load(), "should reuse existing TokenSource when it returns a valid token")
+
+		// Third call reuses the valid tok2 without calling src.Token() again.
+		tok3, err := cache.Token("https://mmf.a.run.app")
+		require.NoError(t, err)
+		assert.Equal(t, "fresh-from-same-source", tok3.AccessToken)
+		assert.Equal(t, 2, src.callCount())
 	})
 
-	// First call gets "expired-tok" from mintFreshLocked.
-	tok1, err := cache.Token("https://mmf.a.run.app")
-	require.NoError(t, err)
-	assert.Equal(t, "expired-tok", tok1.AccessToken)
-	assert.Equal(t, int32(1), factoryCalls.Load())
+	t.Run("RecreatesSourceWhenExistingSourceReturnsExpiredOrError", func(t *testing.T) {
+		t.Parallel()
 
-	// Second call sees tok1.Valid() == false and pulls the next token from the existing source.
-	tok2, err := cache.Token("https://mmf.a.run.app")
-	require.NoError(t, err)
-	assert.Equal(t, "fresh-from-same-source", tok2.AccessToken)
-	assert.Equal(t, int32(1), factoryCalls.Load(), "should reuse existing TokenSource when it returns a valid token")
+		var factoryCalls atomic.Int32
+		firstSrc := &sliceTokenSource{
+			tokens: []*oauth2.Token{
+				{
+					// Still expired on subsequent calls, forcing fallback to mintFreshLocked.
+					AccessToken: "stuck-expired-tok",
+					Expiry:      time.Now().Add(-time.Minute),
+				},
+			},
+		}
+		secondSrc := &sliceTokenSource{
+			tokens: []*oauth2.Token{
+				{
+					AccessToken: "fresh-from-new-source",
+					Expiry:      time.Now().Add(time.Hour),
+				},
+			},
+		}
 
-	// Third call reuses the valid tok2 without calling src.Token() again.
-	tok3, err := cache.Token("https://mmf.a.run.app")
-	require.NoError(t, err)
-	assert.Equal(t, "fresh-from-same-source", tok3.AccessToken)
-	assert.Equal(t, 2, src.calls)
+		cache := NewIDTokenCache(func(_ context.Context, _ string) (oauth2.TokenSource, error) {
+			if factoryCalls.Add(1) == 1 {
+				return firstSrc, nil
+			}
+			return secondSrc, nil
+		})
+
+		tok1, err := cache.Token("https://mmf.a.run.app")
+		require.NoError(t, err)
+		assert.Equal(t, "stuck-expired-tok", tok1.AccessToken)
+		assert.Equal(t, int32(1), factoryCalls.Load())
+
+		// Second call sees tok1 is expired, tries firstSrc.Token() which is also expired,
+		// deletes the stale cache entry, and mints a fresh TokenSource (secondSrc).
+		tok2, err := cache.Token("https://mmf.a.run.app")
+		require.NoError(t, err)
+		assert.Equal(t, "fresh-from-new-source", tok2.AccessToken)
+		assert.Equal(t, int32(2), factoryCalls.Load(), "should recreate TokenSource when existing source fails to return a valid token")
+		assert.Equal(t, 2, firstSrc.callCount())
+		assert.Equal(t, 1, secondSrc.callCount())
+	})
 }
 
+// TestIDTokenCache_RefreshOnRejection_RecreatesSourceAndDeduplicatesConcurrentRefreshes
+// verifies that when multiple concurrent callers report the same rejected token
+// via Refresh(audience, rejectedAccessToken), only one new TokenSource is minted
+// while the remaining callers receive the newly refreshed token without redundant minting.
 func TestIDTokenCache_RefreshOnRejection_RecreatesSourceAndDeduplicatesConcurrentRefreshes(t *testing.T) {
 	t.Parallel()
 
@@ -167,8 +242,9 @@ func TestIDTokenCache_RefreshOnRejection_RecreatesSourceAndDeduplicatesConcurren
 		go func(idx int) {
 			defer wg.Done()
 			refreshed, err := cache.Refresh(aud, "token-v1")
-			require.NoError(t, err)
-			results[idx] = refreshed.AccessToken
+			if assert.NoError(t, err) {
+				results[idx] = refreshed.AccessToken
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -184,6 +260,9 @@ func TestIDTokenCache_RefreshOnRejection_RecreatesSourceAndDeduplicatesConcurren
 	assert.Equal(t, "token-v2", current.AccessToken)
 }
 
+// TestIDTokenCache_DoesNotCacheErrors verifies that transient errors during
+// TokenSource creation or initial Token() minting are not cached, allowing
+// subsequent calls for the same audience to retry and recover.
 func TestIDTokenCache_DoesNotCacheErrors(t *testing.T) {
 	t.Parallel()
 
@@ -217,6 +296,8 @@ func TestIDTokenCache_DoesNotCacheErrors(t *testing.T) {
 	assert.Equal(t, "recovered-token", tok.AccessToken)
 }
 
+// TestIsAuthRejection verifies that IsAuthRejection returns true only for gRPC
+// Unauthenticated and PermissionDenied status errors.
 func TestIsAuthRejection(t *testing.T) {
 	t.Parallel()
 

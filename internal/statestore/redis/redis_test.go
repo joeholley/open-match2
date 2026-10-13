@@ -31,11 +31,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// recordedCmd captures a single Redis command name and its arguments sent via
+// Send or Do on a test Redis connection.
 type recordedCmd struct {
 	cmd  string
 	args []interface{}
 }
 
+// fakeRedisConn is a stateless mock redis.Conn that records sent commands and
+// returns a preconfigured response or error from Do().
 type fakeRedisConn struct {
 	sent   []recordedCmd
 	doResp interface{}
@@ -57,11 +61,15 @@ func (f *fakeRedisConn) Do(commandName string, args ...interface{}) (interface{}
 	return f.doResp, f.doErr
 }
 
+// fakeStreamEntry represents a single entry in the in-memory "om-replication"
+// Redis stream maintained by statefulFakeRedisConn.
 type fakeStreamEntry struct {
 	id     string
 	fields []string
 }
 
+// statefulFakeRedisConn is an in-memory Redis Streams emulator supporting
+// pipelined XADD + XTRIM (via Send + Do("")) and blocking/non-blocking XREAD.
 type statefulFakeRedisConn struct {
 	mu       sync.Mutex
 	pipeline []recordedCmd
@@ -109,13 +117,15 @@ func (c *statefulFakeRedisConn) Do(commandName string, args ...interface{}) (int
 			switch cmd.cmd {
 			case "XADD":
 				// args: ["om-replication", "*", field1, val1, ...]
+				// Real Redis requires at least one field/value pair and an even number of field/value tokens.
+				if len(cmd.args) < 4 || (len(cmd.args)-2)%2 != 0 {
+					results = append(results, redis.Error("ERR wrong number of arguments for 'xadd' command"))
+					continue
+				}
 				id := c.nextStreamIDLocked()
-				var fields []string
-				if len(cmd.args) > 2 {
-					fields = make([]string, 0, len(cmd.args)-2)
-					for _, a := range cmd.args[2:] {
-						fields = append(fields, fmt.Sprint(a))
-					}
+				fields := make([]string, 0, len(cmd.args)-2)
+				for _, a := range cmd.args[2:] {
+					fields = append(fields, fmt.Sprint(a))
 				}
 				c.entries = append(c.entries, fakeStreamEntry{
 					id:     id,
@@ -205,6 +215,8 @@ func (c *statefulFakeRedisConn) Do(commandName string, args ...interface{}) (int
 	return nil, nil
 }
 
+// newTestRedisReplicator constructs a redisReplicator backed by the given mock
+// or fake redis.Conn starting from stream cursor "0-0".
 func newTestRedisReplicator(conn redis.Conn) *redisReplicator {
 	cfg := config.Read()
 	pool := &redis.Pool{
@@ -221,6 +233,10 @@ func newTestRedisReplicator(conn redis.Conn) *redisReplicator {
 	}
 }
 
+// TestSendUpdatesReplyAlignmentWithSkippedInvalidUpdates verifies that when a
+// batch sent to SendUpdates contains an invalid update in the middle (which skips
+// rConn.Send("XADD", ...)), the pipelined Redis replies are still aligned with
+// the corresponding valid caller input indices.
 func TestSendUpdatesReplyAlignmentWithSkippedInvalidUpdates(t *testing.T) {
 	conn := &fakeRedisConn{
 		// Only 2 XADD commands + 1 XTRIM command are sent because update[1] fails validation.
@@ -273,36 +289,55 @@ func TestSendUpdatesReplyAlignmentWithSkippedInvalidUpdates(t *testing.T) {
 	assert.Equal(t, "1700000000020-0", res[2].Result)
 }
 
+// TestSendUpdatesApproximateXTrimEvictsExpiredEntries verifies that the
+// pipelined "XTRIM om-replication MINID ~ <now - TTL>" command evicts stream
+// entries older than OM_CACHE_TICKET_TTL_MS while preserving unexpired
+// pre-existing entries and newly added entries.
 func TestSendUpdatesApproximateXTrimEvictsExpiredEntries(t *testing.T) {
 	conn := newStatefulFakeRedisConn()
 	rr := newTestRedisReplicator(conn)
 	rr.cfg.Set("OM_CACHE_TICKET_TTL_MS", 10000)
 
-	expiredMs := time.Now().UnixMilli() - 25000
-	expiredID := fmt.Sprintf("%013d-0", expiredMs)
-	conn.entries = append(conn.entries, fakeStreamEntry{
-		id:     expiredID,
-		fields: []string{"deactivate", "1700000000000-0"},
-	})
+	nowMs := time.Now().UnixMilli()
+	expiredID := fmt.Sprintf("%013d-0", nowMs-25000)
+	unexpiredID := fmt.Sprintf("%013d-0", nowMs-2000)
+	conn.entries = append(conn.entries,
+		fakeStreamEntry{
+			id:     expiredID,
+			fields: []string{"deactivate", "1700000000000-0"},
+		},
+		fakeStreamEntry{
+			id:     unexpiredID,
+			fields: []string{"deactivate", "1700000000000-1"},
+		},
+	)
 
 	res := rr.SendUpdates([]*store.StateUpdate{
 		{
 			Cmd: store.Activate,
-			Key: "1700000000000-1",
+			Key: "1700000000000-2",
 		},
 	})
 	require.Len(t, res, 1)
 	require.NoError(t, res[0].Err)
 
 	// Expired entry older than OM_CACHE_TICKET_TTL_MS should be trimmed by XTRIM MINID ~,
-	// leaving only the newly added entry in the stream.
+	// while the unexpired pre-existing entry and newly added entry remain in the stream.
 	got := rr.GetUpdates()
-	require.Len(t, got, 1)
-	assert.Equal(t, store.Activate, got[0].Cmd)
+	require.Len(t, got, 2)
+	assert.Equal(t, store.Deactivate, got[0].Cmd)
 	assert.Equal(t, "1700000000000-1", got[0].Key)
-	assert.Equal(t, res[0].Result, got[0].ReplId)
+	assert.Equal(t, unexpiredID, got[0].ReplId)
+
+	assert.Equal(t, store.Activate, got[1].Cmd)
+	assert.Equal(t, "1700000000000-2", got[1].Key)
+	assert.Equal(t, res[0].Result, got[1].ReplId)
 }
 
+// TestSendUpdatesPackedSkipsEmptyKeys verifies that packed Activate/Deactivate
+// updates skip empty strings in Keys, pad an even number of valid keys with a
+// trailing "" so XADD receives an even number of field/value tokens, and reject
+// updates whose Keys slice contains only empty strings.
 func TestSendUpdatesPackedSkipsEmptyKeys(t *testing.T) {
 	conn := &fakeRedisConn{
 		doResp: []interface{}{
@@ -358,6 +393,9 @@ func TestSendUpdatesPackedSkipsEmptyKeys(t *testing.T) {
 	assert.Equal(t, "1700000000000-5", conn.sent[1].args[5])
 }
 
+// TestFormatRedisCmdForLog verifies that formatRedisCmdForLog strips trailing
+// empty padding tokens, truncates long packed argument lists with "...", and
+// summarizes binary ticket protobuf payloads by byte length.
 func TestFormatRedisCmdForLog(t *testing.T) {
 	shortOddArgs := []interface{}{"om-replication", "*", "activate", "id1", "id2", "id3", "id4", "id5"}
 	assert.Equal(t, "XADD om-replication * activate id1 id2 id3 id4 id5", formatRedisCmdForLog("XADD", shortOddArgs))
@@ -372,6 +410,10 @@ func TestFormatRedisCmdForLog(t *testing.T) {
 	assert.Equal(t, "XADD om-replication * ticket <27 bytes>", formatRedisCmdForLog("XADD", ticketArgs))
 }
 
+// TestGetUpdatesPackedAndUnknownCommand verifies that GetUpdates decodes packed
+// multi-key stream entries, skips unrecognized stream commands without failing,
+// and still advances rr.replId past unknown commands (even when the unknown
+// command is the final entry in the XREAD batch).
 func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
 	// XREAD reply structure:
 	// [ [ streamName, [ [ replId, [ field1, val1, field2, val2, ... ] ], ... ] ] ]
@@ -399,6 +441,13 @@ func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
 							[]byte("ticket"), []byte("serialized-ticket-bytes"),
 						},
 					},
+					[]interface{}{
+						// Trailing unknown command verifies that the default branch advances rr.replId.
+						[]byte("1700000000103-0"),
+						[]interface{}{
+							[]byte("unknown_trailing_cmd"), []byte("ignored_payload"),
+						},
+					},
 				},
 			},
 		},
@@ -406,7 +455,7 @@ func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
 	rr := newTestRedisReplicator(conn)
 
 	updates := rr.GetUpdates()
-	// Unknown command entry is skipped; only the packed deactivate and ticket entries are returned.
+	// Unknown command entries are skipped; only the packed deactivate and ticket entries are returned.
 	require.Len(t, updates, 2)
 
 	assert.Equal(t, store.Deactivate, updates[0].Cmd)
@@ -419,9 +468,14 @@ func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
 	assert.Equal(t, "serialized-ticket-bytes", updates[1].Value)
 	assert.Equal(t, "1700000000102-0", updates[1].ReplId)
 
-	assert.Equal(t, "1700000000102-0", rr.replId)
+	// Cursor must advance to the trailing unknown command's stream ID so it is not re-read.
+	assert.Equal(t, "1700000000103-0", rr.replId)
 }
 
+// TestReplicatorConformance runs a shared behavioral contract suite against
+// both the in-memory StateReplicator and the Redis StateReplicator to verify
+// identical round-trip normalization, error attribution, cursor advancement,
+// and monotonic ReplId generation.
 func TestReplicatorConformance(t *testing.T) {
 	factories := []struct {
 		name string
@@ -700,6 +754,39 @@ func TestReplicatorConformance(t *testing.T) {
 					}
 					prev = r.Result
 				}
+			})
+
+			t.Run("IncrementalCursorAdvancementAcrossPolls", func(t *testing.T) {
+				rep := factory.make()
+
+				res1 := rep.SendUpdates([]*store.StateUpdate{
+					{Cmd: store.Activate, Key: "1700000000001-0"},
+				})
+				require.Len(t, res1, 1)
+				require.NoError(t, res1[0].Err)
+
+				poll1 := rep.GetUpdates()
+				require.Len(t, poll1, 1)
+				assert.Equal(t, "1700000000001-0", poll1[0].Key)
+				assert.Equal(t, res1[0].Result, poll1[0].ReplId)
+
+				res2 := rep.SendUpdates([]*store.StateUpdate{
+					{Cmd: store.Deactivate, Key: "1700000000001-0"},
+				})
+				require.Len(t, res2, 1)
+				require.NoError(t, res2[0].Err)
+				assert.Equal(t, -1, store.CompareReplIds(res1[0].Result, res2[0].Result))
+
+				// Second poll must only return the newly sent update, not replay poll1.
+				poll2 := rep.GetUpdates()
+				require.Len(t, poll2, 1)
+				assert.Equal(t, store.Deactivate, poll2[0].Cmd)
+				assert.Equal(t, "1700000000001-0", poll2[0].Key)
+				assert.Equal(t, res2[0].Result, poll2[0].ReplId)
+
+				poll3 := rep.GetUpdates()
+				assert.NotNil(t, poll3)
+				assert.Empty(t, poll3)
 			})
 
 			t.Run("EmptyGetUpdatesReturnsNonNilEmptySlice", func(t *testing.T) {

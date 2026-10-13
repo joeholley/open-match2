@@ -67,9 +67,8 @@ var (
 		"component": "core",
 	})
 
-	// One global instance for the local ticket cache. Everything reads and
-	// writes to this one instance which contains concurrent-safe data
-	// structures where necessary.
+	// tcs maps each configured replication backend ("memory" and optionally "redis")
+	// to its running ReplicatedTicketCache instance for cross-backend conformance tests.
 	tcs = map[string]*cache.ReplicatedTicketCache{}
 
 	// Ticket ids are using the redis stream ID format.
@@ -91,7 +90,7 @@ var (
 	}
 )
 
-const redisUri = "localhost:6379"
+const redisUri = "redis://localhost:6379"
 
 // TestMain sets up both the in-memory mock ticket replicator and the actual
 // redis ticket replicator (using local redis and falling back to
@@ -99,8 +98,6 @@ const redisUri = "localhost:6379"
 // the expected results.
 func TestMain(m *testing.M) {
 	logrus.SetLevel(logrus.FatalLevel)
-	logrus.SetLevel(logrus.DebugLevel)
-	logrus.SetLevel(logrus.TraceLevel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -108,13 +105,19 @@ func TestMain(m *testing.M) {
 	os.Setenv("OM_REDIS_DIAL_MAX_BACKOFF_TIMEOUT", "10s")
 
 	redisConfig := func(uri string) {
-		// Attempt to connect to locally running redis
+		if !strings.Contains(uri, "://") {
+			uri = "redis://" + uri
+		}
 		redisUrl, err := url.Parse(uri)
 		if err != nil {
 			testLogger.Fatalf("failed to parse connection string for redis: %s", err)
 		}
 		os.Setenv("REDISHOST", redisUrl.Hostname())
 		os.Setenv("REDISPORT", redisUrl.Port())
+		os.Setenv("OM_REDIS_READ_HOST", redisUrl.Hostname())
+		os.Setenv("OM_REDIS_WRITE_HOST", redisUrl.Hostname())
+		os.Setenv("OM_REDIS_READ_PORT", redisUrl.Port())
+		os.Setenv("OM_REDIS_WRITE_PORT", redisUrl.Port())
 	}
 	redisConfig(redisUri)
 	cfg = config.Read() // Read env vars into config
@@ -151,7 +154,7 @@ func TestMain(m *testing.M) {
 			if err != nil {
 				log.Fatalf("failed to get connection string for redis container: %s", err)
 			}
-			testLogger.Infof("got connection string for redis container: %s", err)
+			testLogger.Infof("got connection string for redis container: %s", uri)
 			redisConfig(uri)
 			cfg = config.Read() // Read latest REDISPORT/REDISHOST env vars into config
 			rr, err = redisReplicator.New(cfg)
@@ -179,24 +182,33 @@ func TestMain(m *testing.M) {
 	}
 }
 
-// TestCreateTicket tests the createTicket() function, which is the internal
-// implementation of the gRPC CreateTicket() function defined in
-// proto/v2/api.proto .
+// TestCreateTicket tests validateAndMarshalIncomingTicket() and createTicket(),
+// which implement the gRPC CreateTicket() RPC defined in proto/api.proto.
 //
 // This does combinatorial creation of tickets with every valid attribute we
 // want to test, which makes it fail complexity linter.
 //
 //nolint:gocognit,cyclop
 func TestCreateTicket(t *testing.T) {
-	// expiration times that should fail validation
-	inValidEts := map[string]*pb.Ticket{
-		// Now() will always fail, because by the time you send the timestamp to
-		// the validation function, time will have advanced past it.
-		"now": &pb.Ticket{ExpirationTime: timestamppb.Now()},
-		// 1/1/1970
-		"epoch": &pb.Ticket{ExpirationTime: &timestamppb.Timestamp{Seconds: 0, Nanos: 0}},
-		// Timestamppb max allowed timestamp value
-		"last_possible": &pb.Ticket{ExpirationTime: &timestamppb.Timestamp{Seconds: 253402300800, Nanos: 0}},
+	maxTTL := time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))
+
+	// Expiration times that should fail validation across all three rejection branches:
+	// 1. exTime.AsTime().Before(cTime.AsTime()) ("past", "epoch")
+	// 2. exTime.AsTime().After(maxExTime) ("exceeds_max_ttl")
+	// 3. !exTime.IsValid() ("out_of_protobuf_range": 10000-01-01T00:00:00Z > max 9999-12-31T23:59:59Z)
+	inValidEts := map[string]func() *pb.Ticket{
+		"past": func() *pb.Ticket {
+			return &pb.Ticket{ExpirationTime: timestamppb.New(time.Now().Add(-time.Second))}
+		},
+		"epoch": func() *pb.Ticket {
+			return &pb.Ticket{ExpirationTime: &timestamppb.Timestamp{Seconds: 0, Nanos: 0}}
+		},
+		"exceeds_max_ttl": func() *pb.Ticket {
+			return &pb.Ticket{ExpirationTime: timestamppb.New(time.Now().Add(2 * maxTTL))}
+		},
+		"out_of_protobuf_range": func() *pb.Ticket {
+			return &pb.Ticket{ExpirationTime: &timestamppb.Timestamp{Seconds: 253402300800, Nanos: 0}}
+		},
 	}
 
 	// Expected failure status for invalid expiration times
@@ -204,50 +216,49 @@ func TestCreateTicket(t *testing.T) {
 		fmt.Sprintf("specified expiration time not between (now, now + %v)",
 			cfg.GetInt("OM_CACHE_TICKET_TTL_MS")))
 
-	// Make sure all expected invalid expiration times do fail validation correctly
-	for testCaseName, thisTestCase := range inValidEts {
-		t.Run(fmt.Sprintf("InvalidExpTime=%v", testCaseName), func() func(t *testing.T) {
-			return func(t *testing.T) {
-				t.Parallel()
-				_, err := validateAndMarshalIncomingTicket(&pb.CreateTicketRequest{Ticket: thisTestCase})
-				// Check expected error was returned
-				s := status.Convert(err)
-				assert.Equal(t, invalidExpTimeStatus.Code(), s.Code())
-				assert.Contains(t, s.Message(), invalidExpTimeStatus.Message())
-			}
-		}())
+	// Make sure all expected invalid expiration times fail validation with InvalidArgument
+	for testCaseName, makeTicket := range inValidEts {
+		makeTicket := makeTicket
+		t.Run(fmt.Sprintf("InvalidExpTime=%v", testCaseName), func(t *testing.T) {
+			t.Parallel()
+			_, err := validateAndMarshalIncomingTicket(&pb.CreateTicketRequest{Ticket: makeTicket()})
+			s := status.Convert(err)
+			assert.Equal(t, invalidExpTimeStatus.Code(), s.Code())
+			assert.Contains(t, s.Message(), invalidExpTimeStatus.Message())
+		})
 	}
 
-	// valid filterable data attribute test cases
+	// Valid filterable data attribute test cases
 	tags := []*pb.Ticket_FilterableData{
-		&pb.Ticket_FilterableData{},
-		&pb.Ticket_FilterableData{Tags: []string{"bonusxp"}},
+		{},
+		{Tags: []string{"bonusxp"}},
 	}
 	sas := []*pb.Ticket_FilterableData{
-		&pb.Ticket_FilterableData{},
-		&pb.Ticket_FilterableData{StringArgs: map[string]string{"class": "tank"}},
+		{},
+		{StringArgs: map[string]string{"class": "tank"}},
 	}
 	das := []*pb.Ticket_FilterableData{
-		&pb.Ticket_FilterableData{},
-		&pb.Ticket_FilterableData{DoubleArgs: map[string]float64{"mmr": 1200.0}},
+		{},
+		{DoubleArgs: map[string]float64{"mmr": 1200.0}},
 	}
 	cts := []*pb.Ticket_FilterableData{
-		&pb.Ticket_FilterableData{},
-		&pb.Ticket_FilterableData{CreationTime: &timestamppb.Timestamp{Seconds: 0, Nanos: 0}},
-		&pb.Ticket_FilterableData{CreationTime: timestamppb.Now()},
+		{},
+		{CreationTime: &timestamppb.Timestamp{Seconds: 0, Nanos: 0}},
+		{CreationTime: timestamppb.Now()},
 	}
-	validEts := map[string]*pb.Ticket{
-		"empty": &pb.Ticket{},
-		"now+halfMaxTTL": &pb.Ticket{ExpirationTime: timestamppb.New(time.Now().Add(
-			(time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))) / 2))},
-		"now+maxTTL": &pb.Ticket{ExpirationTime: timestamppb.New(time.Now().Add(
-			time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS"))))},
-		"now+matTTL-1": &pb.Ticket{ExpirationTime: timestamppb.New(time.Now().Add(
-			time.Millisecond * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_MS")-1)))},
+	validEts := map[string]func() *timestamppb.Timestamp{
+		"empty": func() *timestamppb.Timestamp {
+			return nil
+		},
+		"now+halfMaxTTL": func() *timestamppb.Timestamp {
+			return timestamppb.New(time.Now().Add(maxTTL / 2))
+		},
+		"now+maxTTL-1ms": func() *timestamppb.Timestamp {
+			return timestamppb.New(time.Now().Add(maxTTL - time.Millisecond))
+		},
 	}
 
-	// Combine the ways of making empty contents to generate different empty
-	// valid Attributes possibilities.
+	// Generate the Cartesian product of empty and non-empty FilterableData attributes.
 	attrs := []*pb.Ticket_FilterableData{}
 	for _, tags := range tags {
 		for _, sas := range sas {
@@ -264,35 +275,37 @@ func TestCreateTicket(t *testing.T) {
 		}
 	}
 
-	// Test that all valid combinations of expiration times, and attributes are parsed correctly.
-	for eCaseName, testExpirationTime := range validEts {
+	// Test that all valid combinations of expiration times and attributes are parsed and replicated.
+	for eCaseName, makeExpTime := range validEts {
+		eCaseName := eCaseName
+		makeExpTime := makeExpTime
 		for _, testAttrs := range attrs {
 			t.Run(fmt.Sprintf("ValidTicketAttrs-ExpTime=%v-FilterableData=%v", eCaseName, testAttrs), func(attrs *pb.Ticket_FilterableData) func(t *testing.T) {
 				return func(t *testing.T) {
 					t.Parallel()
+					reqExpTime := makeExpTime()
 					request := &pb.CreateTicketRequest{
-						Ticket: &pb.Ticket{ExpirationTime: testExpirationTime.GetExpirationTime(),
-							Attributes: attrs}}
+						Ticket: &pb.Ticket{
+							ExpirationTime: reqExpTime,
+							Attributes:     attrs,
+						},
+					}
 					result := &pb.Ticket{}
 
 					// First, check that the ticket processing works correctly
 					marshalledTicket, err := validateAndMarshalIncomingTicket(request)
 					require.NoError(t, err)
-					proto.Unmarshal(marshalledTicket, result) //nolint:errcheck
-					// Filterable Data Attributes being copied correctly to the new
-					// ticket?
+					require.NoError(t, proto.Unmarshal(marshalledTicket, result))
+
+					// Filterable Data Attributes being copied correctly to the new ticket?
 					if len(attrs.GetTags()) > 0 {
-						assert.Equal(t, attrs.GetTags(),
-							result.GetAttributes().GetTags())
+						assert.Equal(t, attrs.GetTags(), result.GetAttributes().GetTags())
 					}
 					if len(attrs.GetStringArgs()) > 0 {
-						assert.Equal(t,
-							attrs.GetStringArgs(),
-							result.GetAttributes().GetStringArgs())
+						assert.Equal(t, attrs.GetStringArgs(), result.GetAttributes().GetStringArgs())
 					}
 					if len(attrs.GetDoubleArgs()) > 0 {
-						assert.Equal(t, attrs.GetDoubleArgs(),
-							result.GetAttributes().GetDoubleArgs())
+						assert.Equal(t, attrs.GetDoubleArgs(), result.GetAttributes().GetDoubleArgs())
 					}
 					if attrs.GetCreationTime().IsValid() {
 						// Note: have to use AsTime() to convert
@@ -303,14 +316,22 @@ func TestCreateTicket(t *testing.T) {
 							result.GetAttributes().GetCreationTime().AsTime())
 					}
 
-					// Creation and expiration time being generated correctly?
+					// Creation and expiration time being generated or preserved correctly?
 					assert.True(t, result.GetAttributes().GetCreationTime().IsValid())
 					assert.True(t, result.GetExpirationTime().IsValid())
+					if reqExpTime != nil {
+						assert.Equal(t, reqExpTime.AsTime(), result.GetExpirationTime().AsTime())
+					}
 
 					// Check that the ticket insertion code for the replication layer of
 					// the ticket cache works correctly.
 					for tcTypeName, tc := range tcs {
-						response, err := createTicket(context.Background(), tc, request)
+						response, err := createTicket(context.Background(), tc, &pb.CreateTicketRequest{
+							Ticket: &pb.Ticket{
+								ExpirationTime: makeExpTime(),
+								Attributes:     attrs,
+							},
+						})
 						require.NoError(t, err, "Error trying to replicate ticket using %v replication", tcTypeName)
 						assert.NotEmpty(t, response.GetTicketId(), "%v replication didn't provide a ticket id", tcTypeName)
 					}
@@ -322,8 +343,13 @@ func TestCreateTicket(t *testing.T) {
 
 // TestValidateTicketStateUpdates tests the validateTicketStateUpdates function
 // used by the internal implementations of the gRPC functions ActivateTickets()
-// and DeactivateTickets() defined in proto/v2/api.proto .
+// and DeactivateTickets() defined in proto/api.proto.
 func TestValidateTicketStateUpdates(t *testing.T) {
+	maxUpdates := cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL")
+	tooManyIds := make([]string, maxUpdates+1)
+	for i := range tooManyIds {
+		tooManyIds[i] = validTicketIds[0]
+	}
 
 	// Table-driven test cases
 	type testcase struct {
@@ -333,27 +359,36 @@ func TestValidateTicketStateUpdates(t *testing.T) {
 		exError              error
 	}
 	tests := map[string]*testcase{
-		//testcase{name:, in:, exValidIds:, exInvalidDetails:, exError:},
-		"empty_input": &testcase{
+		"empty_input": {
 			in:                   []string{},
 			exValidIds:           nil,
 			exInvalidDetailsKeys: nil,
-			exError:              NoTicketIdsErr},
-		"valid_input": &testcase{
+			exError:              NoTicketIdsErr,
+		},
+		"too_many_updates": {
+			in:                   tooManyIds,
+			exValidIds:           nil,
+			exInvalidDetailsKeys: nil,
+			exError:              TooManyUpdatesErr,
+		},
+		"valid_input": {
 			in:                   validTicketIds,
 			exValidIds:           validTicketIds,
 			exInvalidDetailsKeys: nil,
-			exError:              nil},
-		"invalid_input": &testcase{
+			exError:              nil,
+		},
+		"invalid_input": {
 			in:                   invalidTicketIds,
 			exValidIds:           nil,
 			exInvalidDetailsKeys: nil,
-			exError:              NoValidTicketIdsErr},
-		"partial_valid_input": &testcase{
-			in:                   append(validTicketIds, invalidTicketIds...),
+			exError:              NoValidTicketIdsErr,
+		},
+		"partial_valid_input": {
+			in:                   append(append([]string(nil), validTicketIds...), invalidTicketIds...),
 			exValidIds:           validTicketIds,
 			exInvalidDetailsKeys: invalidTicketIds,
-			exError:              InvalidIdErr},
+			exError:              InvalidIdErr,
+		},
 	}
 
 	// Validate that all types of ticket cache replication produce the same results.
@@ -372,17 +407,17 @@ func TestValidateTicketStateUpdates(t *testing.T) {
 
 					// Expected no error
 					if thisTestCase.exError == nil {
-						assert.Empty(t, err)
+						assert.NoError(t, err)
 					} else {
 						// Check expected error was returned
-						require.EqualError(t, err, thisTestCase.exError.Error())
+						require.ErrorIs(t, err, thisTestCase.exError)
 					}
 
 					// Get all keys from the invalid id details map
 					invalidIds := []string{}
 					for k, v := range invalid {
 						// expected invalid ticket id error
-						require.EqualError(t, v, InvalidIdErr.Error())
+						require.ErrorIs(t, v, InvalidIdErr)
 						invalidIds = append(invalidIds, k)
 					}
 
@@ -394,17 +429,13 @@ func TestValidateTicketStateUpdates(t *testing.T) {
 	}
 }
 
-// TestActivateDeactivateTickets tests only that the activateTickets() and
-// deactivateTickets() function calls successfully perform their validation
-// tasks. It does not validate that the actual ticket state updates are
-// successful (that is a job for unit tests of the state storage layer and e2e
-// tests that are generating real ticket IDs).
+// TestActivateDeactivateTickets tests that activateTickets() and
+// deactivateTickets() validate ticket IDs, attach BadRequest.FieldViolations
+// for invalid IDs, and complete even when the caller's context is cancelled.
 //
-// activateTickets() and deactivateTickets() are the internal implementations of the gRPC functions ActivateTickets() and DeactivateTickets() defined in
-// proto/v2/api.proto .
-//
-// This loops over every testcase and runs it against activation and
-// deactivation validation codepaths, which makes it fail the complexity linter.
+// activateTickets() and deactivateTickets() are the internal implementations of
+// the gRPC functions ActivateTickets() and DeactivateTickets() defined in
+// proto/api.proto.
 //
 //nolint:gocognit
 func TestActivateDeactivateTickets(t *testing.T) {
@@ -415,32 +446,34 @@ func TestActivateDeactivateTickets(t *testing.T) {
 		exInvalidDetailsKeys []string
 	}
 	tests := map[string]*testcase{
-		"empty_input": &testcase{
+		"empty_input": {
 			in:                   []string{},
 			exInvalidDetailsKeys: nil,
-			exStatus:             status.New(codes.InvalidArgument, NoTicketIdsErr.Error())},
-		"valid_input": &testcase{
+			exStatus:             status.New(codes.InvalidArgument, NoTicketIdsErr.Error()),
+		},
+		"valid_input": {
 			in:                   validTicketIds,
 			exInvalidDetailsKeys: nil,
-			exStatus:             status.New(codes.OK, "")},
-		"invalid_input": &testcase{
+			exStatus:             status.New(codes.OK, ""),
+		},
+		"invalid_input": {
 			in:                   invalidTicketIds,
 			exInvalidDetailsKeys: nil,
-			exStatus:             status.New(codes.InvalidArgument, NoValidTicketIdsErr.Error())},
-		"partial_valid_input": &testcase{
-			in:                   append(validTicketIds, invalidTicketIds...),
+			exStatus:             status.New(codes.InvalidArgument, NoValidTicketIdsErr.Error()),
+		},
+		"partial_valid_input": {
+			in:                   append(append([]string(nil), validTicketIds...), invalidTicketIds...),
 			exInvalidDetailsKeys: invalidTicketIds,
-			exStatus:             status.New(codes.InvalidArgument, InvalidIdErr.Error())},
+			exStatus:             status.New(codes.InvalidArgument, InvalidIdErr.Error()),
+		},
 	}
 
 	// Validate that all types of ticket cache replication produce the same results.
 	for replType, tc := range tcs {
-
 		// Run all tests in the table.
 		for testName, thisTestCase := range tests {
-
 			// Check that each test in the table also completes even if context
-			// is cancelled (these operations do not support cancellation)
+			// is cancelled before the call (these operations do not support cancellation).
 			for _, abort := range []bool{false, true} {
 				abortTitleString := ""
 				if abort {
@@ -449,27 +482,24 @@ func TestActivateDeactivateTickets(t *testing.T) {
 
 				// Check that both kinds of state update (activation and deactivation) give the expected results.
 				for _, updateType := range []string{"Activate", "Deactivate"} {
+					updateType := updateType
+					abort := abort
+					tc := tc
 					t.Run(fmt.Sprintf("%vTicket-%v-%v%v", updateType, replType, testName, abortTitleString),
 						func(thisTestCase *testcase) func(t *testing.T) {
 							return func(t *testing.T) {
 								t.Parallel()
 
-								// function call
 								ctx, cancel := context.WithCancel(context.Background())
 								defer cancel()
 								if abort {
-									go func() {
-										time.Sleep(25 * time.Millisecond)
-										cancel() // test that the function works properly when context is cancelled
-									}()
+									cancel()
 								}
 
 								var err error
 								if updateType == "Activate" {
-									// Activation is successful if ticketid does NOT appear in the inactive set
 									_, err = activateTickets(ctx, testLogger, tc, &pb.ActivateTicketsRequest{TicketIds: thisTestCase.in})
 								} else if updateType == "Deactivate" {
-									// Activation is successful if ticketid does appear in the inactive set
 									_, err = deactivateTickets(ctx, testLogger, tc, &pb.DeactivateTicketsRequest{TicketIds: thisTestCase.in})
 								}
 
@@ -478,13 +508,8 @@ func TestActivateDeactivateTickets(t *testing.T) {
 								assert.Equal(t, thisTestCase.exStatus.Code(), s.Code())
 								assert.Contains(t, s.Message(), thisTestCase.exStatus.Message())
 
-								// Get all keys from the invalid id details map of the status BadRequest.FieldViolations array
-								// and make sure it contains all expected keys.
-								deets := s.Details()
-								if len(deets) > 0 {
-									assert.ElementsMatch(t, getStatusDetailBrvKeys(s), thisTestCase.exInvalidDetailsKeys)
-								}
-
+								// Verify that the BadRequest.FieldViolations details match expected invalid IDs.
+								assert.ElementsMatch(t, getStatusDetailBrvKeys(s), thisTestCase.exInvalidDetailsKeys)
 							}
 						}(thisTestCase))
 				}
@@ -493,19 +518,16 @@ func TestActivateDeactivateTickets(t *testing.T) {
 	}
 }
 
-// Parse the grpc Status object and return the ticket ids (i.e. 'keys') of all
-// the BadRequest.FieldViolation detail messages.
+// getStatusDetailBrvKeys parses the gRPC Status object and returns the ticket
+// IDs from all BadRequest.FieldViolation detail messages ("ticket_id/<id>").
 func getStatusDetailBrvKeys(s *status.Status) []string {
 	failedKeys := []string{}
-	// invalid IDs are returned in the details field of the grpc Status message type
 	for _, detail := range s.Details() {
-		switch failure := detail.(type) {
-		case *errdetails.BadRequest:
-			// There should be one violation for each invalid ID
+		if failure, ok := detail.(*errdetails.BadRequest); ok {
 			for _, violation := range failure.GetFieldViolations() {
-				// The 'Field' fields of the FieldViolations message contains the string 'ticket_id/<ticketId>'
-				testLogger.Debugf("failed id: '%v'", strings.Split(violation.GetField(), "/")[1])
-				failedKeys = append(failedKeys, strings.Split(violation.GetField(), "/")[1])
+				key, _ := strings.CutPrefix(violation.GetField(), "ticket_id/")
+				testLogger.Debugf("failed id: '%v'", key)
+				failedKeys = append(failedKeys, key)
 			}
 		}
 	}
@@ -576,29 +598,45 @@ func TestSetDifferenceSnapshotIsolation(t *testing.T) {
 }
 
 // TestWaitForDeactivation verifies that WaitForDeactivation succeeds both when
-// a ticket appears in InactiveSet and when the replication watermark advances
-// past targetReplId (e.g. if the ticket expired during the same cycle).
+// an active ticket is deactivated into InactiveSet and when the replication
+// watermark advances past targetReplId for a ticket ID not present in InactiveSet.
 func TestWaitForDeactivation(t *testing.T) {
 	t.Parallel()
 	for replType, tcInstance := range tcs {
 		t.Run("WaitForDeactivation-"+replType, func(tc *cache.ReplicatedTicketCache) func(t *testing.T) {
 			return func(t *testing.T) {
 				t.Parallel()
-				resp, err := createTicket(context.Background(), tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+				ctx := context.Background()
+				resp, err := createTicket(ctx, tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
 				require.NoError(t, err)
 				ticketId := resp.GetTicketId()
 
-				errs, maxReplId := updateTicketsActiveState(context.Background(), testLogger, tc, []string{ticketId}, 2) // store.Deactivate == 2
+				// Activate the ticket first so it is removed from InactiveSet before we test deactivation.
+				actErrs, actReplId := updateTicketsActiveState(ctx, testLogger, tc, []string{ticketId}, store.Activate)
+				require.Empty(t, actErrs)
+				require.Eventually(t, func() bool {
+					return tc.HasAppliedReplId(actReplId)
+				}, 5*time.Second, 5*time.Millisecond)
+
+				errs, maxReplId := updateTicketsActiveState(ctx, testLogger, tc, []string{ticketId}, store.Deactivate)
 				require.Empty(t, errs)
 				require.NotEmpty(t, maxReplId)
 
+				// 1. Succeeds via InactiveSet + watermark for the deactivated ticket.
 				ok := tc.WaitForDeactivation(ticketId, maxReplId, 5*time.Second)
 				assert.True(t, ok, "expected deactivation to replicate within timeout")
+
+				// 2. Also succeeds via watermark alone when ticketId is absent from InactiveSet.
+				okWatermark := tc.WaitForDeactivation("0000000000000-0", maxReplId, 5*time.Second)
+				assert.True(t, okWatermark, "expected watermark fallback to succeed when maxReplId is applied")
 			}
 		}(tcInstance))
 	}
 }
 
+// TestPackedUpdateTicketsActiveState verifies that updateTicketsActiveState
+// sends a single packed multi-key StateUpdate when
+// OM_CACHE_PACK_TICKET_STATE_UPDATES=true and deactivates all specified tickets.
 func TestPackedUpdateTicketsActiveState(t *testing.T) {
 	t.Parallel()
 	localCfg := config.Read()
@@ -620,7 +658,7 @@ func TestPackedUpdateTicketsActiveState(t *testing.T) {
 		"1790307871351-22",
 		"1790307871351-23",
 	}
-	errs, maxReplId := updateTicketsActiveState(ctx, testLogger, localTc, ticketIds, 2) // store.Deactivate
+	errs, maxReplId := updateTicketsActiveState(ctx, testLogger, localTc, ticketIds, store.Deactivate)
 	require.Empty(t, errs)
 	require.NotEmpty(t, maxReplId)
 
@@ -631,6 +669,8 @@ func TestPackedUpdateTicketsActiveState(t *testing.T) {
 	}
 }
 
+// errorInjectingReplicator wraps a store.StateReplicator and invokes onSend to
+// inject custom per-update errors or modify StateResponse results.
 type errorInjectingReplicator struct {
 	inner  store.StateReplicator
 	onSend func(updates []*store.StateUpdate, results []*store.StateResponse) []*store.StateResponse
@@ -652,6 +692,9 @@ func (r *errorInjectingReplicator) GetReplIdValidator() *regexp.Regexp {
 	return r.inner.GetReplIdValidator()
 }
 
+// TestUpdateTicketsActiveStateErrorAttribution verifies that
+// updateTicketsActiveState attributes replication errors to the exact failing
+// ticket ID even when StateResponse.Result is empty or responses arrive out of order.
 func TestUpdateTicketsActiveStateErrorAttribution(t *testing.T) {
 	t.Parallel()
 
@@ -753,6 +796,10 @@ func TestUpdateTicketsActiveStateErrorAttribution(t *testing.T) {
 	})
 }
 
+// TestMatchDeactivationTimeoutAnnotation verifies that waitForMatchDeactivation
+// attaches the MatchDeactivationTimeoutExtensionKey BoolValue(true) extension
+// to a returned Match when deactivation replication times out or fails (if
+// annotateOnTimeout is enabled), without clobbering existing match extensions.
 func TestMatchDeactivationTimeoutAnnotation(t *testing.T) {
 	t.Parallel()
 	localCfg := config.Read()
@@ -814,7 +861,7 @@ func TestMatchDeactivationTimeoutAnnotation(t *testing.T) {
 		require.NoError(t, err)
 		ticketId := createResp.GetTicketId()
 
-		errs, maxReplId := updateTicketsActiveState(ctx, testLogger, runningTc, []string{ticketId}, 2) // store.Deactivate
+		errs, maxReplId := updateTicketsActiveState(ctx, testLogger, runningTc, []string{ticketId}, store.Deactivate)
 		require.Empty(t, errs)
 		require.NotEmpty(t, maxReplId)
 
@@ -883,6 +930,9 @@ func TestMatchDeactivationTimeoutAnnotation(t *testing.T) {
 	})
 }
 
+// TestBuildChunkedRequestsDoesNotAliasPools verifies that buildChunkedRequests
+// creates an independent Pool message per chunk without mutating the caller's
+// request Profile or overwriting earlier chunks' Participants slices.
 func TestBuildChunkedRequestsDoesNotAliasPools(t *testing.T) {
 	t.Parallel()
 
@@ -943,6 +993,8 @@ func TestBuildChunkedRequestsDoesNotAliasPools(t *testing.T) {
 	}
 }
 
+// fakeInvokeMMFServerStream is an in-processpb.OpenMatchService_InvokeMatchmakingFunctionsServer
+// test double that records matches streamed back to the caller.
 type fakeInvokeMMFServerStream struct {
 	grpc.ServerStream
 	ctx     context.Context
@@ -963,6 +1015,10 @@ func (f *fakeInvokeMMFServerStream) Send(resp *pb.StreamedMmfResponse) error {
 	return nil
 }
 
+// testAuthMMFServer is an in-process gRPC MatchMakingFunctionServiceServer that
+// records incoming Authorization metadata headers, optionally rejects a stale
+// Bearer token with Unauthenticated, requires a specific Bearer token, and
+// returns a single Match containing ticketID.
 type testAuthMMFServer struct {
 	pb.UnimplementedMatchMakingFunctionServiceServer
 	mu          sync.Mutex
@@ -1020,6 +1076,8 @@ func (s *testAuthMMFServer) Run(stream pb.MatchMakingFunctionService_RunServer) 
 	})
 }
 
+// staticSeqTokenSource is a test oauth2.TokenSource that returns a sequence of
+// valid Bearer token strings across successive Token() calls.
 type staticSeqTokenSource struct {
 	mu     sync.Mutex
 	tokens []string
@@ -1039,6 +1097,9 @@ func (s *staticSeqTokenSource) Token() (*oauth2.Token, error) {
 	}, nil
 }
 
+// newLocalTestTLS generates an ephemeral self-signed ECDSA TLS certificate for
+// localhost / 127.0.0.1 and returns matching gRPC server credentials and client
+// tls.Config.
 func newLocalTestTLS(t *testing.T) (serverCreds credentials.TransportCredentials, clientTLS *tls.Config) {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -1070,6 +1131,11 @@ func newLocalTestTLS(t *testing.T) (serverCreds credentials.TransportCredentials
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{tlsCert}}), &tls.Config{RootCAs: pool}
 }
 
+// TestInvokeMMFsPerMMFAuthAndRefreshOnRejection verifies that
+// InvokeMatchmakingFunctions mints audience-specific OIDC Bearer tokens per
+// HTTPS MMF host, automatically refreshes and retries once when an MMF rejects
+// a cached token with Unauthenticated, streams matches from all MMFs, and
+// deactivates the matched tickets in the cache.
 func TestInvokeMMFsPerMMFAuthAndRefreshOnRejection(t *testing.T) {
 	serverCreds1, clientTLS := newLocalTestTLS(t)
 
@@ -1226,4 +1292,5 @@ func TestInvokeMMFsPerMMFAuthAndRefreshOnRejection(t *testing.T) {
 
 	assert.Equal(t, int32(2), mmf1SourceCalls.Load(), "mmf1 should have created initial source + 1 refreshed source")
 	assert.Equal(t, int32(1), mmf2SourceCalls.Load(), "mmf2 should have created 1 source")
+	assert.Empty(t, tc.SnapshotActiveTickets(), "both matched tickets should be deactivated after InvokeMatchmakingFunctions completes")
 }

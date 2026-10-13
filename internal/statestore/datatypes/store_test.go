@@ -20,6 +20,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestParseReplIdTimestampMs verifies that ParseReplIdTimestampMs extracts the
+// millisecond Unix timestamp prefix from a "<ms>-<seq>" or bare "<ms>"
+// replication ID, and returns an error when the prefix is empty or non-numeric.
 func TestParseReplIdTimestampMs(t *testing.T) {
 	t.Parallel()
 
@@ -27,13 +30,23 @@ func TestParseReplIdTimestampMs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1790307871351), ts)
 
+	tsBare, err := ParseReplIdTimestampMs("1790307871351")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1790307871351), tsBare)
+
 	_, err = ParseReplIdTimestampMs("")
+	assert.Error(t, err)
+
+	_, err = ParseReplIdTimestampMs("-12")
 	assert.Error(t, err)
 
 	_, err = ParseReplIdTimestampMs("not-a-timestamp")
 	assert.Error(t, err)
 }
 
+// TestCompareReplIds verifies numeric ordering of "<timestampMs>-<seq>"
+// replication IDs, handling of empty IDs, and lexicographical fallback when
+// an ID is not in "<uint>-<uint>" format.
 func TestCompareReplIds(t *testing.T) {
 	t.Parallel()
 
@@ -42,6 +55,9 @@ func TestCompareReplIds(t *testing.T) {
 	assert.Equal(t, 1, CompareReplIds("1790307871351-0", ""))
 	assert.Equal(t, 0, CompareReplIds("1790307871351-12", "1790307871351-12"))
 
+	// Numerically equal IDs with different zero-padding compare equal.
+	assert.Equal(t, 0, CompareReplIds("01790307871351-0", "1790307871351-0"))
+
 	// Numeric sequence comparison ("-2" < "-12", whereas lexicographically "-12" < "-2")
 	assert.Equal(t, -1, CompareReplIds("1790307871351-2", "1790307871351-12"))
 	assert.Equal(t, 1, CompareReplIds("1790307871351-12", "1790307871351-2"))
@@ -49,8 +65,15 @@ func TestCompareReplIds(t *testing.T) {
 	// Timestamp comparison
 	assert.Equal(t, -1, CompareReplIds("1790307871350-99", "1790307871351-0"))
 	assert.Equal(t, 1, CompareReplIds("1790307871351-0", "1790307871350-99"))
+
+	// Fallback to lexicographical strings.Compare when an ID lacks "-<seq>" (e.g., initial bare timestamp).
+	assert.Equal(t, -1, CompareReplIds("1790307871350", "1790307871351-0"))
+	assert.Equal(t, 1, CompareReplIds("1790307871351-0", "1790307871350"))
 }
 
+// TestStateUpdatePrimaryKey verifies that PrimaryKey returns Key when set,
+// falls back to the first non-empty element in Keys, and returns "" for nil
+// or empty updates.
 func TestStateUpdatePrimaryKey(t *testing.T) {
 	t.Parallel()
 
@@ -63,6 +86,9 @@ func TestStateUpdatePrimaryKey(t *testing.T) {
 	assert.Equal(t, "", (&StateUpdate{Keys: []string{"", ""}}).PrimaryKey())
 }
 
+// TestStateUpdateString verifies that StateUpdate.String truncates packed Keys
+// beyond 3 entries and summarizes binary Ticket payloads by byte length while
+// preserving human-readable fields on non-Ticket commands.
 func TestStateUpdateString(t *testing.T) {
 	t.Parallel()
 
@@ -83,8 +109,18 @@ func TestStateUpdateString(t *testing.T) {
 		},
 		{
 			name: "binary ticket value payload summarized",
-			in:   StateUpdate{Cmd: Ticket, Key: "1790307871351-0", Value: "raw-protobuf-binary-payload"},
-			want: "{Cmd:0 Key:1790307871351-0 Keys: Value:<27 bytes> ReplId:}",
+			in:   StateUpdate{Cmd: Ticket, Key: "1790307871351-0", Value: "raw-protobuf-binary-payload", ReplId: "1790307871351-0"},
+			want: "{Cmd:0 Key:1790307871351-0 Keys: Value:<27 bytes> ReplId:1790307871351-0}",
+		},
+		{
+			name: "empty ticket value is not summarized as byte length",
+			in:   StateUpdate{Cmd: Ticket, Key: "1790307871351-0", Value: ""},
+			want: "{Cmd:0 Key:1790307871351-0 Keys: Value: ReplId:}",
+		},
+		{
+			name: "assign command prints value and replId verbatim",
+			in:   StateUpdate{Cmd: Assign, Key: "1790307871351-0", Value: "10.0.0.1:7777", ReplId: "1790307871352-0"},
+			want: "{Cmd:3 Key:1790307871351-0 Keys: Value:10.0.0.1:7777 ReplId:1790307871352-0}",
 		},
 	}
 	for _, tc := range tests {
