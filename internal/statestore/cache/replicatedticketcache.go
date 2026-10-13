@@ -318,6 +318,8 @@ func (tc *ReplicatedTicketCache) OutgoingReplicationQueue(ctx context.Context) {
 		// collect currently pending requests to write to state storage using a single command (e.g. Redis Pipelining)
 		for !exec {
 			select {
+			case <-ctx.Done():
+				exec = true
 			case req := <-tc.UpRequests:
 				pipelineRequests = append(pipelineRequests, req)
 				pipeline = append(pipeline, &req.Update)
@@ -453,6 +455,9 @@ func (tc *ReplicatedTicketCache) OutgoingReplicationQueue(ctx context.Context) {
 				}
 			}
 		}
+		if ctx.Err() != nil && len(tc.UpRequests) == 0 {
+			return
+		}
 	}
 }
 
@@ -562,8 +567,16 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 	// and add updates to the channel to be processed as they come in
 	inBufSize := tc.Cfg.GetInt("OM_CACHE_IN_QUEUE_BUFFER_SIZE")
 	replStream := make(chan store.StateUpdate, inBufSize)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			maxUpdatesPerPoll := tc.Cfg.GetInt("OM_CACHE_IN_MAX_UPDATES_PER_POLL")
 			waitTimeoutMs := tc.Cfg.GetInt("OM_CACHE_IN_WAIT_TIMEOUT_MS")
 			pollWaitMs := tc.Cfg.GetInt("OM_CACHE_IN_POLL_WAIT_MS")
@@ -602,7 +615,11 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 						"update.command": curUpdate.Cmd,
 					}).Trace("queueing incoming update from state storage")
 				}
-				replStream <- *curUpdate
+				select {
+				case replStream <- *curUpdate:
+				case <-ctx.Done():
+					return
+				}
 			}
 			if len(results) > 0 {
 				otelCacheIncomingQueueWait.Record(ctx, float64(time.Since(queueStart).Microseconds())/1000.0)
@@ -637,7 +654,13 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 			}
 			waitStart := time.Now()
 			if postPollWait > 0 {
-				time.Sleep(postPollWait)
+				waitTimer := time.NewTimer(postPollWait)
+				select {
+				case <-ctx.Done():
+					waitTimer.Stop()
+					return
+				case <-waitTimer.C:
+				}
 			}
 			otelCacheIncomingPollWait.Record(ctx, float64(time.Since(waitStart).Microseconds())/1000.0)
 		}
@@ -646,7 +669,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 	// Run local cache expiration asynchronously on its own ticker so local
 	// expiration sweeps do not block applying incoming replication updates.
 	expIntervalMs := tc.Cfg.GetInt("OM_CACHE_EXPIRATION_INTERVAL_MS")
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(time.Millisecond * time.Duration(expIntervalMs))
 		defer ticker.Stop()
 		for {
@@ -662,6 +687,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 	// Check the channel for updates, and apply them
 	hitApplyTimeout := false
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		// Force sleep time between applying replication updates into the local cache
 		// to avoid tight looping and high cpu usage. When the previous apply cycle
 		// was force-stopped by OM_CACHE_IN_MAX_APPLY_DURATION_MS with updates still
@@ -673,7 +701,13 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 		}
 		sleepStart := time.Now()
 		if sleepMs > 0 {
-			time.Sleep(time.Millisecond * time.Duration(sleepMs))
+			sleepTimer := time.NewTimer(time.Millisecond * time.Duration(sleepMs))
+			select {
+			case <-ctx.Done():
+				sleepTimer.Stop()
+				return
+			case <-sleepTimer.C:
+			}
 		}
 		otelCacheIncomingApplySleep.Record(ctx, float64(time.Since(sleepStart).Microseconds())/1000.0)
 		done := false
@@ -692,6 +726,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 			// Check the cycle deadline first so a full replStream cannot starve
 			// the timeout branch when Go selects between ready channels.
 			select {
+			case <-ctx.Done():
+				done = true
+				continue
 			case <-updateTimer.C:
 				otelCacheIncomingProcessingTimeouts.Add(ctx, 1)
 				logger.Trace("lock hold timeout")
@@ -704,6 +741,8 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 			// Process all incoming updates until there are none left or the
 			// cycle time limit is reached.
 			select {
+			case <-ctx.Done():
+				done = true
 			case curUpdate := <-replStream:
 				// Still updates to process. Unmarshal any protobuf payload
 				// outside tc.cacheMu, then apply the single update under
@@ -797,6 +836,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 		atomic.StoreInt64(&IncomingBacklogCount, inBacklog)
 		if appliedAny {
 			tc.recordApplied(lastReplId)
+		}
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }

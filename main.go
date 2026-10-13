@@ -14,8 +14,6 @@
 //
 // Tries to use the guidelines at https://cloud.google.com/apis/design for the gRPC API where possible.
 //
-// TODO: permissive deadlines for all RPC calls
-//
 //nolint:staticcheck
 package main
 
@@ -34,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -118,8 +117,8 @@ func main() {
 	cfg = config.Read()
 	logging.ConfigureLogging(cfg)
 
-	// Make a parent context that gets cancelled on SIGINT
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	// Make a parent context that gets cancelled on SIGINT or SIGTERM
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	// Read in the system root certificates in case an MMF is using TLS (which will
@@ -142,7 +141,11 @@ func main() {
 	} else {
 		meter, otelShutdownFunc = initializeOtelWithLocalProm()
 	}
-	defer otelShutdownFunc(ctx) //nolint:errcheck
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = otelShutdownFunc(shutdownCtx)
+	}()
 	registerMetrics(meter)
 	cache.RegisterMetrics(meter)
 
@@ -176,7 +179,7 @@ func main() {
 	go tc.IncomingReplicationQueue(ctx)
 
 	// Start the gRPC server
-	start(cfg)
+	start(ctx, cfg)
 
 	// Dump the final state of the cache to the log for debugging.
 	if cfg.GetBool("OM_VERBOSE") {
@@ -230,12 +233,13 @@ func createTicket(parentCtx context.Context, tc *cache.ReplicatedTicketCache, re
 		return &pb.CreateTicketResponse{}, fmt.Errorf("%w", err)
 	}
 
-	// Make a results return channel
-	rChan := make(chan *store.StateResponse)
+	// Make a 1-buffered results return channel so OutgoingReplicationQueue
+	// never blocks if parentCtx is cancelled after the request is queued.
+	rChan := make(chan *store.StateResponse, 1)
 
 	// Queue our ticket creation cache update request to be replicated to all
 	// om-core instances.
-	tc.UpRequests <- &cache.UpdateRequest{
+	reqUpdate := &cache.UpdateRequest{
 		// This command (writing a ticket to the cache) is replicated to all
 		// other om-core instances using the batch writing async goroutine
 		// tc.OutgoingReplicationQueue() and the update itself is applied to
@@ -249,9 +253,19 @@ func createTicket(parentCtx context.Context, tc *cache.ReplicatedTicketCache, re
 			Value: string(ticketPb[:]),
 		},
 	}
+	select {
+	case tc.UpRequests <- reqUpdate:
+	case <-parentCtx.Done():
+		return &pb.CreateTicketResponse{}, status.FromContextError(parentCtx.Err()).Err()
+	}
 
 	// Get the results
-	results := <-rChan
+	var results *store.StateResponse
+	select {
+	case results = <-rChan:
+	case <-parentCtx.Done():
+		return &pb.CreateTicketResponse{}, status.FromContextError(parentCtx.Err()).Err()
+	}
 	if results.Err == nil {
 		// Record the size of the ticket in kb
 		otelTicketSize.Record(parentCtx, float64(len(ticketPb))/1024.0)
@@ -567,7 +581,7 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 		rChan := make(chan *store.StateResponse, 1)
 		packedKeys := append([]string(nil), ticketIds...)
 		logger.Trace("queuing packed update for ticket state change")
-		tc.UpRequests <- &cache.UpdateRequest{
+		reqUpdate := &cache.UpdateRequest{
 			ResultsChan: rChan,
 			Ctx:         parentCtx,
 			EnqueuedAt:  time.Now(),
@@ -577,7 +591,25 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 				Keys: packedKeys,
 			},
 		}
-		r := <-rChan
+		select {
+		case tc.UpRequests <- reqUpdate:
+		case <-parentCtx.Done():
+			ctxErr := status.FromContextError(parentCtx.Err()).Err()
+			for _, id := range ticketIds {
+				errs[id] = ctxErr
+			}
+			return errs, maxReplId
+		}
+		var r *store.StateResponse
+		select {
+		case r = <-rChan:
+		case <-parentCtx.Done():
+			ctxErr := status.FromContextError(parentCtx.Err()).Err()
+			for _, id := range ticketIds {
+				errs[id] = ctxErr
+			}
+			return errs, maxReplId
+		}
 		if r.Err != nil {
 			for _, id := range ticketIds {
 				errs[id] = status.Error(codes.Internal, fmt.Errorf("Unable to update ticket %v state to %v : %w", id, requestedStateAsString, r.Err).Error())
@@ -601,7 +633,7 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 	traceEnabled := logger.Logger.IsLevelEnabled(logrus.TraceLevel)
 	for i, id := range ticketIds {
 		rChans[i] = make(chan *store.StateResponse, 1)
-		tc.UpRequests <- &cache.UpdateRequest{
+		reqUpdate := &cache.UpdateRequest{
 			// This command (adding/removing the id to the inactive list)
 			// is replicated to all other om-core instances using the batch
 			// writing async goroutine tc.OutgoingReplicationQueue() and its
@@ -615,6 +647,18 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 				Key: id,
 			},
 		}
+		select {
+		case tc.UpRequests <- reqUpdate:
+		case <-parentCtx.Done():
+			ctxErr := status.FromContextError(parentCtx.Err()).Err()
+			for _, remID := range ticketIds[i:] {
+				errs[remID] = ctxErr
+			}
+			ticketIds = ticketIds[:i]
+		}
+		if len(ticketIds) == i {
+			break
+		}
 		if traceEnabled {
 			logger.WithFields(logrus.Fields{
 				"ticket_id": id,
@@ -624,7 +668,16 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 
 	// Look through all results for errors.
 	for i := 0; i < len(ticketIds); i++ {
-		r := <-rChans[i]
+		var r *store.StateResponse
+		select {
+		case r = <-rChans[i]:
+		case <-parentCtx.Done():
+			ctxErr := status.FromContextError(parentCtx.Err()).Err()
+			for _, remID := range ticketIds[i:] {
+				errs[remID] = ctxErr
+			}
+			return errs, maxReplId
+		}
 		if r.Err != nil {
 			// Wrap redis error and give it a gRPC internal server error status code
 			// The results.result field contains the ticket id that generated the error.

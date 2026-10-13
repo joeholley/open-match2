@@ -1370,3 +1370,180 @@ func TestActiveTicketGaugeAccuracyRealTimeUpdatesAndInstanceIsolation(t *testing
 	})
 }
 
+// burstStaticReplicator returns a fixed slice of StateUpdates on every GetUpdates()
+// call without blocking, used to test poller backpressure and cancellation when
+// replStream is full.
+type burstStaticReplicator struct {
+	updates []*store.StateUpdate
+}
+
+func (b *burstStaticReplicator) GetUpdates() []*store.StateUpdate {
+	return b.updates
+}
+
+func (b *burstStaticReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
+	return make([]*store.StateResponse, len(updates))
+}
+
+func (b *burstStaticReplicator) GetReplIdValidator() *regexp.Regexp {
+	return regexp.MustCompile(`^\d{13}-\d+$`)
+}
+
+// TestReplicationQueuesGracefulShutdownAndDrainOnContextCancel verifies REC-11 (Task M-10):
+//  1. OutgoingReplicationQueue and IncomingReplicationQueue (including its child
+//     poller and expiration ticker goroutines) unblock immediately from long
+//     timers/sleeps and exit cleanly when ctx is cancelled.
+//  2. OutgoingReplicationQueue drains and flushes any already-queued requests in
+//     tc.UpRequests (across multiple batches if necessary) before exiting on
+//     context cancellation so in-flight callers receive their ResultsChan responses.
+//  3. When replStream is full and the apply loop exits on ctx.Done(), the incoming
+//     poller goroutine unblocks from `select { case replStream <- *curUpdate: case <-ctx.Done(): }`
+//     instead of deadlocking on a full channel.
+func TestReplicationQueuesGracefulShutdownAndDrainOnContextCancel(t *testing.T) {
+	t.Run("OutgoingAndIncomingQueuesExitCleanlyOnCancelWithoutGoroutineLeak", func(t *testing.T) {
+		cfg := config.Read()
+		// Set all waits/sleeps/intervals to 5000ms so any uncancelled timer or time.Sleep
+		// would block for 5 seconds and fail the < 250ms shutdown assertion below.
+		cfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5000)
+		cfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 5000)
+		cfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5000)
+		cfg.Set("OM_CACHE_IN_FULL_POLL_WAIT_MS", 5000)
+		cfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5000)
+		cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 5000)
+
+		rep := &immediateEmptyReplicator{
+			validator: regexp.MustCompile(`^\d{13}-\d+$`),
+		}
+		tc := New(cfg, rep)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		outDone := make(chan struct{})
+		inDone := make(chan struct{})
+		go func() {
+			defer close(outDone)
+			tc.OutgoingReplicationQueue(ctx)
+		}()
+		go func() {
+			defer close(inDone)
+			tc.IncomingReplicationQueue(ctx)
+		}()
+
+		// Wait until the poller has completed its first immediate poll and entered its 5s postPollWait timer.
+		require.Eventually(t, func() bool {
+			return rep.polls.Load() >= 1
+		}, time.Second, 2*time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
+
+		cancelStart := time.Now()
+		cancel()
+
+		select {
+		case <-outDone:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("OutgoingReplicationQueue did not exit within 250ms after context cancellation")
+		}
+		select {
+		case <-inDone:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("IncomingReplicationQueue (and its child goroutines) did not exit within 250ms after context cancellation")
+		}
+		assert.Less(t, time.Since(cancelStart), 250*time.Millisecond)
+	})
+
+	t.Run("OutgoingQueueFlushesPendingRequestsBeforeExitingOnCancel", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5000)
+		cfg.Set("OM_CACHE_OUT_MAX_QUEUE_THRESHOLD", 2)
+		cfg.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)
+
+		tc := New(cfg, memoryReplicator.New(cfg))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// Pre-populate 3 requests (> maxThreshold=2, requiring 2 flush cycles)
+		// and cancel ctx BEFORE starting OutgoingReplicationQueue.
+		const numReqs = 3
+		rChans := make([]chan *store.StateResponse, numReqs)
+		for i := 0; i < numReqs; i++ {
+			rChans[i] = make(chan *store.StateResponse, 1)
+			tc.UpRequests <- &UpdateRequest{
+				Ctx:         ctx,
+				ResultsChan: rChans[i],
+				EnqueuedAt:  time.Now(),
+				Update: store.StateUpdate{
+					Cmd: store.Deactivate,
+					Key: fmt.Sprintf("1790307871351-%d", 800+i),
+				},
+			}
+		}
+		cancel()
+
+		outDone := make(chan struct{})
+		go func() {
+			defer close(outDone)
+			tc.OutgoingReplicationQueue(ctx)
+		}()
+
+		select {
+		case <-outDone:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("OutgoingReplicationQueue did not finish draining and exit within 500ms")
+		}
+
+		for i, ch := range rChans {
+			select {
+			case res := <-ch:
+				require.NotNil(t, res, "request %d must receive a response before OutgoingReplicationQueue exits", i)
+				require.NoError(t, res.Err)
+				assert.NotEmpty(t, res.Result)
+			default:
+				t.Fatalf("request %d did not receive response on ResultsChan before OutgoingReplicationQueue exited", i)
+			}
+		}
+		assert.Empty(t, tc.UpRequests)
+	})
+
+	t.Run("IncomingPollerUnblocksWhenReplStreamIsFullAndContextCancelled", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_IN_QUEUE_BUFFER_SIZE", 1)
+		cfg.Set("OM_CACHE_IN_MAX_UPDATES_PER_POLL", 10)
+		cfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5000)
+		cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 5000)
+
+		// Return 5 updates in a single poll while replStream buffer size is 1 and
+		// the apply loop is sleeping for 5000ms before reading from replStream.
+		// The poller sends 1 update into replStream (filling the buffer) and blocks
+		// on the 2nd update at `select { case replStream <- *curUpdate: case <-ctx.Done(): }`.
+		updates := make([]*store.StateUpdate, 5)
+		for i := range updates {
+			updates[i] = &store.StateUpdate{
+				Cmd:    store.Deactivate,
+				Key:    fmt.Sprintf("1790307871351-%d", 900+i),
+				ReplId: fmt.Sprintf("1790307871351-%d", 900+i),
+			}
+		}
+		tc := New(cfg, &burstStaticReplicator{updates: updates})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		inDone := make(chan struct{})
+		go func() {
+			defer close(inDone)
+			tc.IncomingReplicationQueue(ctx)
+		}()
+
+		// Give the poller a moment to fill the 1-element replStream buffer and block on the 2nd update.
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+
+		select {
+		case <-inDone:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("IncomingReplicationQueue deadlocked on full replStream after context cancellation")
+		}
+	})
+}
+
+

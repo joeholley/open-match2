@@ -28,6 +28,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -59,6 +60,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
@@ -3648,4 +3650,246 @@ func TestMetricsRpcErrorsCardinalityActivationDeactivationFailureCountsAndWatchM
 		assert.Equal(t, "Number of tickets assignments included in each CreateAssignments() call", descriptions["om_core.ticket.assignment"])
 	})
 }
+
+// TestGracefulShutdownAndContextCancellation verifies REC-11 (Task M-10):
+//  1. createTicket respects parentCtx cancellation both when tc.UpRequests is
+//     full (blocking at send) and when waiting on <-rChan, and uses a 1-buffered
+//     rChan so a late writer never blocks after caller cancellation.
+//  2. updateTicketsActiveState respects parentCtx cancellation in both packed
+//     and unpacked modes (both when blocked enqueuing to tc.UpRequests and when
+//     blocked waiting on <-rChan / <-rChans[i]), attributing the context error
+//     to each affected ticket ID.
+//  3. start(ctx, cfg) starts the gRPC server and HTTP gRPC-Gateway proxy and,
+//     when ctx is cancelled, gracefully shuts down both servers and returns
+//     promptly without hanging on an unbuffered signal channel.
+func TestGracefulShutdownAndContextCancellation(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("CreateTicketRespectsContextCancellationWhenQueueFullOrWaitingForResult", func(t *testing.T) {
+		localCfg := config.Read()
+		localCfg.Set("OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 1)
+
+		// Case 1: tc.UpRequests is full and no OutgoingReplicationQueue is running ->
+		// createTicket unblocks at `select { case tc.UpRequests <- reqUpdate: case <-parentCtx.Done(): }`.
+		fullTc := cache.New(localCfg, memoryReplicator.New(localCfg))
+		fullTc.UpRequests <- &cache.UpdateRequest{
+			ResultsChan: make(chan *store.StateResponse, 1),
+			Update:      store.StateUpdate{Cmd: store.Ticket},
+		}
+
+		timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancelTimeout()
+
+		startTime := time.Now()
+		_, err := createTicket(timeoutCtx, fullTc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.Error(t, err)
+		assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		assert.Less(t, time.Since(startTime), 250*time.Millisecond)
+		assert.Len(t, fullTc.UpRequests, 1)
+
+		// Case 2: tc.UpRequests has buffer space so reqUpdate is enqueued, and createTicket
+		// blocks at `select { case results = <-rChan: case <-parentCtx.Done(): }`.
+		waitTc := cache.New(localCfg, memoryReplicator.New(localCfg))
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+		}()
+
+		startWait := time.Now()
+		_, err = createTicket(cancelCtx, waitTc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.Error(t, err)
+		assert.Equal(t, codes.Canceled, status.Code(err))
+		assert.Less(t, time.Since(startWait), 250*time.Millisecond)
+
+		// Verify reqUpdate was enqueued with a 1-buffered ResultsChan so a late
+		// OutgoingReplicationQueue write never blocks after caller cancellation.
+		require.Len(t, waitTc.UpRequests, 1)
+		enqueued := <-waitTc.UpRequests
+		select {
+		case enqueued.ResultsChan <- &store.StateResponse{Result: "1790307871351-1"}:
+		default:
+			t.Fatal("createTicket ResultsChan must be 1-buffered so late replication responses do not block")
+		}
+	})
+
+	t.Run("UpdateTicketsActiveStateRespectsContextCancellationInPackedAndUnpackedModes", func(t *testing.T) {
+		t.Run("PackedMode_BlockedOnEnqueueAndBlockedOnResponse", func(t *testing.T) {
+			localCfg := config.Read()
+			localCfg.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", true)
+			localCfg.Set("OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 1)
+
+			ids := []string{"1790307871351-701", "1790307871351-702"}
+
+			// Subcase 1: tc.UpRequests is full -> unblocks at enqueue on <-parentCtx.Done().
+			fullTc := cache.New(localCfg, memoryReplicator.New(localCfg))
+			fullTc.UpRequests <- &cache.UpdateRequest{
+				ResultsChan: make(chan *store.StateResponse, 1),
+			}
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel1()
+
+			errs, maxReplId := updateTicketsActiveState(ctx1, testLogger, fullTc, ids, store.Activate)
+			assert.Empty(t, maxReplId)
+			require.Len(t, errs, 2)
+			for _, id := range ids {
+				assert.Equal(t, codes.DeadlineExceeded, status.Code(errs[id]))
+			}
+
+			// Subcase 2: tc.UpRequests accepts reqUpdate, then blocks at <-rChan until ctx2 is cancelled.
+			waitTc := cache.New(localCfg, memoryReplicator.New(localCfg))
+			ctx2, cancel2 := context.WithCancel(context.Background())
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				cancel2()
+			}()
+
+			errs, maxReplId = updateTicketsActiveState(ctx2, testLogger, waitTc, ids, store.Deactivate)
+			assert.Empty(t, maxReplId)
+			require.Len(t, errs, 2)
+			for _, id := range ids {
+				assert.Equal(t, codes.Canceled, status.Code(errs[id]))
+			}
+
+			// Late send to ResultsChan must not block.
+			require.Len(t, waitTc.UpRequests, 1)
+			enqueued := <-waitTc.UpRequests
+			select {
+			case enqueued.ResultsChan <- &store.StateResponse{Result: "1790307871351-702"}:
+			default:
+				t.Fatal("packed updateTicketsActiveState ResultsChan must be 1-buffered")
+			}
+		})
+
+		t.Run("UnpackedMode_PartialEnqueueAndPartialResponseWait", func(t *testing.T) {
+			// Subcase 1: Buffer size 1 with 3 ticket IDs -> id1 enqueues, id2 blocks at
+			// enqueue until context cancellation, attributing codes.Canceled to all 3 IDs.
+			cfgSmallBuf := config.Read()
+			cfgSmallBuf.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)
+			cfgSmallBuf.Set("OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 1)
+
+			ids := []string{"1790307871351-711", "1790307871351-712", "1790307871351-713"}
+			smallBufTc := cache.New(cfgSmallBuf, memoryReplicator.New(cfgSmallBuf))
+
+			ctx1, cancel1 := context.WithCancel(context.Background())
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				cancel1()
+			}()
+
+			errs, maxReplId := updateTicketsActiveState(ctx1, testLogger, smallBufTc, ids, store.Activate)
+			assert.Empty(t, maxReplId)
+			require.Len(t, errs, 3)
+			for _, id := range ids {
+				assert.Equal(t, codes.Canceled, status.Code(errs[id]))
+			}
+
+			// Subcase 2: Buffer size 10 with 3 ticket IDs -> all 3 enqueue; id1 receives a
+			// valid response before ctx2 times out while waiting on id2's response channel.
+			cfgLargeBuf := config.Read()
+			cfgLargeBuf.Set("OM_CACHE_PACK_TICKET_STATE_UPDATES", false)
+			cfgLargeBuf.Set("OM_CACHE_OUT_QUEUE_BUFFER_SIZE", 10)
+
+			partialTc := cache.New(cfgLargeBuf, memoryReplicator.New(cfgLargeBuf))
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 40*time.Millisecond)
+			defer cancel2()
+
+			go func() {
+				// Deliver response only to the first queued request (id1), leaving id2 and id3 pending.
+				firstReq := <-partialTc.UpRequests
+				firstReq.ResultsChan <- &store.StateResponse{Result: "1790307871351-799"}
+			}()
+
+			errs, maxReplId = updateTicketsActiveState(ctx2, testLogger, partialTc, ids, store.Deactivate)
+			assert.Equal(t, "1790307871351-799", maxReplId, "completed update before cancellation must preserve maxReplId")
+			assert.NotContains(t, errs, ids[0], "id1 succeeded before timeout and must not be in errs")
+			require.Contains(t, errs, ids[1])
+			require.Contains(t, errs, ids[2])
+			assert.Equal(t, codes.DeadlineExceeded, status.Code(errs[ids[1]]))
+			assert.Equal(t, codes.DeadlineExceeded, status.Code(errs[ids[2]]))
+		})
+	})
+
+	t.Run("ServerStartAndGracefulShutdownOnContextCancel", func(t *testing.T) {
+		// Reserve two ephemeral TCP ports for OM_GRPC_PORT and PORT.
+		grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		_, grpcPort, err := net.SplitHostPort(grpcLis.Addr().String())
+		require.NoError(t, err)
+
+		httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		_, httpPort, err := net.SplitHostPort(httpLis.Addr().String())
+		require.NoError(t, err)
+
+		require.NoError(t, grpcLis.Close())
+		require.NoError(t, httpLis.Close())
+
+		serverCfg := config.Read()
+		serverCfg.Set("OM_GRPC_PORT", grpcPort)
+		serverCfg.Set("PORT", httpPort)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		startDone := make(chan struct{})
+		go func() {
+			defer close(startDone)
+			start(ctx, serverCfg)
+		}()
+
+		// Wait until both the gRPC server and the HTTP gRPC-Gateway proxy accept connections,
+		// and issue a real gRPC request and HTTP request before cancelling ctx.
+		require.Eventually(t, func() bool {
+			conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+grpcPort, 25*time.Millisecond)
+			if dialErr != nil {
+				return false
+			}
+			_ = conn.Close()
+			httpConn, httpDialErr := net.DialTimeout("tcp", "127.0.0.1:"+httpPort, 25*time.Millisecond)
+			if httpDialErr != nil {
+				return false
+			}
+			_ = httpConn.Close()
+			return true
+		}, 2*time.Second, 10*time.Millisecond, "gRPC and HTTP servers should start listening")
+
+		// Verify live gRPC server responds to an RPC.
+		grpcConn, err := grpc.NewClient("127.0.0.1:"+grpcPort, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err)
+		defer grpcConn.Close()
+		client := pb.NewOpenMatchServiceClient(grpcConn)
+		createResp, err := client.CreateTicket(context.Background(), &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+		require.NoError(t, err)
+		require.NotEmpty(t, createResp.GetTicketId())
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: []string{createResp.GetTicketId()},
+			})
+		})
+
+		// Verify HTTP gRPC-Gateway server responds to an HTTP request.
+		httpResp, err := http.Get("http://127.0.0.1:" + httpPort + "/")
+		require.NoError(t, err)
+		_ = httpResp.Body.Close()
+
+		// Cancel ctx to trigger graceful shutdown of both HTTP and gRPC servers.
+		shutdownStart := time.Now()
+		cancel()
+
+		select {
+		case <-startDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("start(ctx, cfg) did not shut down and return within 2s after context cancellation")
+		}
+		assert.Less(t, time.Since(shutdownStart), 2*time.Second)
+
+		// Both server listeners must be closed after start() returns.
+		_, grpcErr := net.DialTimeout("tcp", "127.0.0.1:"+grpcPort, 25*time.Millisecond)
+		assert.Error(t, grpcErr, "gRPC listener must be closed after start() returns")
+		_, httpErr := net.DialTimeout("tcp", "127.0.0.1:"+httpPort, 25*time.Millisecond)
+		assert.Error(t, httpErr, "HTTP listener must be closed after start() returns")
+	})
+}
+
 
