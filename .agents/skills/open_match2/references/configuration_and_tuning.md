@@ -40,13 +40,16 @@ All configuration in `om-core` follows the 12-factor methodology via environment
 | `OM_REDIS_USE_TLS` | `false` | Enables TLS for both read and write Redis connections. |
 | `OM_REDIS_TLS_SKIP_VERIFY` | `false` | Skips TLS certificate verification when `OM_REDIS_USE_TLS=true`. |
 | `OM_REDIS_DIAL_MAX_BACKOFF_TIMEOUT` | `"2m0s"` | Max exponential backoff duration (`time.ParseDuration` format) when dialing Redis. |
+| `OM_REDIS_DIAL_CONNECT_TIMEOUT` | `"5s"` | TCP connect timeout (`time.ParseDuration` format) when dialing Redis. |
+| `OM_REDIS_DIAL_READ_TIMEOUT` | `"10s"` | Socket read timeout (`time.ParseDuration` format; auto-clamped to at least `OM_CACHE_IN_WAIT_TIMEOUT_MS` + 1s). |
+| `OM_REDIS_DIAL_WRITE_TIMEOUT` | `"5s"` | Socket write timeout (`time.ParseDuration` format) on Redis connections. |
 | `OM_REDIS_POOL_MAX_IDLE` / `OM_REDIS_POOL_MAX_ACTIVE` | `500` / `500` | Redigo connection pool `MaxIdle` and `MaxActive` limits. |
 | `OM_REDIS_POOL_IDLE_TIMEOUT` | `"1m0s"` | Redigo connection pool idle timeout (`time.ParseDuration` format). |
 
 ### Replicated Ticket Cache & Expiration Tuning
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
-| `OM_CACHE_TICKET_TTL_MS` | `600000` (10m) | Ticket Time-To-Live (ms) from `creation_time`. Controls both local heap expiration and Redis `XTRIM MINID ~`. |
+| `OM_CACHE_TICKET_TTL_MS` | `600000` (10m) | Ticket Time-To-Live (ms) from `creation_time`. Controls local heap expiration and contributes (with `OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS`) to the Redis `XTRIM MINID ~` horizon. |
 | `OM_CACHE_EXPIRATION_INTERVAL_MS` | `1000` | Interval (ms) between local min-heap expiration scans. |
 | `OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE` | `5000` | Max expired entries removed per scan cycle (in bounded lock chunks). |
 | `OM_CACHE_PACK_TICKET_STATE_UPDATES` | `false` | Packs multi-ticket `Activate`/`Deactivate` calls and coalesces contiguous same-command outgoing batches into single Redis Stream entries. |
@@ -85,8 +88,9 @@ Start by monitoring **`om_core.cache.replication.lag`** (ms between write to Red
 ### Core RPC & Matchmaking Metrics (`metrics.go`)
 - `om_core.rpc.duration` (ms), `om_core.rpc.errors` (count)
 - `om_core.ticket.size` (kb)
-- `om_core.ticket.activation.requests`, `om_core.ticket.activation.failures.invalid_id`, `om_core.ticket.deactivation.failures.unspecified`
+- `om_core.ticket.activation.requests`, `om_core.ticket.activation.failures.invalid_id`, `om_core.ticket.activation.failures.unspecified`
 - `om_core.ticket.deactivation.requests`, `om_core.ticket.deactivation.failures.invalid_id`, `om_core.ticket.deactivation.failures.unspecified`
+- `om_core.ticket.assignment` (count), `om_core.ticket.assignment.watch` (count)
 - `om_core.profile.pools` (count), `om_core.profile.chunks` (count)
 - `om_core.cache.tickets.available` (active tickets when `InvokeMatchmakingFunctions` filtered pools)
 - `om_core.mmf.prep.duration` (ms spent snapshotting active tickets, filtering pools, and chunking requests)

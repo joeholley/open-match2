@@ -29,12 +29,12 @@ Open Match 2でOpenTelemetryを有効にするには、`OM_OTEL_SIDECAR`環境�
 | `om_core.rpc.errors` | 返されたgRPCエラーの総数。 | count |
 | `om_core.ticket.activation.requests` | アクティブに設定され、プールに表示されるようになったチケットの総数。 | count |
 | `om_core.ticket.activation.failures.invalid_id` | `ActivateTickets` RPCコールごとに、無効なIDが原因で失敗したチケットアクティベーションの数。 | count |
-| `om_core.ticket.deactivation.failures.unspecified` | `ActivateTickets` RPCコールごとに、不特定のエラーが原因で失敗したチケットアクティベーションの数。 | count |
+| `om_core.ticket.activation.failures.unspecified` | `ActivateTickets` RPCコールごとに、不特定のエラーが原因で失敗したチケットアクティベーションの数。 | count |
 | `om_core.ticket.deactivation.requests` | `DeactivateTickets` RPCコールごとに、非アクティブに設定されたチケットの数。 | count |
 | `om_core.ticket.deactivation.failures.invalid_id` | `DeactivateTickets` RPCコールごとに、無効なIDが原因で失敗したチケット非アクティブ化の数。 | count |
 | `om_core.ticket.deactivation.failures.unspecified` | `DeactivateTickets` RPCコールごとに、不特定のエラーが原因で失敗したチケット非アクティブ化の数。 | count |
 | `om_core.ticket.assignment` | 各`CreateAssignments()`呼び出しに含まれるチケットアサインメントの数。 | count |
-| `om_core.ticket.assigment.watch` | 各`CreateAssignments()`呼び出しに含まれるチケットアサインメントの数。 | count |
+| `om_core.ticket.assignment.watch` | 現在アサインメントを監視中のチケットの数。 | count |
 | `om_core.profile.chunks` | `InvokeMatchmakingFunctions()`呼び出し中に、すべてのプールにすべてのチケットが投入された後、プロファイルが分割されたチャンクの数。 | count |
 | `om_core.cache.tickets.available` | `InvokeMatchmakingFunctions()`呼び出しが提供されたプロファイルのプールフィルターを処理した時点で、キャッシュ内にあったアクティブなチケットの数。 | count |
 | `om_core.profile.pools` | `InvokeMatchmakingFunctions()`呼び出しに提供されたプロファイル内のプールの数。 | count |

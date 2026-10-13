@@ -78,35 +78,6 @@ If the creation is successful you should get a response like this:
 {"ticketId":"1716339182-0"}
 ```
 
-### End-to-End (E2E) Testing
-A 6-stage automated E2E test suite that validates `om-core` together with `mmqueue`, `gsdirector`, and `fifo`/`debug` MMFs lives in the companion [`open-match-ecosystem`](https://github.com/googleforgames/open-match-ecosystem) repository under `v2/e2e/` (see `v2/e2e/README.md` for full setup and IAM prerequisites):
-
-* **Live GCP / Cloud Run E2E test**:
-  1. Build and push your `om-core` container image to your GCP Artifact Registry repository with a tag of your choice (e.g., `e2e-test-1`):
-     ```bash
-     gcloud builds submit \
-       --project="${PROJECT_ID}" \
-       --region="${REGION}" \
-       --config=cloudbuild.yaml \
-       --substitutions="_OM_IMAGE_URL=${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/om-core:e2e-test-1" \
-       .
-     ```
-  2. From the `v2/` directory of `open-match-ecosystem`, submit `e2e/cloudbuild-e2e.yaml` passing `_OM_CORE_IMAGE_TAG`:
-     ```bash
-     gcloud builds submit \
-       --project="${PROJECT_ID}" \
-       --region="${REGION}" \
-       --config=e2e/cloudbuild-e2e.yaml \
-       --substitutions="_OM_CORE_IMAGE_TAG=e2e-test-1,_LOCATION=${REGION},_REPOSITORY=${REPOSITORY},_REDIS_READ_HOST=${REDIS_HOST},_REDIS_WRITE_HOST=${REDIS_HOST}" \
-       .
-     ```
-* **Local In-Memory E2E test (no GCP project required)**:
-  From the `v2/` directory of `open-match-ecosystem`, run:
-  ```bash
-  go run ./e2e/cmd/e2e-runner --local --om-core-dir=/path/to/open-match2
-  ```
-
-
 ## Running locally
 If you want to just run the `om-core` application locally, you can `go run .` in the root directory, and it will start up. However, by default, most of the configuration variables are set to work out-of-the-box in Cloud Run, so when running locally you'll probably want to set (at least) the following environment variables:
 

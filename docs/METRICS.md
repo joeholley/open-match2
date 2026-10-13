@@ -21,12 +21,12 @@ These metrics are defined in `metrics.go` and provide insights into the overall 
 | `om_core.rpc.errors` | Total gRPC errors returned. | count |
 | `om_core.ticket.activation.requests` | Total tickets set to active, so they appear in pools. | count |
 | `om_core.ticket.activation.failures.invalid_id` | Ticket activations per ActivateTickets rpc call that failed due to an invalid id. | count |
-| `om_core.ticket.deactivation.failures.unspecified` | Ticket activations per ActivateTickets rpc call that failed due to an unspecified error. | count |
+| `om_core.ticket.activation.failures.unspecified` | Ticket activations per ActivateTickets rpc call that failed due to an unspecified error. | count |
 | `om_core.ticket.deactivation.requests` | Tickets set to deactive per DeactivateTickets rpc call. | count |
 | `om_core.ticket.deactivation.failures.invalid_id` | Ticket deactivations per DeactivateTickets rpc call that failed due to an invalid id. | count |
 | `om_core.ticket.deactivation.failures.unspecified` | Ticket deactivations per DeactivateTickets rpc call that failed due to an unspecified error. | count |
 | `om_core.ticket.assignment` | Number of tickets assignments included in each CreateAssignments() call. | count |
-| `om_core.ticket.assigment.watch` | Number of tickets assignments included in each CreateAssignments() call. | count |
+| `om_core.ticket.assignment.watch` | Number of tickets currently being watched for assignment. | count |
 | `om_core.profile.chunks` | Number of chunks the profile was split into after all tickets were populated in all pools during the InvokeMatchmakingFunctions() call. | count |
 | `om_core.cache.tickets.available` | Number of active tickets in the cache at the time the InvokeMatchmakingFunctions() call processed pool filters for the provided profile. | count |
 | `om_core.profile.pools` | Number of pools in the profile provided to the InvokeMatchmakingFunctions() call. | count |

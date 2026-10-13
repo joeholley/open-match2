@@ -51,7 +51,7 @@ open-match2/
 - **State replication, caching, & TTL expiration**: `internal/statestore/cache/replicatedticketcache.go` and `internal/statestore/redis/redis.go`.
 - **Environment variables & tuning parameters**: `internal/config/config.go`, `docs/FAQ.md`, `docs/METRICS.md` (see [configuration_and_tuning.md](references/configuration_and_tuning.md)).
 - **Architecture & OM1 -> OM2 migration**: `docs/ADVANCED.md` and `docs/MIGRATION.md`.
-- **Companion ecosystem (sample Director `gsdirector`, queue `mmqueue`, sample MMFs, E2E runner)**: Hosted in the separate [`googleforgames/open-match-ecosystem`](https://github.com/googleforgames/open-match-ecosystem/tree/main/v2) repository under `v2/`.
+- **Companion ecosystem (sample Director `gsdirector`, queue `mmqueue`, sample MMFs)**: Hosted in the separate [`googleforgames/open-match-ecosystem`](https://github.com/googleforgames/open-match-ecosystem/tree/main/v2) repository under `v2/`.
 
 ---
 
