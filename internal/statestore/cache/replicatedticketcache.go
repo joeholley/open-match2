@@ -127,11 +127,22 @@ type ReplicatedTicketCache struct {
 	assignmentHeap   expMinHeap
 	assignmentInHeap map[string]struct{}
 
-	// v2.1 - tracking active tickets in memory now, so  tracking ticket state
+	// v2.1 - tracking active tickets in memory now, so tracking ticket state
 	// counts for otel metrics
+	liveActive      int64
 	liveTickets     int64
 	liveInactive    int64
 	liveAssignments int64
+
+	// Per-instance atomic gauge counters updated alongside the package-level
+	// counters so concurrent ReplicatedTicketCache instances can be observed
+	// independently without cross-instance interference.
+	activeCount          int64
+	ticketCount          int64
+	inactiveCount        int64
+	assignmentCount      int64
+	incomingBacklogCount int64
+	outgoingBacklogCount int64
 }
 
 // Init initializes the cache's configuration, state replicator, channels, and expiration heap tracking maps.
@@ -149,6 +160,51 @@ func New(cfg *viper.Viper, r store.StateReplicator) *ReplicatedTicketCache {
 	tc := &ReplicatedTicketCache{}
 	tc.Init(cfg, r)
 	return tc
+}
+
+// ActiveCount returns the latest atomic count of active tickets in this cache instance.
+func (tc *ReplicatedTicketCache) ActiveCount() int64 {
+	return atomic.LoadInt64(&tc.activeCount)
+}
+
+// TicketCount returns the latest atomic count of total tickets in this cache instance.
+func (tc *ReplicatedTicketCache) TicketCount() int64 {
+	return atomic.LoadInt64(&tc.ticketCount)
+}
+
+// InactiveCount returns the latest atomic count of inactive ticket IDs in this cache instance.
+func (tc *ReplicatedTicketCache) InactiveCount() int64 {
+	return atomic.LoadInt64(&tc.inactiveCount)
+}
+
+// AssignmentCount returns the latest atomic count of assignments in this cache instance.
+func (tc *ReplicatedTicketCache) AssignmentCount() int64 {
+	return atomic.LoadInt64(&tc.assignmentCount)
+}
+
+// IncomingBacklogCount returns the latest atomic count of buffered incoming replication updates for this cache instance.
+func (tc *ReplicatedTicketCache) IncomingBacklogCount() int64 {
+	return atomic.LoadInt64(&tc.incomingBacklogCount)
+}
+
+// OutgoingBacklogCount returns the latest atomic count of queued outgoing replication updates for this cache instance.
+func (tc *ReplicatedTicketCache) OutgoingBacklogCount() int64 {
+	return atomic.LoadInt64(&tc.outgoingBacklogCount)
+}
+
+// updateGaugeCountsLocked publishes the current cacheMu-protected live state
+// counts to both the per-instance atomic counters and the package-level atomic
+// counters. Caller must hold tc.cacheMu.
+func (tc *ReplicatedTicketCache) updateGaugeCountsLocked() {
+	atomic.StoreInt64(&tc.activeCount, tc.liveActive)
+	atomic.StoreInt64(&tc.ticketCount, tc.liveTickets)
+	atomic.StoreInt64(&tc.inactiveCount, tc.liveInactive)
+	atomic.StoreInt64(&tc.assignmentCount, tc.liveAssignments)
+
+	atomic.StoreInt64(&ActiveCount, tc.liveActive)
+	atomic.StoreInt64(&TicketCount, tc.liveTickets)
+	atomic.StoreInt64(&InactiveCount, tc.liveInactive)
+	atomic.StoreInt64(&AssignmentCount, tc.liveAssignments)
 }
 
 // SnapshotActiveTickets returns a point-in-time slice copy of all currently
@@ -265,7 +321,9 @@ func (tc *ReplicatedTicketCache) OutgoingReplicationQueue(ctx context.Context) {
 			case req := <-tc.UpRequests:
 				pipelineRequests = append(pipelineRequests, req)
 				pipeline = append(pipeline, &req.Update)
-				atomic.StoreInt64(&OutgoingBacklogCount, int64(len(tc.UpRequests)))
+				outBacklog := int64(len(tc.UpRequests))
+				atomic.StoreInt64(&tc.outgoingBacklogCount, outBacklog)
+				atomic.StoreInt64(&OutgoingBacklogCount, outBacklog)
 
 				logger.Tracef(" %v requests queued for current batch", len(pipelineRequests))
 				if len(pipelineRequests) >= maxThreshold {
@@ -296,7 +354,9 @@ func (tc *ReplicatedTicketCache) OutgoingReplicationQueue(ctx context.Context) {
 			}
 		}
 
-		atomic.StoreInt64(&OutgoingBacklogCount, int64(len(tc.UpRequests)))
+		outBacklog := int64(len(tc.UpRequests))
+		atomic.StoreInt64(&tc.outgoingBacklogCount, outBacklog)
+		atomic.StoreInt64(&OutgoingBacklogCount, outBacklog)
 
 		// If the redis update pipeline batch job has commands to run, execute
 		if len(pipelineRequests) > 0 {
@@ -547,7 +607,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 			if len(results) > 0 {
 				otelCacheIncomingQueueWait.Record(ctx, float64(time.Since(queueStart).Microseconds())/1000.0)
 			}
-			atomic.StoreInt64(&IncomingBacklogCount, int64(len(replStream)))
+			inBacklog := int64(len(replStream))
+			atomic.StoreInt64(&tc.incomingBacklogCount, inBacklog)
+			atomic.StoreInt64(&IncomingBacklogCount, inBacklog)
 
 			// Determine the post-poll wait before issuing the next GetUpdates() call:
 			// - Full poll (len(results) >= maxUpdatesPerPoll): more updates are likely
@@ -730,7 +792,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 		}
 		updateTimer.Stop()
 		otelCacheIncomingApplyDuration.Record(ctx, float64(time.Since(applyStart).Microseconds())/1000.0)
-		atomic.StoreInt64(&IncomingBacklogCount, int64(len(replStream)))
+		inBacklog := int64(len(replStream))
+		atomic.StoreInt64(&tc.incomingBacklogCount, inBacklog)
+		atomic.StoreInt64(&IncomingBacklogCount, inBacklog)
 		if appliedAny {
 			tc.recordApplied(lastReplId)
 		}
@@ -777,6 +841,7 @@ func (tc *ReplicatedTicketCache) applyUpdate(curUpdate *store.StateUpdate, ticke
 		}
 		tc.storeAssignmentLocked(curUpdate.Key, assignmentPb)
 	}
+	tc.updateGaugeCountsLocked()
 }
 
 func (tc *ReplicatedTicketCache) storeTicketLocked(id string, ticketPb *pb.Ticket) {
@@ -786,7 +851,9 @@ func (tc *ReplicatedTicketCache) storeTicketLocked(id string, ticketPb *pb.Ticke
 	if _, loaded := tc.InactiveSet.LoadOrStore(id, true); !loaded {
 		tc.liveInactive++
 	}
-	tc.ActiveTickets.Delete(id)
+	if _, wasActive := tc.ActiveTickets.LoadAndDelete(id); wasActive {
+		tc.liveActive--
+	}
 	if _, existed := tc.Tickets.Swap(id, ticketPb); !existed {
 		tc.liveTickets++
 	}
@@ -809,7 +876,9 @@ func (tc *ReplicatedTicketCache) activateTicketLocked(id string) {
 		tc.liveInactive--
 	}
 	if hasTicket && ticketVal != nil {
-		tc.ActiveTickets.Store(id, ticketVal)
+		if _, wasActive := tc.ActiveTickets.Swap(id, ticketVal); !wasActive {
+			tc.liveActive++
+		}
 	}
 }
 
@@ -820,7 +889,9 @@ func (tc *ReplicatedTicketCache) deactivateTicketLocked(id string) {
 	if _, loaded := tc.InactiveSet.LoadOrStore(id, true); !loaded {
 		tc.liveInactive++
 	}
-	tc.ActiveTickets.Delete(id)
+	if _, wasActive := tc.ActiveTickets.LoadAndDelete(id); wasActive {
+		tc.liveActive--
+	}
 	if _, inHeap := tc.inactiveInHeap[id]; !inHeap {
 		if creationMs, err := store.ParseReplIdTimestampMs(id); err == nil {
 			tc.inactiveInHeap[id] = struct{}{}
@@ -854,11 +925,11 @@ func (tc *ReplicatedTicketCache) runExpireChunk(
 	numInactiveDeletions *int64,
 	numTicketDeletions *int64,
 	numAssignmentDeletions *int64,
-) (moreWork bool, numAssignments, numTickets, numInactive int64) {
+) bool {
 	tc.cacheMu.Lock()
 	defer tc.cacheMu.Unlock()
 
-	moreWork = tc.expireChunkLocked(
+	moreWork := tc.expireChunkLocked(
 		startTime,
 		nowMs,
 		ticketTtlMs,
@@ -869,7 +940,8 @@ func (tc *ReplicatedTicketCache) runExpireChunk(
 		numTicketDeletions,
 		numAssignmentDeletions,
 	)
-	return moreWork, tc.liveAssignments, tc.liveTickets, tc.liveInactive
+	tc.updateGaugeCountsLocked()
+	return moreWork
 }
 
 func (tc *ReplicatedTicketCache) expireChunkLocked(
@@ -901,7 +973,9 @@ func (tc *ReplicatedTicketCache) expireChunkLocked(
 		chunkOps++
 		delete(tc.inactiveInHeap, popped.id)
 		if _, isInactive := tc.InactiveSet.Load(popped.id); isInactive {
-			tc.ActiveTickets.Delete(popped.id)
+			if _, wasActive := tc.ActiveTickets.LoadAndDelete(popped.id); wasActive {
+				tc.liveActive--
+			}
 			if _, existed := tc.Tickets.LoadAndDelete(popped.id); existed {
 				tc.liveTickets--
 				*numTicketDeletions++
@@ -934,7 +1008,9 @@ func (tc *ReplicatedTicketCache) expireChunkLocked(
 		if val, exists := tc.Tickets.Load(popped.id); exists {
 			if ticketPb, tOk := val.(*pb.Ticket); tOk && ticketPb != nil {
 				if startTime.After(ticketPb.GetExpirationTime().AsTime()) {
-					tc.ActiveTickets.Delete(popped.id)
+					if _, wasActive := tc.ActiveTickets.LoadAndDelete(popped.id); wasActive {
+						tc.liveActive--
+					}
 					if _, removed := tc.Tickets.LoadAndDelete(popped.id); removed {
 						tc.liveTickets--
 						*numTicketDeletions++
@@ -1003,17 +1079,9 @@ func (tc *ReplicatedTicketCache) expireCacheEntries(ctx context.Context) {
 		"operation": "expiration",
 	})
 
-	// Metrics are tallied in local variables. The values get copied to
-	// the module global values that the metrics actually sample after
-	// th tally is complete. This way the mid-tally values never get
-	// accidentally reported to the metrics sidecar (which could happen
-	// if we used the module global values to compute the tally)
 	var (
-		numInactive            int64
 		numInactiveDeletions   int64
-		numTickets             int64
 		numTicketDeletions     int64
-		numAssignments         int64
 		numAssignmentDeletions int64
 	)
 	startTime := time.Now()
@@ -1024,8 +1092,7 @@ func (tc *ReplicatedTicketCache) expireCacheEntries(ctx context.Context) {
 
 	deletedSoFar := 0
 	for {
-		var moreWork bool
-		moreWork, numAssignments, numTickets, numInactive = tc.runExpireChunk(
+		moreWork := tc.runExpireChunk(
 			startTime,
 			nowMs,
 			ticketTtlMs,
@@ -1040,11 +1107,6 @@ func (tc *ReplicatedTicketCache) expireCacheEntries(ctx context.Context) {
 			break
 		}
 	}
-
-	// Log results and record counter metrics
-	atomic.StoreInt64(&AssignmentCount, numAssignments)
-	atomic.StoreInt64(&TicketCount, numTickets)
-	atomic.StoreInt64(&InactiveCount, numInactive)
 
 	// Record time elapsed for histogram
 	elapsed := float64(time.Since(startTime).Microseconds())

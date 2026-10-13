@@ -30,6 +30,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -805,6 +807,10 @@ func TestOrderedExpirationAndGauges(t *testing.T) {
 		assert.True(t, newerInTickets, "newer ticket should still exist in Tickets")
 		assert.True(t, newerInInactive, "newer ticket should still exist in InactiveSet")
 		assert.Empty(t, tc.SnapshotActiveTickets())
+		assert.Equal(t, int64(0), atomic.LoadInt64(&ActiveCount))
+		assert.Equal(t, int64(0), tc.ActiveCount())
+		assert.Equal(t, int64(1), tc.TicketCount())
+		assert.Equal(t, int64(1), tc.InactiveCount())
 	})
 
 	t.Run("accurate gauges after duplicate updates and expiration", func(t *testing.T) {
@@ -840,12 +846,24 @@ func TestOrderedExpirationAndGauges(t *testing.T) {
 		tc.applyUpdate(&store.StateUpdate{Cmd: store.Assign, Key: liveId1}, nil, assignPb)
 		tc.applyUpdate(&store.StateUpdate{Cmd: store.Assign, Key: liveId1}, nil, assignPb)
 
+		// Before expiration: liveId1 is active (1), expiredId and liveId2 are inactive (2), total tickets (3), assignments (2).
+		assert.Equal(t, int64(1), atomic.LoadInt64(&ActiveCount))
+		assert.Equal(t, int64(1), tc.ActiveCount())
+		assert.Equal(t, int64(3), tc.TicketCount())
+		assert.Equal(t, int64(2), tc.InactiveCount())
+		assert.Equal(t, int64(2), tc.AssignmentCount())
+
 		tc.expireCacheEntries(ctx)
 
 		// expiredId (ticket + inactive + assignment) is expired; liveId1 (active) and liveId2 (inactive) remain; liveId1 assignment remains.
+		assert.Equal(t, int64(1), atomic.LoadInt64(&ActiveCount))
 		assert.Equal(t, int64(2), atomic.LoadInt64(&TicketCount))
 		assert.Equal(t, int64(1), atomic.LoadInt64(&InactiveCount))
 		assert.Equal(t, int64(1), atomic.LoadInt64(&AssignmentCount))
+		assert.Equal(t, int64(1), tc.ActiveCount())
+		assert.Equal(t, int64(2), tc.TicketCount())
+		assert.Equal(t, int64(1), tc.InactiveCount())
+		assert.Equal(t, int64(1), tc.AssignmentCount())
 	})
 
 	t.Run("OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE bounds deletions per cycle", func(t *testing.T) {
@@ -865,18 +883,30 @@ func TestOrderedExpirationAndGauges(t *testing.T) {
 
 		// Cycle 1: deletes 4 expired tickets, 6 remain.
 		tc.expireCacheEntries(ctx)
+		assert.Equal(t, int64(0), atomic.LoadInt64(&ActiveCount))
 		assert.Equal(t, int64(6), atomic.LoadInt64(&TicketCount))
 		assert.Equal(t, int64(6), atomic.LoadInt64(&InactiveCount))
+		assert.Equal(t, int64(0), tc.ActiveCount())
+		assert.Equal(t, int64(6), tc.TicketCount())
+		assert.Equal(t, int64(6), tc.InactiveCount())
 
 		// Cycle 2: deletes 4 more expired tickets, 2 remain.
 		tc.expireCacheEntries(ctx)
+		assert.Equal(t, int64(0), atomic.LoadInt64(&ActiveCount))
 		assert.Equal(t, int64(2), atomic.LoadInt64(&TicketCount))
 		assert.Equal(t, int64(2), atomic.LoadInt64(&InactiveCount))
+		assert.Equal(t, int64(0), tc.ActiveCount())
+		assert.Equal(t, int64(2), tc.TicketCount())
+		assert.Equal(t, int64(2), tc.InactiveCount())
 
 		// Cycle 3: deletes the remaining 2 expired tickets, 0 remain.
 		tc.expireCacheEntries(ctx)
+		assert.Equal(t, int64(0), atomic.LoadInt64(&ActiveCount))
 		assert.Equal(t, int64(0), atomic.LoadInt64(&TicketCount))
 		assert.Equal(t, int64(0), atomic.LoadInt64(&InactiveCount))
+		assert.Equal(t, int64(0), tc.ActiveCount())
+		assert.Equal(t, int64(0), tc.TicketCount())
+		assert.Equal(t, int64(0), tc.InactiveCount())
 	})
 
 	t.Run("multi-chunk expiration across more than 256 expired entries", func(t *testing.T) {
@@ -897,10 +927,16 @@ func TestOrderedExpirationAndGauges(t *testing.T) {
 				tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Key: id}, nil, nil)
 			}
 		}
+		assert.Equal(t, int64(totalExpired/2), atomic.LoadInt64(&ActiveCount))
+		assert.Equal(t, int64(totalExpired/2), tc.ActiveCount())
 
 		tc.expireCacheEntries(ctx)
+		assert.Equal(t, int64(0), atomic.LoadInt64(&ActiveCount))
 		assert.Equal(t, int64(0), atomic.LoadInt64(&TicketCount))
 		assert.Equal(t, int64(0), atomic.LoadInt64(&InactiveCount))
+		assert.Equal(t, int64(0), tc.ActiveCount())
+		assert.Equal(t, int64(0), tc.TicketCount())
+		assert.Equal(t, int64(0), tc.InactiveCount())
 		assert.Empty(t, tc.SnapshotActiveTickets())
 	})
 }
@@ -1144,3 +1180,193 @@ func TestOutgoingReplicationQueueDefensiveFallbacks(t *testing.T) {
 		assert.Equal(t, "1790307871351-33", res3.Result)
 	})
 }
+
+func collectCacheGauges(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	out := make(map[string]int64)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) > 0 {
+				out[m.Name] = sum.DataPoints[0].Value
+			}
+		}
+	}
+	return out
+}
+
+// TestActiveTicketGaugeAccuracyRealTimeUpdatesAndInstanceIsolation verifies REC-09:
+//   - om_core.cache.tickets.active (ActiveCount / tc.ActiveCount()) tracks the
+//     actual live count of entries in ActiveTickets and never goes negative or
+//     undercounts when InactiveSet contains pre-deactivated IDs for non-existent
+//     tickets or tickets with early custom ExpirationTime;
+//   - gauges update immediately inside applyUpdate without waiting for an
+//     expiration cycle;
+//   - per-instance counters and tc.RegisterMetrics isolate multiple concurrent
+//     ReplicatedTicketCache instances.
+func TestActiveTicketGaugeAccuracyRealTimeUpdatesAndInstanceIsolation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("NeverGoesNegativeOrUndercountsWhenInactiveExceedsTickets", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_TICKET_TTL_MS", 10000)
+
+		tc := New(cfg, nil)
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+		meter := mp.Meter("cache-test-rec09-1")
+		tc.RegisterMetrics(&meter)
+
+		now := time.Now()
+		nowMs := now.UnixMilli()
+
+		// Step 1: Deactivate 3 ticket IDs that were never created via store.Ticket.
+		// Previously, TicketCount - InactiveCount became 0 - 3 = -3.
+		tc.applyUpdate(&store.StateUpdate{
+			Cmd:  store.Deactivate,
+			Keys: []string{fmt.Sprintf("%013d-ghost1", nowMs), fmt.Sprintf("%013d-ghost2", nowMs), fmt.Sprintf("%013d-ghost3", nowMs)},
+		}, nil, nil)
+
+		assert.Equal(t, int64(0), tc.TicketCount())
+		assert.Equal(t, int64(3), tc.InactiveCount())
+		assert.Equal(t, int64(0), tc.ActiveCount(), "active ticket count must never go negative when InactiveSet has pre-deactivated IDs")
+		assert.Equal(t, int64(0), atomic.LoadInt64(&ActiveCount))
+
+		gauges := collectCacheGauges(t, reader)
+		assert.Equal(t, int64(0), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(3), gauges["om_core.cache.tickets.inactive"])
+
+		// Step 2: Create and activate 2 real tickets while the 3 ghost IDs remain in InactiveSet.
+		// Previously, TicketCount - InactiveCount was 2 - 3 = -1 instead of 2!
+		activeId1 := fmt.Sprintf("%013d-active1", nowMs)
+		activeId2 := fmt.Sprintf("%013d-active2", nowMs)
+		for _, id := range []string{activeId1, activeId2} {
+			tk := &pb.Ticket{Id: id, ExpirationTime: timestamppb.New(now.Add(5 * time.Minute))}
+			tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id}, tk, nil)
+		}
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Keys: []string{activeId1, activeId2}}, nil, nil)
+
+		assert.Equal(t, int64(2), tc.TicketCount())
+		assert.Equal(t, int64(3), tc.InactiveCount())
+		assert.Equal(t, int64(2), tc.ActiveCount(), "active ticket count must equal actual ActiveTickets entries despite ghost IDs in InactiveSet")
+		assert.Len(t, tc.SnapshotActiveTickets(), 2)
+
+		gauges = collectCacheGauges(t, reader)
+		assert.Equal(t, int64(2), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(3), gauges["om_core.cache.tickets.inactive"])
+
+		// Step 3: Create a ticket with an early custom ExpirationTime (already elapsed),
+		// keep it inactive, and run expireCacheEntries. Its Tickets entry expires before
+		// its InactiveSet entry (which uses default OM_CACHE_TICKET_TTL_MS = 10s).
+		earlyInactiveId := fmt.Sprintf("%013d-early", nowMs)
+		tkEarly := &pb.Ticket{Id: earlyInactiveId, ExpirationTime: timestamppb.New(now.Add(-time.Second))}
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: earlyInactiveId}, tkEarly, nil)
+
+		tc.expireCacheEntries(ctx)
+
+		// earlyInactiveId was removed from Tickets (TicketCount=2) while its ID remains
+		// in InactiveSet (InactiveCount=4). Both active tickets remain active (ActiveCount=2).
+		assert.Equal(t, int64(2), tc.TicketCount())
+		assert.Equal(t, int64(4), tc.InactiveCount())
+		assert.Equal(t, int64(2), tc.ActiveCount())
+
+		gauges = collectCacheGauges(t, reader)
+		assert.Equal(t, int64(2), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(4), gauges["om_core.cache.tickets.inactive"])
+	})
+
+	t.Run("GaugesUpdateImmediatelyInApplyUpdateWithoutWaitingForExpiration", func(t *testing.T) {
+		tc := New(config.Read(), nil)
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+		meter := mp.Meter("cache-test-rec09-2")
+		tc.RegisterMetrics(&meter)
+
+		now := time.Now()
+		id1 := fmt.Sprintf("%013d-rt1", now.UnixMilli())
+		id2 := fmt.Sprintf("%013d-rt2", now.UnixMilli())
+		tk1 := &pb.Ticket{Id: id1, ExpirationTime: timestamppb.New(now.Add(time.Minute))}
+		tk2 := &pb.Ticket{Id: id2, ExpirationTime: timestamppb.New(now.Add(time.Minute))}
+
+		// 1. Store tickets -> immediately reflected in TicketCount and InactiveCount.
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id1}, tk1, nil)
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id2}, tk2, nil)
+		gauges := collectCacheGauges(t, reader)
+		assert.Equal(t, int64(0), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(2), gauges["om_core.cache.tickets.inactive"])
+
+		// 2. Activate both -> immediately reflected in ActiveCount (2) and InactiveCount (0).
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Keys: []string{id1, id2}}, nil, nil)
+		gauges = collectCacheGauges(t, reader)
+		assert.Equal(t, int64(2), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(0), gauges["om_core.cache.tickets.inactive"])
+
+		// 3. Re-storing an already-active ticket transitions it back to inactive and decrements ActiveCount.
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id1}, tk1, nil)
+		gauges = collectCacheGauges(t, reader)
+		assert.Equal(t, int64(1), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(1), gauges["om_core.cache.tickets.inactive"])
+
+		// 4. Deactivating id2 and assigning id1 updates ActiveCount, InactiveCount, and AssignmentCount immediately.
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Deactivate, Key: id2}, nil, nil)
+		tc.applyUpdate(&store.StateUpdate{Cmd: store.Assign, Key: id1}, nil, &pb.Assignment{Connection: "10.0.0.1:8888"})
+		gauges = collectCacheGauges(t, reader)
+		assert.Equal(t, int64(0), gauges["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(2), gauges["om_core.cache.tickets.inactive"])
+		assert.Equal(t, int64(1), gauges["om_core.cache.assignments"])
+	})
+
+	t.Run("PerInstanceCountersAndRegisterMetricsIsolateMultipleCaches", func(t *testing.T) {
+		tc1 := New(config.Read(), nil)
+		tc2 := New(config.Read(), nil)
+
+		reader1 := sdkmetric.NewManualReader()
+		mp1 := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader1))
+		meter1 := mp1.Meter("cache-test-instance-1")
+		tc1.RegisterMetrics(&meter1)
+
+		reader2 := sdkmetric.NewManualReader()
+		mp2 := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader2))
+		meter2 := mp2.Meter("cache-test-instance-2")
+		tc2.RegisterMetrics(&meter2)
+
+		now := time.Now()
+		id1 := fmt.Sprintf("%013d-c1", now.UnixMilli())
+		id2 := fmt.Sprintf("%013d-c2", now.UnixMilli())
+		tk1 := &pb.Ticket{Id: id1, ExpirationTime: timestamppb.New(now.Add(time.Minute))}
+		tk2 := &pb.Ticket{Id: id2, ExpirationTime: timestamppb.New(now.Add(time.Minute))}
+
+		tc1.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id1}, tk1, nil)
+		tc1.applyUpdate(&store.StateUpdate{Cmd: store.Activate, Key: id1}, nil, nil)
+
+		// Mutating tc2 does not overwrite tc1's per-instance counters or OTel callback observations.
+		tc2.applyUpdate(&store.StateUpdate{Cmd: store.Ticket, Key: id2}, tk2, nil)
+		tc2.applyUpdate(&store.StateUpdate{Cmd: store.Assign, Key: id2}, nil, &pb.Assignment{Connection: "10.0.0.2:9999"})
+
+		assert.Equal(t, int64(1), tc1.ActiveCount())
+		assert.Equal(t, int64(1), tc1.TicketCount())
+		assert.Equal(t, int64(0), tc1.InactiveCount())
+		assert.Equal(t, int64(0), tc1.AssignmentCount())
+		assert.Equal(t, int64(0), tc1.IncomingBacklogCount())
+		assert.Equal(t, int64(0), tc1.OutgoingBacklogCount())
+
+		assert.Equal(t, int64(0), tc2.ActiveCount())
+		assert.Equal(t, int64(1), tc2.TicketCount())
+		assert.Equal(t, int64(1), tc2.InactiveCount())
+		assert.Equal(t, int64(1), tc2.AssignmentCount())
+		assert.Equal(t, int64(0), tc2.IncomingBacklogCount())
+		assert.Equal(t, int64(0), tc2.OutgoingBacklogCount())
+
+		gauges1 := collectCacheGauges(t, reader1)
+		assert.Equal(t, int64(1), gauges1["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(0), gauges1["om_core.cache.tickets.inactive"])
+		assert.Equal(t, int64(0), gauges1["om_core.cache.assignments"])
+
+		gauges2 := collectCacheGauges(t, reader2)
+		assert.Equal(t, int64(0), gauges2["om_core.cache.tickets.active"])
+		assert.Equal(t, int64(1), gauges2["om_core.cache.tickets.inactive"])
+		assert.Equal(t, int64(1), gauges2["om_core.cache.assignments"])
+	})
+}
+

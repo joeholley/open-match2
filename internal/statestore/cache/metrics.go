@@ -57,6 +57,7 @@ var (
 	// Metric variable declarations are global to the module, so they can be
 	// accessed directly in the module code.
 	// The live counters that the metrics observe.
+	ActiveCount          int64
 	TicketCount          int64
 	InactiveCount        int64
 	AssignmentCount      int64
@@ -72,34 +73,13 @@ var (
 	otelCacheOutgoingBacklog otelmetrics.Int64ObservableUpDownCounter
 )
 
+// RegisterMetrics registers the OpenTelemetry cache instruments on meterPointer
+// and binds observable gauge callbacks to the package-level atomic counters.
+//
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
 func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 	meter := *meterPointer
 	var err error
-
-	otelCacheActiveTickets, err = meter.Int64ObservableUpDownCounter(
-		metricsNamePrefix+"tickets.active",
-		otelmetrics.WithDescription("Active tickets that can appear in pools"),
-	)
-	if err != nil {
-		otelLogger.Fatal(err)
-	}
-
-	otelCacheInactiveTickets, err = meter.Int64ObservableUpDownCounter(
-		metricsNamePrefix+"tickets.inactive",
-		otelmetrics.WithDescription("Inactive tickets that won't appear in pools"),
-	)
-	if err != nil {
-		otelLogger.Fatal(err)
-	}
-
-	otelCacheAssignments, err = meter.Int64ObservableUpDownCounter(
-		metricsNamePrefix+"assignments",
-		otelmetrics.WithDescription("Assignments in Open Match cache"),
-	)
-	if err != nil {
-		otelLogger.Fatal(err)
-	}
 
 	otelCacheExpirationCycleDuration, err = meter.Float64Histogram(
 		metricsNamePrefix+"expiration.duration",
@@ -262,7 +242,75 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelCacheIncomingBacklog, err = meter.Int64ObservableUpDownCounter(
+	otelCacheActiveTickets,
+		otelCacheInactiveTickets,
+		otelCacheAssignments,
+		otelCacheIncomingBacklog,
+		otelCacheOutgoingBacklog = registerObservableGauges(
+		meter,
+		&ActiveCount,
+		&InactiveCount,
+		&AssignmentCount,
+		&IncomingBacklogCount,
+		&OutgoingBacklogCount,
+	)
+}
+
+// RegisterMetrics registers the OpenTelemetry observable cache gauge instruments
+// on meterPointer and binds their callback to this ReplicatedTicketCache
+// instance's atomic counters without mutating package-level instruments.
+func (tc *ReplicatedTicketCache) RegisterMetrics(meterPointer *otelmetrics.Meter) {
+	registerObservableGauges(
+		*meterPointer,
+		&tc.activeCount,
+		&tc.inactiveCount,
+		&tc.assignmentCount,
+		&tc.incomingBacklogCount,
+		&tc.outgoingBacklogCount,
+	)
+}
+
+func registerObservableGauges(
+	meter otelmetrics.Meter,
+	activeCount *int64,
+	inactiveCount *int64,
+	assignmentCount *int64,
+	incomingBacklogCount *int64,
+	outgoingBacklogCount *int64,
+) (
+	activeTickets otelmetrics.Int64ObservableUpDownCounter,
+	inactiveTickets otelmetrics.Int64ObservableUpDownCounter,
+	assignments otelmetrics.Int64ObservableUpDownCounter,
+	incomingBacklog otelmetrics.Int64ObservableUpDownCounter,
+	outgoingBacklog otelmetrics.Int64ObservableUpDownCounter,
+) {
+	var err error
+
+	activeTickets, err = meter.Int64ObservableUpDownCounter(
+		metricsNamePrefix+"tickets.active",
+		otelmetrics.WithDescription("Active tickets that can appear in pools"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	inactiveTickets, err = meter.Int64ObservableUpDownCounter(
+		metricsNamePrefix+"tickets.inactive",
+		otelmetrics.WithDescription("Inactive tickets that won't appear in pools"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	assignments, err = meter.Int64ObservableUpDownCounter(
+		metricsNamePrefix+"assignments",
+		otelmetrics.WithDescription("Assignments in Open Match cache"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	incomingBacklog, err = meter.Int64ObservableUpDownCounter(
 		metricsNamePrefix+"incoming.backlog",
 		otelmetrics.WithDescription("Number of incoming replication updates buffered and waiting to be applied to the local cache"),
 	)
@@ -270,7 +318,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelCacheOutgoingBacklog, err = meter.Int64ObservableUpDownCounter(
+	outgoingBacklog, err = meter.Int64ObservableUpDownCounter(
 		metricsNamePrefix+"outgoing.backlog",
 		otelmetrics.WithDescription("Number of outgoing replication updates queued and waiting to be sent to state storage"),
 	)
@@ -282,15 +330,17 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 	// tickets, assignments, and replication backlogs.
 	if _, err := meter.RegisterCallback(
 		func(ctx context.Context, o otelmetrics.Observer) error {
-			o.ObserveInt64(otelCacheActiveTickets, atomic.LoadInt64(&TicketCount)-atomic.LoadInt64(&InactiveCount))
-			o.ObserveInt64(otelCacheInactiveTickets, atomic.LoadInt64(&InactiveCount))
-			o.ObserveInt64(otelCacheAssignments, atomic.LoadInt64(&AssignmentCount))
-			o.ObserveInt64(otelCacheIncomingBacklog, atomic.LoadInt64(&IncomingBacklogCount))
-			o.ObserveInt64(otelCacheOutgoingBacklog, atomic.LoadInt64(&OutgoingBacklogCount))
+			o.ObserveInt64(activeTickets, atomic.LoadInt64(activeCount))
+			o.ObserveInt64(inactiveTickets, atomic.LoadInt64(inactiveCount))
+			o.ObserveInt64(assignments, atomic.LoadInt64(assignmentCount))
+			o.ObserveInt64(incomingBacklog, atomic.LoadInt64(incomingBacklogCount))
+			o.ObserveInt64(outgoingBacklog, atomic.LoadInt64(outgoingBacklogCount))
 			return nil
 		},
-		otelCacheActiveTickets, otelCacheInactiveTickets, otelCacheAssignments, otelCacheIncomingBacklog, otelCacheOutgoingBacklog,
+		activeTickets, inactiveTickets, assignments, incomingBacklog, outgoingBacklog,
 	); err != nil {
 		panic(err)
 	}
+
+	return activeTickets, inactiveTickets, assignments, incomingBacklog, outgoingBacklog
 }
