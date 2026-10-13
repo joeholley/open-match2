@@ -645,12 +645,17 @@ func updateTicketsActiveState(parentCtx context.Context, logger *logrus.Entry, t
 // cloning each Pool message from reqProfile so that setting pool.Participants on
 // one chunk never mutates the Pool in earlier chunks or in reqProfile itself.
 func buildChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*pb.Ticket) []*pb.ChunkedMmfRunRequest {
+	if len(chunkedPools) == 0 {
+		chunkedPools = []map[string][]*pb.Ticket{{}}
+	}
 	chunkedRequest := make([]*pb.ChunkedMmfRunRequest, len(chunkedPools))
 	for chunkIndex, chunk := range chunkedPools {
 		logger.Debugf("processing chunk %v ", chunkIndex)
 
-		// Fill this request 'chunk' with the chunked pools we built above
-		pools := make(map[string]*pb.Pool, len(chunk))
+		// Fill this request 'chunk' with the chunked pools we built above,
+		// then populate any remaining valid pools from reqProfile with empty
+		// rosters so pools that matched 0 tickets in this chunk are preserved.
+		pools := make(map[string]*pb.Pool, max(len(reqProfile.GetPools()), len(chunk)))
 		profile := &pb.Profile{
 			Name:       reqProfile.GetName(),
 			Pools:      pools,
@@ -665,9 +670,29 @@ func buildChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*p
 			if !ok || poolCopy == nil {
 				poolCopy = &pb.Pool{Name: name}
 			}
+			if participantRoster == nil {
+				participantRoster = []*pb.Ticket{}
+			}
 			poolCopy.Participants = &pb.Roster{
 				Name:    name + "_roster",
 				Tickets: participantRoster,
+			}
+			profile.Pools[name] = poolCopy
+		}
+		for name, reqPool := range reqProfile.GetPools() {
+			if _, exists := profile.Pools[name]; exists {
+				continue
+			}
+			if valid, _ := filter.ValidatePoolFilters(reqPool); !valid {
+				continue
+			}
+			poolCopy, ok := proto.Clone(reqPool).(*pb.Pool)
+			if !ok || poolCopy == nil {
+				poolCopy = &pb.Pool{Name: name}
+			}
+			poolCopy.Participants = &pb.Roster{
+				Name:    name + "_roster",
+				Tickets: []*pb.Ticket{},
 			}
 			profile.Pools[name] = poolCopy
 		}
@@ -789,7 +814,7 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// MMFs need to re-assemble the pools with a simple loop+concat over all chunks
 	var chunkCount int32
 	chunkedPools := make([]map[string][]*pb.Ticket, 0)
-	chunkedPools = append(chunkedPools, map[string][]*pb.Ticket{})
+	chunkedPools = append(chunkedPools, validPools)
 
 	for _, ticket := range activeTickets {
 		for name := range validPools {
@@ -1022,9 +1047,19 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				for index, chunk := range chunkedRequest {
 					sendErr := streamClient.Send(chunk)
 					if sendErr != nil {
+						if errors.Is(sendErr, io.EOF) {
+							if _, recvErr := streamClient.Recv(); recvErr != nil && !errors.Is(recvErr, io.EOF) {
+								sendErr = recvErr
+							}
+						}
 						logger.Errorf("Failed to send MmfRequest chunk to MMF: %v", sendErr)
+						return nil, sendErr
 					}
 					logger.Tracef("MMF request chunk %02d/%02d: %0.2fmb", index+1, len(chunkedRequest), float64(proto.Size(chunk))/float64(1024*1024))
+				}
+				if closeErr := streamClient.CloseSend(); closeErr != nil {
+					logger.Errorf("Failed to close MmfRequest stream to MMF: %v", closeErr)
+					return nil, closeErr
 				}
 				return streamClient, nil
 			}
@@ -1064,12 +1099,21 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			// are complete. (All tickets in matches returned by the MMF are
 			// set to inactive by OM.)
 			var tdwg sync.WaitGroup
+			// Wait for all match ticket deactivation goroutines to complete.
+			defer tdwg.Wait()
 
 			// i counts the number of results (which equates to matches
 			// received) for metrics reporting; this loop reads streaming
 			// match responses from the mmf and runs until a break
 			// statement is encountered.
 			var i int64
+			// Track matches received from mmfs
+			defer func() {
+				otelMatches.Add(ctx, i, metric.WithAttributes(
+					attribute.String("mmf.name", mmf.GetName()),
+					attribute.String("profile.name", profileName),
+				))
+			}()
 			for {
 				// Get results from MMF
 				var result *pb.StreamedMmfResponse
@@ -1224,27 +1268,6 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				}(resultCopy) // End of match return & ticket deactivation goroutine
 
 			} // End of match stream receiving loop
-
-			// Track matches received from mmfs
-			otelMatches.Add(ctx, i, metric.WithAttributes(
-				attribute.String("mmf.name", mmf.GetName()),
-				attribute.String("profile.name", profileName),
-			))
-
-			// Wait for all match ticket deactivation goroutines to complete.
-			tdwg.Wait()
-
-			// io.EOF indicates the MMF server closed the stream (mmf is
-			// complete), so don't log if that's the error we received (it's
-			// not a failure).
-			if err != nil && !errors.Is(err, io.EOF) {
-				// Track matches received from mmfs
-				otelMatches.Add(context.Background(), 1, metric.WithAttributes(
-					attribute.String("mmf.name", mmf.GetName()),
-					attribute.String("profile.name", profileName),
-				))
-				logger.Errorf("Internal MMF error:%v", err)
-			}
 
 			// All done
 			logger.Trace("async call to mmf complete")
