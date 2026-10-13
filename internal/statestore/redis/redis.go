@@ -687,8 +687,13 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 				}
 				// Element 0 is the redis stream entry ID, which we use as the replication ID.
 				replId, err := redis.String(entry[0], nil)
-				if err != nil {
-					logger.Error(err)
+				if err != nil || replId == "" {
+					if err != nil {
+						logger.Error(err)
+					} else {
+						logger.Error("Redis XREAD returned empty stream item ID")
+					}
+					continue
 				}
 				thisUpdate := &store.StateUpdate{
 					ReplId: replId,
@@ -703,6 +708,7 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 				}
 				if len(y) < 2 {
 					logger.Error("Redis XREAD stream item missing key/value fields")
+					rr.replId = replId
 					continue
 				}
 
@@ -730,6 +736,7 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 				case "assign":
 					if len(y) < 4 {
 						logger.Error("Redis XREAD assign item missing connection field")
+						rr.replId = replId
 						continue
 					}
 					thisUpdate.Cmd = store.Assign

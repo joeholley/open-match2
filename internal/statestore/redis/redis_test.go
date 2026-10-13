@@ -472,6 +472,202 @@ func TestGetUpdatesPackedAndUnknownCommand(t *testing.T) {
 	assert.Equal(t, "1700000000103-0", rr.replId)
 }
 
+// TestGetUpdatesAdvancesCursorPastMalformedStreamEntries verifies that when a
+// stream contains malformed entries (missing key/value fields with len(y) < 2,
+// or "assign" entries missing the connection field with len(y) < 4), GetUpdates
+// still advances rr.replId past each malformed entry so subsequent XREAD polls
+// progress to later valid entries instead of re-reading the malformed entry
+// forever.
+func TestGetUpdatesAdvancesCursorPastMalformedStreamEntries(t *testing.T) {
+	conn := newStatefulFakeRedisConn()
+	rr := newTestRedisReplicator(conn)
+	// Poll 1 entry at a time so each GetUpdates call issues XREAD with the
+	// cursor updated by the immediately preceding poll.
+	rr.cfg.Set("OM_CACHE_IN_MAX_UPDATES_PER_POLL", 1)
+
+	conn.entries = []fakeStreamEntry{
+		{
+			// 1. Malformed entry: 0 fields (len(y) == 0 < 2).
+			id:     "1700000000100-0",
+			fields: []string{},
+		},
+		{
+			// 2. Malformed entry: 1 field (len(y) == 1 < 2).
+			id:     "1700000000101-0",
+			fields: []string{"ticket"},
+		},
+		{
+			// 3. Malformed "assign" entry: 2 fields (len(y) == 2 < 4).
+			id:     "1700000000102-0",
+			fields: []string{"assign", "1700000000001-0"},
+		},
+		{
+			// 4. Malformed "assign" entry: 3 fields (len(y) == 3 < 4).
+			id:     "1700000000103-0",
+			fields: []string{"assign", "1700000000001-0", "connection"},
+		},
+		{
+			// 5. Valid "activate" entry.
+			id:     "1700000000104-0",
+			fields: []string{"activate", "1700000000001-0"},
+		},
+		{
+			// 6. Valid "assign" entry.
+			id:     "1700000000105-0",
+			fields: []string{"assign", "1700000000001-0", "connection", "10.0.0.1:7777"},
+		},
+	}
+
+	// Poll 1: skips 1700000000100-0 (0 fields) and advances cursor to 1700000000100-0.
+	poll1 := rr.GetUpdates()
+	assert.Empty(t, poll1)
+	assert.Equal(t, "1700000000100-0", rr.replId)
+
+	// Poll 2: skips 1700000000101-0 (1 field) and advances cursor to 1700000000101-0.
+	poll2 := rr.GetUpdates()
+	assert.Empty(t, poll2)
+	assert.Equal(t, "1700000000101-0", rr.replId)
+
+	// Poll 3: skips 1700000000102-0 (assign with 2 fields) and advances cursor to 1700000000102-0.
+	poll3 := rr.GetUpdates()
+	assert.Empty(t, poll3)
+	assert.Equal(t, "1700000000102-0", rr.replId)
+
+	// Poll 4: skips 1700000000103-0 (assign with 3 fields) and advances cursor to 1700000000103-0.
+	poll4 := rr.GetUpdates()
+	assert.Empty(t, poll4)
+	assert.Equal(t, "1700000000103-0", rr.replId)
+
+	// Poll 5: reaches and decodes valid "activate" entry at 1700000000104-0.
+	poll5 := rr.GetUpdates()
+	require.Len(t, poll5, 1)
+	assert.Equal(t, store.Activate, poll5[0].Cmd)
+	assert.Equal(t, "1700000000001-0", poll5[0].Key)
+	assert.Equal(t, "1700000000104-0", poll5[0].ReplId)
+	assert.Equal(t, "1700000000104-0", rr.replId)
+
+	// Poll 6: reaches and decodes valid "assign" entry at 1700000000105-0.
+	poll6 := rr.GetUpdates()
+	require.Len(t, poll6, 1)
+	assert.Equal(t, store.Assign, poll6[0].Cmd)
+	assert.Equal(t, "1700000000001-0", poll6[0].Key)
+	assert.Equal(t, "10.0.0.1:7777", poll6[0].Value)
+	assert.Equal(t, "1700000000105-0", poll6[0].ReplId)
+	assert.Equal(t, "1700000000105-0", rr.replId)
+
+	// Poll 7: stream is caught up; returns empty slice and preserves cursor.
+	poll7 := rr.GetUpdates()
+	assert.Empty(t, poll7)
+	assert.Equal(t, "1700000000105-0", rr.replId)
+}
+
+// TestGetUpdatesPreservesCursorOnInvalidStreamEntryIDAndAdvancesOnInvalidFieldArray
+// verifies that GetUpdates never overwrites rr.replId with "" when a stream
+// item's ID (entry[0]) is missing, empty, or non-string, while advancing
+// rr.replId when entry[0] is valid but entry[1] fails redis.Strings conversion
+// or has insufficient fields.
+func TestGetUpdatesPreservesCursorOnInvalidStreamEntryIDAndAdvancesOnInvalidFieldArray(t *testing.T) {
+	t.Run("preserves_cursor_when_entry_id_is_empty_or_non_string", func(t *testing.T) {
+		conn := &fakeRedisConn{
+			doResp: []interface{}{
+				[]interface{}{
+					[]byte("om-replication"),
+					[]interface{}{
+						// 1. Malformed stream item with < 2 elements.
+						[]interface{}{
+							[]byte("1700000000051-0"),
+						},
+						// 2. Empty stream item ID ([]byte("")).
+						[]interface{}{
+							[]byte(""),
+							[]interface{}{
+								[]byte("activate"), []byte("1700000000001-0"),
+							},
+						},
+						// 3. Nil stream item ID (redis.String returns redis.ErrNil).
+						[]interface{}{
+							nil,
+							[]interface{}{
+								[]byte("activate"), []byte("1700000000002-0"),
+							},
+						},
+						// 4. Non-string stream item ID (slice type fails redis.String).
+						[]interface{}{
+							[]interface{}{[]byte("nested")},
+							[]interface{}{
+								[]byte("activate"), []byte("1700000000003-0"),
+							},
+						},
+					},
+				},
+			},
+		}
+		rr := newTestRedisReplicator(conn)
+		rr.replId = "1700000000050-0"
+
+		updates := rr.GetUpdates()
+		assert.Empty(t, updates)
+		assert.Equal(t, "1700000000050-0", rr.replId, "cursor must not be overwritten by invalid or empty entry[0]")
+	})
+
+	t.Run("advances_cursor_across_non_slice_field_array_and_trailing_malformed_items", func(t *testing.T) {
+		conn := &fakeRedisConn{
+			doResp: []interface{}{
+				[]interface{}{
+					[]byte("om-replication"),
+					[]interface{}{
+						// 1. Valid ID with non-slice entry[1] (redis.Strings fails -> len(y) == 0 < 2).
+						[]interface{}{
+							[]byte("1700000000200-0"),
+							int64(123),
+						},
+						// 2. Valid "deactivate" entry.
+						[]interface{}{
+							[]byte("1700000000201-0"),
+							[]interface{}{
+								[]byte("deactivate"), []byte("1700000000001-0"),
+							},
+						},
+						// 3. Empty ID with < 2 fields: must be rejected at replId == "" before len(y) < 2
+						// so rr.replId is not clobbered with "".
+						[]interface{}{
+							[]byte(""),
+							[]interface{}{
+								[]byte("ticket"),
+							},
+						},
+						// 4. Malformed "assign" entry with 2 fields (len(y) < 4).
+						[]interface{}{
+							[]byte("1700000000202-0"),
+							[]interface{}{
+								[]byte("assign"), []byte("1700000000001-0"),
+							},
+						},
+						// 5. Trailing malformed entry with 1 field (len(y) < 2).
+						[]interface{}{
+							[]byte("1700000000203-0"),
+							[]interface{}{
+								[]byte("activate"),
+							},
+						},
+					},
+				},
+			},
+		}
+		rr := newTestRedisReplicator(conn)
+		rr.replId = "1700000000050-0"
+
+		updates := rr.GetUpdates()
+		require.Len(t, updates, 1)
+		assert.Equal(t, store.Deactivate, updates[0].Cmd)
+		assert.Equal(t, "1700000000001-0", updates[0].Key)
+		assert.Equal(t, "1700000000201-0", updates[0].ReplId)
+
+		// Cursor must advance through all valid-ID entries up to the final item (1700000000203-0).
+		assert.Equal(t, "1700000000203-0", rr.replId)
+	})
+}
+
 // TestReplicatorConformance runs a shared behavioral contract suite against
 // both the in-memory StateReplicator and the Redis StateReplicator to verify
 // identical round-trip normalization, error attribution, cursor advancement,
