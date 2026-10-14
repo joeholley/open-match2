@@ -4880,6 +4880,70 @@ func TestParseMMFURLAndSchemelessInvokeMMFs(t *testing.T) {
 	})
 }
 
+// TestOTelCollectorSidecarDockerfileAndConfig verifies Task E2E-01:
+//  1. deploy/cloud_run/otel-collector-sidecar/Dockerfile populates both
+//     /etc/otelcol-google/config.yaml (for the Google-Built OpenTelemetry
+//     Collector base image) and /etc/otelcol-contrib/config.yaml (for the
+//     contrib collector image), and does not override ENTRYPOINT without CMD/--config.
+//  2. deploy/cloud_run/otel-collector-sidecar/config.yaml configures the OTLP
+//     receiver and googlemanagedprometheus exporter in the metrics pipeline.
+func TestOTelCollectorSidecarDockerfileAndConfig(t *testing.T) {
+	t.Parallel()
 
+	dockerfileBytes, err := os.ReadFile("deploy/cloud_run/otel-collector-sidecar/Dockerfile")
+	require.NoError(t, err)
 
+	var (
+		hasFromBase          bool
+		hasGoogleConfigPath  bool
+		hasContribConfigPath bool
+		hasBareEntrypoint    bool
+		hasCmdOrConfigFlag   bool
+	)
+	for _, rawLine := range strings.Split(string(dockerfileBytes), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		directive := strings.ToUpper(fields[0])
+		switch directive {
+		case "FROM":
+			if len(fields) >= 2 && (strings.Contains(fields[1], "otelcol-google") || strings.Contains(fields[1], "opentelemetry-collector-contrib")) {
+				hasFromBase = true
+			}
+		case "ADD", "COPY":
+			if len(fields) >= 3 && strings.TrimPrefix(fields[1], "./") == "config.yaml" {
+				switch fields[len(fields)-1] {
+				case "/etc/otelcol-google/config.yaml":
+					hasGoogleConfigPath = true
+				case "/etc/otelcol-contrib/config.yaml":
+					hasContribConfigPath = true
+				}
+			}
+		case "ENTRYPOINT":
+			hasBareEntrypoint = true
+			if strings.Contains(line, "--config") {
+				hasCmdOrConfigFlag = true
+			}
+		case "CMD":
+			hasCmdOrConfigFlag = true
+		}
+	}
 
+	assert.True(t, hasFromBase, "otel-collector-sidecar Dockerfile must declare a collector FROM base image")
+	assert.True(t, hasGoogleConfigPath, "otel-collector-sidecar Dockerfile must copy config.yaml to /etc/otelcol-google/config.yaml for otelcol-google base image")
+	assert.True(t, hasContribConfigPath, "otel-collector-sidecar Dockerfile must copy config.yaml to /etc/otelcol-contrib/config.yaml for otelcol-contrib compatibility")
+	if hasBareEntrypoint {
+		assert.True(t, hasCmdOrConfigFlag, "overriding ENTRYPOINT in child Dockerfile without CMD or --config clears the base image's default --config argument")
+	}
+
+	configBytes, err := os.ReadFile("deploy/cloud_run/otel-collector-sidecar/config.yaml")
+	require.NoError(t, err)
+	configContent := string(configBytes)
+	assert.Contains(t, configContent, "googlemanagedprometheus:")
+	assert.Contains(t, configContent, "exporters: [googlemanagedprometheus]")
+}
