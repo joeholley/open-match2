@@ -39,6 +39,11 @@ steps:
       - --no-allow-unauthenticated
       - --concurrency
       - "1000"
+      - --no-cpu-throttling
+      - --execution-environment
+      - gen2
+      - --min-instances
+      - "2"
       - --service-account
       - ${_SERVICE_ACCOUNT}
       - --region

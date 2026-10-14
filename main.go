@@ -894,7 +894,29 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// as we process. The participants of these pools won't reflect updates to
 	// the ticket cache that happen after this point.
 
-	// Copy the ticket cache, leaving out inactive tickets.
+	// Copy the ticket cache, leaving out inactive tickets. Wait for initial
+	// cache replication catch-up first so newly started or scaled-out instances
+	// never snapshot a cold or partially replayed ticket pool.
+	catchUpCtx := ctx
+	var catchUpCancel context.CancelFunc
+	if !tc.IsCaughtUp() && stream != nil && stream.Context() != nil {
+		catchUpCtx, catchUpCancel = context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-stream.Context().Done():
+				catchUpCancel()
+			case <-catchUpCtx.Done():
+			}
+		}()
+	}
+	catchUpErr := tc.WaitForCatchUp(catchUpCtx)
+	if catchUpCancel != nil {
+		catchUpCancel()
+	}
+	if catchUpErr != nil {
+		return status.Errorf(codes.Unavailable, "waiting for initial ticket cache replication catch-up: %v", catchUpErr)
+	}
+
 	prepStart := time.Now()
 	activeTickets := tc.SnapshotActiveTickets()
 	// This is largely for local debugging when developiong a matchmaker against

@@ -1325,30 +1325,57 @@ func newLocalTestTLS(t *testing.T) (serverCreds credentials.TransportCredentials
 }
 
 var (
-	globalTestTCOnce     sync.Once
+	globalTestTCMu       sync.Mutex
+	globalTestTCCancel   context.CancelFunc
+	globalTestTCWG       sync.WaitGroup
 	globalTestReplicator *errorInjectingReplicator
 )
 
 // ensureGlobalTestTicketCache initializes the package-global tc instance and
-// starts its background replication queue goroutines once per test binary
-// execution so sequential tests exercising InvokeMatchmakingFunctions never
-// overwrite tc while its replication goroutines are actively running.
+// starts its background replication queue goroutines if not already running so
+// sequential tests exercising InvokeMatchmakingFunctions never overwrite tc
+// while its replication goroutines are actively running.
 func ensureGlobalTestTicketCache() {
-	globalTestTCOnce.Do(func() {
-		localCfg := config.Read()
-		localCfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 10)
-		localCfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5)
-		localCfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5)
-		localCfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
+	globalTestTCMu.Lock()
+	defer globalTestTCMu.Unlock()
+	if globalTestTCCancel != nil {
+		return
+	}
+	localCfg := config.Read()
+	localCfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 10)
+	localCfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5)
+	localCfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5)
+	localCfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
 
-		globalTestReplicator = &errorInjectingReplicator{
-			inner: memoryReplicator.New(localCfg),
-		}
-		tc = cache.ReplicatedTicketCache{}
-		tc.Init(localCfg, globalTestReplicator)
-		go tc.OutgoingReplicationQueue(context.Background())
-		go tc.IncomingReplicationQueue(context.Background())
-	})
+	globalTestReplicator = &errorInjectingReplicator{
+		inner: memoryReplicator.New(localCfg),
+	}
+	tc = cache.ReplicatedTicketCache{}
+	tc.Init(localCfg, globalTestReplicator)
+	ctx, cancel := context.WithCancel(context.Background())
+	globalTestTCCancel = cancel
+	globalTestTCWG.Add(2)
+	go func() {
+		defer globalTestTCWG.Done()
+		tc.OutgoingReplicationQueue(ctx)
+	}()
+	go func() {
+		defer globalTestTCWG.Done()
+		tc.IncomingReplicationQueue(ctx)
+	}()
+}
+
+// stopGlobalTestTicketCache cancels and awaits the background replication
+// goroutines started by ensureGlobalTestTicketCache so tests that need to
+// re-initialize the global tc instance can do so without data races.
+func stopGlobalTestTicketCache() {
+	globalTestTCMu.Lock()
+	defer globalTestTCMu.Unlock()
+	if globalTestTCCancel != nil {
+		globalTestTCCancel()
+		globalTestTCWG.Wait()
+		globalTestTCCancel = nil
+	}
 }
 
 // TestInvokeMMFsPerMMFAuthAndRefreshOnRejection verifies that
@@ -4947,3 +4974,197 @@ func TestOTelCollectorSidecarDockerfileAndConfig(t *testing.T) {
 	assert.Contains(t, configContent, "googlemanagedprometheus:")
 	assert.Contains(t, configContent, "exporters: [googlemanagedprometheus]")
 }
+
+// TestInvokeMMFsWaitsForInitialCacheCatchUpAndCloudRunConfig verifies Task E2E-02:
+//  1. When InvokeMatchmakingFunctions is called on a cold-started om-core instance
+//     before IncomingReplicationQueue has completed its initial replication catch-up,
+//     InvokeMatchmakingFunctions waits on tc.WaitForCatchUp before calling
+//     tc.SnapshotActiveTickets() so MMFs receive the pre-existing active tickets
+//     rather than an empty pool.
+//  2. When the caller stream context expires or is cancelled while waiting for
+//     initial cache catch-up, InvokeMatchmakingFunctions returns codes.Unavailable.
+//  3. deploy/cloud_run/service.yaml and deploy/cloud_run/cloudbuild.yaml configure
+//     always-on CPU allocation (cpu-throttling: false / --no-cpu-throttling),
+//     gen2 execution environment, and 2 minimum warm instances so background
+//     replication goroutines stay caught up between requests.
+func TestInvokeMMFsWaitsForInitialCacheCatchUpAndCloudRunConfig(t *testing.T) {
+	t.Run("InvokeMMFsWaitsForInitialCacheCatchUpBeforeSnapshottingActiveTickets", func(t *testing.T) {
+		stopGlobalTestTicketCache()
+		defer ensureGlobalTestTicketCache()
+
+		localCfg := config.Read()
+		localCfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5)
+		localCfg.Set("OM_CACHE_IN_FULL_POLL_WAIT_MS", 5)
+		localCfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 5)
+		localCfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5)
+		localCfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
+		localCfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 5000)
+
+		rep := memoryReplicator.New(localCfg)
+		ticketBytes, err := proto.Marshal(&pb.Ticket{
+			Attributes: &pb.Ticket_FilterableData{
+				Tags:         []string{"e2e02-coldstart"},
+				CreationTime: timestamppb.Now(),
+			},
+		})
+		require.NoError(t, err)
+		// Pre-populate an active ticket in the state store before initializing the cold-start cache.
+		createResps := rep.SendUpdates([]*store.StateUpdate{
+			{
+				Cmd:   store.Ticket,
+				Value: string(ticketBytes),
+			},
+		})
+		require.Len(t, createResps, 1)
+		require.NoError(t, createResps[0].Err)
+		ticketID := createResps[0].Result
+
+		actResps := rep.SendUpdates([]*store.StateUpdate{
+			{Cmd: store.Activate, Key: ticketID},
+		})
+		require.Len(t, actResps, 1)
+		require.NoError(t, actResps[0].Err)
+
+		// Re-initialize the global cache as a freshly started instance that has not yet caught up.
+		tc.Init(localCfg, rep)
+		require.False(t, tc.IsCaughtUp())
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		port := lis.Addr().(*net.TCPAddr).Port
+
+		mmfSrv := &testChunkInspectingMMFServer{
+			matches: []*pb.Match{
+				{
+					Id: "e2e02-catchup-match",
+					Rosters: map[string]*pb.Roster{
+						"r": {
+							Name:    "r",
+							Tickets: []*pb.Ticket{{Id: ticketID}},
+						},
+					},
+				},
+			},
+		}
+		grpcSrv := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		qCtx, qCancel := context.WithCancel(context.Background())
+		outDone := make(chan struct{})
+		inDone := make(chan struct{})
+		defer func() {
+			qCancel()
+			<-outDone
+			<-inDone
+		}()
+
+		// Start the replication queues after a 30ms delay so InvokeMatchmakingFunctions
+		// enters tc.WaitForCatchUp while the cache is still cold (IsCaughtUp() == false).
+		go func() {
+			defer close(outDone)
+			tc.OutgoingReplicationQueue(qCtx)
+		}()
+		go func() {
+			defer close(inDone)
+			time.Sleep(30 * time.Millisecond)
+			tc.IncomingReplicationQueue(qCtx)
+		}()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.e2e02.coldstart",
+				Pools: map[string]*pb.Pool{
+					"coldstart_pool": {
+						Name: "coldstart_pool",
+						TagPresentFilters: []*pb.Pool_TagPresentFilter{
+							{Tag: "e2e02-coldstart"},
+						},
+					},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "e2e02-mmf",
+					Host: "127.0.0.1",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+		err = (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.NoError(t, err)
+		assert.True(t, tc.IsCaughtUp())
+
+		// Verify the MMF received the pre-existing active ticket (not an empty pool)
+		// and returned the match.
+		mmfSrv.mu.Lock()
+		require.Len(t, mmfSrv.receivedChunks, 1)
+		poolTickets := mmfSrv.receivedChunks[0].GetProfile().GetPools()["coldstart_pool"].GetParticipants().GetTickets()
+		mmfSrv.mu.Unlock()
+		require.Len(t, poolTickets, 1)
+		assert.Equal(t, ticketID, poolTickets[0].GetId())
+
+		stream.mu.Lock()
+		require.Len(t, stream.matches, 1)
+		assert.Equal(t, "e2e02-catchup-match", stream.matches[0].GetId())
+		stream.mu.Unlock()
+	})
+
+	t.Run("InvokeMMFsReturnsUnavailableWhenCatchUpTimesOutOrStreamCancelled", func(t *testing.T) {
+		stopGlobalTestTicketCache()
+		defer ensureGlobalTestTicketCache()
+
+		localCfg := config.Read()
+		tc.Init(localCfg, memoryReplicator.New(localCfg))
+		require.False(t, tc.IsCaughtUp())
+
+		shortCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.e2e02.timeout",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "e2e02-mmf",
+					Host: "127.0.0.1",
+					Port: 50051,
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: shortCtx}
+		err := (&grpcServer{}).InvokeMatchmakingFunctions(req, stream)
+		require.Error(t, err)
+		assert.Equal(t, codes.Unavailable, status.Code(err))
+		assert.Contains(t, err.Error(), "waiting for initial ticket cache replication catch-up")
+	})
+
+	t.Run("CloudRunManifestsConfigureNoCPUThrottlingGen2AndMinScale2", func(t *testing.T) {
+		serviceBytes, err := os.ReadFile("deploy/cloud_run/service.yaml")
+		require.NoError(t, err)
+		serviceContent := string(serviceBytes)
+		assert.Contains(t, serviceContent, "run.googleapis.com/cpu-throttling: 'false'")
+		assert.Contains(t, serviceContent, "run.googleapis.com/execution-environment: gen2")
+		assert.Contains(t, serviceContent, "autoscaling.knative.dev/minScale: '2'")
+
+		cloudbuildBytes, err := os.ReadFile("deploy/cloud_run/cloudbuild.yaml")
+		require.NoError(t, err)
+		cloudbuildContent := string(cloudbuildBytes)
+		assert.Contains(t, cloudbuildContent, "--no-cpu-throttling")
+		assert.Contains(t, cloudbuildContent, "--execution-environment")
+		assert.Contains(t, cloudbuildContent, "gen2")
+		assert.Contains(t, cloudbuildContent, "--min-instances")
+	})
+}
+

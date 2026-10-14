@@ -26,11 +26,13 @@ spec:
   template:
     metadata:
       annotations:
+        autoscaling.knative.dev/minScale: '2'
         autoscaling.knative.dev/maxScale: '100'
+        run.googleapis.com/cpu-throttling: 'false'
         run.googleapis.com/network-interfaces: '[{"network": "default", "subnetwork": "default"}]'
         run.googleapis.com/vpc-access-egress: all-traffic
         run.googleapis.com/startup-cpu-boost: 'true'
-        run.googleapis.com/execution-environment: gen1
+        run.googleapis.com/execution-environment: gen2
     spec:
       containerConcurrency: 1000 
       containers:

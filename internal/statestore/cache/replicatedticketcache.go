@@ -117,6 +117,13 @@ type ReplicatedTicketCache struct {
 	appliedReplId string
 	appliedNotify chan struct{}
 
+	// v2.1 - initial cache catch-up barrier so newly started or scaled-out
+	// instances do not serve InvokeMatchmakingFunctions against a cold or
+	// partially replayed ticket cache before IncomingReplicationQueue has
+	// polled and applied the initial state backlog from state storage.
+	catchUpOnce  sync.Once
+	catchUpReady chan struct{}
+
 	// v2.1 - applying replcation updates and expiring items from the ticket
 	// cache are now concurrent processes, so require a mutex when writing.
 	// Readers remain lock-free on sync.Map.
@@ -153,6 +160,47 @@ func (tc *ReplicatedTicketCache) Init(cfg *viper.Viper, r store.StateReplicator)
 	tc.inactiveInHeap = make(map[string]struct{})
 	tc.assignmentInHeap = make(map[string]struct{})
 	tc.appliedNotify = make(chan struct{})
+	tc.catchUpOnce = sync.Once{}
+	tc.catchUpReady = make(chan struct{})
+}
+
+// markCaughtUp closes tc.catchUpReady once to unblock any callers waiting on
+// initial replication catch-up.
+func (tc *ReplicatedTicketCache) markCaughtUp() {
+	tc.catchUpOnce.Do(func() {
+		if tc.catchUpReady != nil {
+			close(tc.catchUpReady)
+		}
+	})
+}
+
+// IsCaughtUp returns true if IncomingReplicationQueue has finished polling and
+// applying its initial state backlog from state storage.
+func (tc *ReplicatedTicketCache) IsCaughtUp() bool {
+	if tc.catchUpReady == nil {
+		return false
+	}
+	select {
+	case <-tc.catchUpReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// WaitForCatchUp blocks until IncomingReplicationQueue has completed its
+// initial catch-up poll and applied all initial backlog updates to the local
+// cache, or until ctx is cancelled.
+func (tc *ReplicatedTicketCache) WaitForCatchUp(ctx context.Context) error {
+	if tc.IsCaughtUp() {
+		return nil
+	}
+	select {
+	case <-tc.catchUpReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // New creates and initializes a ReplicatedTicketCache.
@@ -567,7 +615,30 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 	// and add updates to the channel to be processed as they come in
 	inBufSize := tc.Cfg.GetInt("OM_CACHE_IN_QUEUE_BUFFER_SIZE")
 	replStream := make(chan store.StateUpdate, inBufSize)
-	var wg sync.WaitGroup
+	// Track initial startup catch-up across the poller and applier goroutines so
+	// WaitForCatchUp only unblocks after the initial state store backlog has
+	// been both polled AND applied to the local ticket cache:
+	// - totalPolled (poller-local): cumulative updates read from GetUpdates().
+	// - totalApplied (atomic): cumulative updates applied via tc.applyUpdate().
+	// - catchUpTarget (atomic, initialized to -1): set once by the poller on the
+	//   first non-full poll (< OM_CACHE_IN_MAX_UPDATES_PER_POLL) to the total
+	//   number of updates that must be applied before marking the cache caught up.
+	// - catchUpWakeCh: 1-buffered signal so initial catch-up batches wake the
+	//   applier out of OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS immediately.
+	var (
+		wg            sync.WaitGroup
+		totalPolled   int64
+		totalApplied  int64
+		catchUpTarget atomic.Int64
+	)
+	catchUpTarget.Store(-1)
+	catchUpWakeCh := make(chan struct{}, 1)
+	wakeApplierForCatchUp := func() {
+		select {
+		case catchUpWakeCh <- struct{}{}:
+		default:
+		}
+	}
 	defer wg.Wait()
 
 	wg.Add(1)
@@ -600,7 +671,10 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 				otelCacheIncomingEmptyTimeouts.Add(ctx, 1)
 			}
 
-			isFullPoll := len(results) >= maxUpdatesPerPoll
+			// A poll is considered full when a positive maxUpdatesPerPoll limit is
+			// configured and GetUpdates() returned at least that many updates,
+			// indicating additional updates are likely still queued in state storage.
+			isFullPoll := maxUpdatesPerPoll > 0 && len(results) >= maxUpdatesPerPoll
 			if isFullPoll {
 				otelCacheIncomingFullPolls.Add(ctx, 1)
 			}
@@ -627,6 +701,32 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 			inBacklog := int64(len(replStream))
 			atomic.StoreInt64(&tc.incomingBacklogCount, inBacklog)
 			atomic.StoreInt64(&IncomingBacklogCount, inBacklog)
+
+			// Advance initial catch-up tracking:
+			// - A full poll (len(results) >= maxUpdatesPerPoll) means more initial
+			//   backlog may still be waiting in state storage; wake the applier so it
+			//   starts draining replStream immediately, and keep polling.
+			// - The first non-full poll (!isFullPoll) marks the end of the initial
+			//   state storage backlog. If no updates were polled at all (empty state
+			//   store on startup), mark the cache caught up immediately. Otherwise,
+			//   publish totalPolled to catchUpTarget, wake the applier, and check
+			//   whether the applier has already applied all totalPolled updates.
+			totalPolled += int64(len(results))
+			if !tc.IsCaughtUp() {
+				if !isFullPoll && catchUpTarget.Load() < 0 {
+					if totalPolled == 0 {
+						tc.markCaughtUp()
+					} else {
+						catchUpTarget.Store(totalPolled)
+						wakeApplierForCatchUp()
+						if atomic.LoadInt64(&totalApplied) >= totalPolled {
+							tc.markCaughtUp()
+						}
+					}
+				} else if len(results) > 0 {
+					wakeApplierForCatchUp()
+				}
+			}
 
 			// Determine the post-poll wait before issuing the next GetUpdates() call:
 			// - Full poll (len(results) >= maxUpdatesPerPoll): more updates are likely
@@ -702,11 +802,26 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 		sleepStart := time.Now()
 		if sleepMs > 0 {
 			sleepTimer := time.NewTimer(time.Millisecond * time.Duration(sleepMs))
-			select {
-			case <-ctx.Done():
-				sleepTimer.Stop()
-				return
-			case <-sleepTimer.C:
+			if tc.IsCaughtUp() {
+				select {
+				case <-ctx.Done():
+					sleepTimer.Stop()
+					return
+				case <-sleepTimer.C:
+				}
+			} else {
+				// While initial catch-up is still in progress, allow the poller to
+				// wake the applier immediately via catchUpWakeCh when initial backlog
+				// updates arrive, rather than stalling cold start for the full
+				// OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS interval.
+				select {
+				case <-ctx.Done():
+					sleepTimer.Stop()
+					return
+				case <-catchUpWakeCh:
+					sleepTimer.Stop()
+				case <-sleepTimer.C:
+				}
 			}
 		}
 		otelCacheIncomingApplySleep.Record(ctx, float64(time.Since(sleepStart).Microseconds())/1000.0)
@@ -719,6 +834,9 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 		applyStart := time.Now()
 		updateTimer := time.NewTimer(time.Millisecond * time.Duration(maxApplyMs))
 		var lastReplId string
+		// Track how many updates are applied in this batch cycle so totalApplied
+		// can be updated once per cycle after tc.recordApplied(lastReplId).
+		var appliedInCycle int64
 		appliedAny := false
 
 		var err error
@@ -806,6 +924,7 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 
 				tc.applyUpdate(&curUpdate, ticketPb, assignmentPb)
 				appliedAny = true
+				appliedInCycle++
 
 				if curUpdate.ReplId != "" {
 					lastReplId = curUpdate.ReplId
@@ -836,6 +955,15 @@ func (tc *ReplicatedTicketCache) IncomingReplicationQueue(ctx context.Context) {
 		atomic.StoreInt64(&IncomingBacklogCount, inBacklog)
 		if appliedAny {
 			tc.recordApplied(lastReplId)
+			// Publish the cumulative number of applied updates and check whether
+			// the initial catch-up target set by the poller has now been reached.
+			// Pairing atomic.AddInt64(&totalApplied, ...) here with
+			// catchUpTarget.Store(totalPolled) in the poller guarantees that
+			// whichever goroutine finishes second marks the cache caught up.
+			nowApplied := atomic.AddInt64(&totalApplied, appliedInCycle)
+			if target := catchUpTarget.Load(); target >= 0 && nowApplied >= target {
+				tc.markCaughtUp()
+			}
 		}
 		if ctx.Err() != nil {
 			return

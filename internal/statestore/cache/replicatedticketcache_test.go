@@ -1546,4 +1546,133 @@ func TestReplicationQueuesGracefulShutdownAndDrainOnContextCancel(t *testing.T) 
 	})
 }
 
+// TestIncomingReplicationQueueInitialCatchUp verifies Task E2E-02:
+//  1. A newly initialized ReplicatedTicketCache reports IsCaughtUp() == false
+//     until IncomingReplicationQueue completes its first non-full poll and applies
+//     all updates polled up to that point.
+//  2. When the state store is empty on startup, the first non-full poll marks the
+//     cache caught up immediately.
+//  3. When the state store has a multi-poll backlog on startup (spanning multiple
+//     full polls followed by a non-full poll), WaitForCatchUp wakes the applier out
+//     of OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS via catchUpWakeCh and only
+//     unblocks after all initial updates have been applied to the cache.
+//  4. WaitForCatchUp respects caller context cancellation / deadline expiration
+//     while initial catch-up is still pending.
+func TestIncomingReplicationQueueInitialCatchUp(t *testing.T) {
+	t.Run("EmptyStateStoreMarksCaughtUpImmediatelyOnFirstPoll", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5000)
+		cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 5000)
 
+		rep := &immediateEmptyReplicator{
+			validator: regexp.MustCompile(`^\d{13}-\d+$`),
+		}
+		tc := New(cfg, rep)
+		assert.False(t, tc.IsCaughtUp(), "newly initialized cache must not be marked caught up before first poll")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		inDone := make(chan struct{})
+		go func() {
+			defer close(inDone)
+			tc.IncomingReplicationQueue(ctx)
+		}()
+		defer func() {
+			cancel()
+			<-inDone
+		}()
+
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer waitCancel()
+		require.NoError(t, tc.WaitForCatchUp(waitCtx))
+		assert.True(t, tc.IsCaughtUp())
+	})
+
+	t.Run("MultiPollBacklogWaitsUntilAllInitialUpdatesAppliedAndWakesApplier", func(t *testing.T) {
+		cfg := config.Read()
+		cfg.Set("OM_CACHE_IN_MAX_UPDATES_PER_POLL", 2)
+		cfg.Set("OM_CACHE_IN_FULL_POLL_WAIT_MS", 5)
+		cfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5000)
+		cfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 5)
+		// Set sleep between apply batches to 5000ms so that after applying the first
+		// poll batch, the applier enters sleepTimer; catchUpWakeCh must wake the
+		// applier as soon as the poller reaches the non-full poll so WaitForCatchUp
+		// completes well within the 500ms timeout.
+		cfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5000)
+		cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 5000)
+
+		rep := memoryReplicator.New(cfg)
+		ticketBytes, err := proto.Marshal(&pb.Ticket{
+			Attributes: &pb.Ticket_FilterableData{CreationTime: timestamppb.Now()},
+		})
+		require.NoError(t, err)
+		// Pre-populate 5 updates in the replicator before starting IncomingReplicationQueue:
+		// 3 Ticket creations + 2 Activations (2 full polls of 2 updates + 1 partial poll of 1 update).
+		resps := rep.SendUpdates([]*store.StateUpdate{
+			{Cmd: store.Ticket, Value: string(ticketBytes)},
+			{Cmd: store.Ticket, Value: string(ticketBytes)},
+			{Cmd: store.Ticket, Value: string(ticketBytes)},
+		})
+		require.Len(t, resps, 3)
+		for _, r := range resps {
+			require.NoError(t, r.Err)
+		}
+		actResps := rep.SendUpdates([]*store.StateUpdate{
+			{Cmd: store.Activate, Key: resps[0].Result},
+			{Cmd: store.Activate, Key: resps[1].Result},
+		})
+		require.Len(t, actResps, 2)
+		for _, r := range actResps {
+			require.NoError(t, r.Err)
+		}
+
+		tc := New(cfg, rep)
+		assert.False(t, tc.IsCaughtUp())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		inDone := make(chan struct{})
+		go func() {
+			defer close(inDone)
+			tc.IncomingReplicationQueue(ctx)
+		}()
+		defer func() {
+			cancel()
+			<-inDone
+		}()
+
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer waitCancel()
+		require.NoError(t, tc.WaitForCatchUp(waitCtx))
+
+		// Immediately upon WaitForCatchUp returning nil, all 5 initial updates must already be applied.
+		assert.True(t, tc.IsCaughtUp())
+		assert.Equal(t, int64(3), tc.TicketCount())
+		assert.Equal(t, int64(2), tc.ActiveCount())
+		assert.Equal(t, int64(1), tc.InactiveCount())
+		snap := tc.SnapshotActiveTickets()
+		require.Len(t, snap, 2)
+		snapIDs := []string{snap[0].(*pb.Ticket).GetId(), snap[1].(*pb.Ticket).GetId()}
+		assert.ElementsMatch(t, []string{resps[0].Result, resps[1].Result}, snapIDs)
+	})
+
+	t.Run("WaitForCatchUpRespectsContextCancellationWhileBacklogPending", func(t *testing.T) {
+		cfg := config.Read()
+		tc := New(cfg, memoryReplicator.New(cfg))
+		assert.False(t, tc.IsCaughtUp())
+
+		shortCtx, shortCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer shortCancel()
+		err := tc.WaitForCatchUp(shortCtx)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.False(t, tc.IsCaughtUp())
+
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err = tc.WaitForCatchUp(cancelCtx)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.False(t, tc.IsCaughtUp())
+	})
+}
