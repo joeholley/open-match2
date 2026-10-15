@@ -4448,6 +4448,9 @@ func TestInvokeMMFsValidationMultiChunkFanOutErrorsAndEdgeCases(t *testing.T) {
 		deactCount, found := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "mixed-matches-mmf", "com.example.m11")
 		require.True(t, found)
 		assert.Equal(t, int64(1), deactCount)
+		matchCount, found := findInt64SumPointByMMF(rm, "om_core.match.received", "mixed-matches-mmf", "com.example.m11")
+		require.True(t, found)
+		assert.Equal(t, int64(1), matchCount, "om_core.match.received must only count matches with >= 1 valid ticket ID")
 	})
 
 	t.Run("FanInStreamSendErrorDrainsRemainingMatchesWithoutDeadlock", func(t *testing.T) {
@@ -5168,3 +5171,270 @@ func TestInvokeMMFsWaitsForInitialCacheCatchUpAndCloudRunConfig(t *testing.T) {
 	})
 }
 
+// TestInvokeMMFsEmptyAndInvalidTicketMatchesDoNotIncrementMatchCounter verifies Task E2E-03:
+//  1. When InvokeMatchmakingFunctions fans out to both a matchmaking MMF (mmf-fifo)
+//     and a diagnostic/no-op MMF (mmf-debug) that returns a StreamedMmfResponse
+//     with 0 rosters / 0 valid tickets (or nil Match / only invalid ticket IDs),
+//     otelMatches (om_core.match.received) only increments for matches containing
+//     at least one valid ticket ID that is deactivated and forwarded to the caller.
+//     Specifically, mmf-debug records om_core.match.received == 0 (not 1), and
+//     mmf-fifo records om_core.match.received == 2 (matching the 2 valid match
+//     proposals received on the InvokeMatchmakingFunctions stream).
+//  2. Tracking receivedAnyResponse separately from the valid match counter i
+//     ensures that if an HTTPS MMF streams an empty/no-op response (i == 0,
+//     receivedAnyResponse == true) and then fails mid-stream with Unauthenticated,
+//     InvokeMatchmakingFunctions does NOT treat the mid-stream error as an initial
+//     handshake auth rejection or re-open the stream.
+func TestInvokeMMFsEmptyAndInvalidTicketMatchesDoNotIncrementMatchCounter(t *testing.T) {
+	ensureGlobalTestTicketCache()
+
+	t.Run("FifoAndDebugMMFsOnlyCountValidMatchesInOtelMatches", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.e2e03_match_counter")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		ctx := context.Background()
+		var ticketIDs []string
+		for idx := 0; idx < 2; idx++ {
+			resp, err := createTicket(ctx, &tc, &pb.CreateTicketRequest{Ticket: &pb.Ticket{}})
+			require.NoError(t, err)
+			ticketIDs = append(ticketIDs, resp.GetTicketId())
+		}
+		t.Cleanup(func() {
+			_, _ = deactivateTickets(context.Background(), testLogger, &tc, &pb.DeactivateTicketsRequest{
+				TicketIds: ticketIDs,
+			})
+			require.Eventually(t, func() bool {
+				return len(tc.SnapshotActiveTickets()) == 0
+			}, 2*time.Second, 5*time.Millisecond)
+		})
+
+		_, err := activateTickets(ctx, testLogger, &tc, &pb.ActivateTicketsRequest{
+			TicketIds: ticketIDs,
+		})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 2
+		}, 2*time.Second, 5*time.Millisecond)
+
+		// Start mmf-fifo: returns 2 valid matches alongside 1 empty match, 1 nil match,
+		// and 1 match with only invalid ticket IDs.
+		lisFifo, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lisFifo.Close()
+		fifoPort := lisFifo.Addr().(*net.TCPAddr).Port
+
+		fifoSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id:      "fifo-empty-match",
+					Rosters: map[string]*pb.Roster{},
+				},
+				nil,
+				{
+					Id: "fifo-valid-match-1",
+					Rosters: map[string]*pb.Roster{
+						"team": {
+							Name:    "team",
+							Tickets: []*pb.Ticket{{Id: ticketIDs[0]}},
+						},
+					},
+				},
+				{
+					Id: "fifo-invalid-only-match",
+					Rosters: map[string]*pb.Roster{
+						"team": {
+							Name:    "team",
+							Tickets: []*pb.Ticket{{Id: "invalid-repl-id"}},
+						},
+					},
+				},
+				{
+					Id: "fifo-valid-match-2",
+					Rosters: map[string]*pb.Roster{
+						"team": {
+							Name:    "team",
+							Tickets: []*pb.Ticket{{Id: ticketIDs[1]}},
+						},
+					},
+				},
+			},
+		}
+		grpcFifo := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcFifo, fifoSrv)
+		go grpcFifo.Serve(lisFifo) //nolint:errcheck
+		defer grpcFifo.Stop()
+
+		// Start mmf-debug: returns a single diagnostic StreamedMmfResponse with 0 rosters / 0 tickets.
+		lisDebug, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lisDebug.Close()
+		debugPort := lisDebug.Addr().(*net.TCPAddr).Port
+
+		debugSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id:      "debug-diagnostic-noop-match",
+					Rosters: map[string]*pb.Roster{},
+				},
+			},
+		}
+		grpcDebug := grpc.NewServer()
+		pb.RegisterMatchMakingFunctionServiceServer(grpcDebug, debugSrv)
+		go grpcDebug.Serve(lisDebug) //nolint:errcheck
+		defer grpcDebug.Stop()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.e2e03.match_counter",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "mmf-fifo",
+					Host: "127.0.0.1",
+					Port: int32(fifoPort),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+				{
+					Name: "mmf-debug",
+					Host: "127.0.0.1",
+					Port: int32(debugPort),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: ctx}
+		require.NoError(t, (&grpcServer{}).InvokeMatchmakingFunctions(req, stream))
+
+		// Only the 2 valid matches from mmf-fifo must be streamed to the caller.
+		stream.mu.Lock()
+		gotIDs := make([]string, 0, len(stream.matches))
+		for _, m := range stream.matches {
+			gotIDs = append(gotIDs, m.GetId())
+		}
+		stream.mu.Unlock()
+		assert.ElementsMatch(t, []string{"fifo-valid-match-1", "fifo-valid-match-2"}, gotIDs)
+
+		// Both active tickets must be deactivated.
+		require.Eventually(t, func() bool {
+			return len(tc.SnapshotActiveTickets()) == 0
+		}, 2*time.Second, 5*time.Millisecond)
+
+		const expectedProfileAttr = "com.example.e2e03"
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(ctx, &rm))
+
+		fifoMatches, found := findInt64SumPointByMMF(rm, "om_core.match.received", "mmf-fifo", expectedProfileAttr)
+		require.True(t, found, "expected om_core.match.received data point for mmf-fifo")
+		assert.Equal(t, int64(2), fifoMatches, "mmf-fifo must only count the 2 valid matches, excluding empty/nil/invalid-ticket matches")
+
+		debugMatches, found := findInt64SumPointByMMF(rm, "om_core.match.received", "mmf-debug", expectedProfileAttr)
+		require.True(t, found, "expected om_core.match.received data point for mmf-debug")
+		assert.Equal(t, int64(0), debugMatches, "mmf-debug returning only an empty 0-ticket match must record 0 in om_core.match.received")
+
+		fifoDeacts, found := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "mmf-fifo", expectedProfileAttr)
+		require.True(t, found)
+		assert.Equal(t, int64(2), fifoDeacts)
+		_, debugDeactFound := findInt64SumPointByMMF(rm, "om_core.mmf.deactivations", "mmf-debug", expectedProfileAttr)
+		assert.False(t, debugDeactFound, "mmf-debug must not spawn a deactivation goroutine or record deactivations")
+	})
+
+	t.Run("HTTPSMidStreamUnauthenticatedAfterEmptyMatchDoesNotRetriggerInitialAuthRetry", func(t *testing.T) {
+		metricReader := sdkmetric.NewManualReader()
+		testMeterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricReader))
+		defer testMeterProvider.Shutdown(context.Background()) //nolint:errcheck
+		testMeter := testMeterProvider.Meter("open_match.core.e2e03_https_midstream")
+
+		prevMeter := meter
+		registerMetrics(&testMeter)
+		defer func() {
+			if prevMeter != nil {
+				registerMetrics(prevMeter)
+			}
+		}()
+
+		serverCreds, clientTLS := newLocalTestTLS(t)
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer lis.Close()
+		port := lis.Addr().(*net.TCPAddr).Port
+
+		// Stream 1 empty match (so i remains 0, but receivedAnyResponse becomes true)
+		// followed by a mid-stream codes.Unauthenticated error.
+		mmfSrv := &testMidStreamErrorMMFServer{
+			matches: []*pb.Match{
+				{
+					Id:      "initial-empty-noop-match",
+					Rosters: map[string]*pb.Roster{},
+				},
+			},
+			terminalErr: status.Error(codes.Unauthenticated, "simulated mid-stream unauthenticated error after first response"),
+		}
+		grpcSrv := grpc.NewServer(grpc.Creds(serverCreds))
+		pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfSrv)
+		go grpcSrv.Serve(lis) //nolint:errcheck
+		defer grpcSrv.Stop()
+
+		prevTLS := tlsConfig
+		prevTokens := mmfIDTokens
+		tlsConfig = clientTLS
+		var tokenSourceCalls atomic.Int32
+		mmfIDTokens = mmfauth.NewIDTokenCache(func(_ context.Context, audience string) (oauth2.TokenSource, error) {
+			tokenSourceCalls.Add(1)
+			return &staticSeqTokenSource{tokens: []string{"valid-token-1", "refreshed-token-2"}}, nil
+		})
+		defer func() {
+			tlsConfig = prevTLS
+			mmfIDTokens = prevTokens
+		}()
+
+		req := &pb.MmfRequest{
+			Profile: &pb.Profile{
+				Name: "com.example.e2e03.https_midstream",
+				Pools: map[string]*pb.Pool{
+					"all": {Name: "all"},
+				},
+			},
+			Mmfs: []*pb.MatchmakingFunctionSpec{
+				{
+					Name: "https-empty-then-unauth-mmf",
+					Host: "https://localhost",
+					Port: int32(port),
+					Type: pb.MatchmakingFunctionSpec_GRPC,
+				},
+			},
+		}
+
+		stream := &fakeInvokeMMFServerStream{ctx: context.Background()}
+		require.NoError(t, (&grpcServer{}).InvokeMatchmakingFunctions(req, stream))
+
+		// Because the MMF already sent one StreamedMmfResponse (receivedAnyResponse == true),
+		// the mid-stream Unauthenticated error must NOT trigger an auth token refresh/retry.
+		assert.Equal(t, int32(1), tokenSourceCalls.Load(), "mid-stream Unauthenticated after an empty match must not trigger initial auth token refresh")
+
+		const expectedProfileAttr = "com.example.e2e03"
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, metricReader.Collect(context.Background(), &rm))
+
+		matchesCount, found := findInt64SumPointByMMF(rm, "om_core.match.received", "https-empty-then-unauth-mmf", expectedProfileAttr)
+		require.True(t, found)
+		assert.Equal(t, int64(0), matchesCount)
+
+		failuresCount, found := findInt64SumPointByMMF(rm, "om_core.mmf.failures", "https-empty-then-unauth-mmf", expectedProfileAttr)
+		require.True(t, found)
+		assert.Equal(t, int64(1), failuresCount)
+	})
+}

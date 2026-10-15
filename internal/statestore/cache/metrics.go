@@ -71,6 +71,30 @@ var (
 	otelCacheAssignments     otelmetrics.Int64ObservableUpDownCounter
 	otelCacheIncomingBacklog otelmetrics.Int64ObservableUpDownCounter
 	otelCacheOutgoingBacklog otelmetrics.Int64ObservableUpDownCounter
+
+	// cacheDurationMsBuckets defines explicit histogram bucket boundaries (in
+	// milliseconds) for all millisecond-unit cache Float64Histogram instruments.
+	//
+	// Cache durations in ReplicatedTicketCache are recorded in fractional
+	// milliseconds via float64(time.Since(start).Microseconds()) / 1000.0 and
+	// frequently complete in sub-millisecond time (< 0.5 ms) for in-memory
+	// operations such as expiration sweeps, channel pushes, and small batch
+	// applies, while state storage polls or heavy backlogs can range up to
+	// multiple seconds.
+	//
+	// Without explicit bucket boundaries, the OpenTelemetry Go SDK uses its
+	// default histogram bucket boundaries:
+	//   [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
+	// When sub-millisecond observations (< 0.5 ms) land in the [0, 5] ms bucket
+	// (le="5"), Prometheus histogram_quantile(0.99, ...) linearly interpolates
+	// across [0, 5] and artificially reports p99 = 4.95 ms (0.99 * 5 ms),
+	// masking true sub-millisecond performance and regressions between 0.05 ms
+	// and 4.9 ms. Including sub-millisecond boundaries (0.05, 0.1, 0.25, 0.5, 1,
+	// 2.5 ms) alongside higher-latency boundaries up to 10,000 ms preserves both
+	// microsecond-scale quantile accuracy and multi-second tail visibility.
+	cacheDurationMsBuckets = []float64{
+		0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+	}
 )
 
 // RegisterMetrics registers the OpenTelemetry cache instruments on meterPointer
@@ -80,11 +104,13 @@ var (
 func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 	meter := *meterPointer
 	var err error
+	msBucketOpt := otelmetrics.WithExplicitBucketBoundaries(cacheDurationMsBuckets...)
 
 	otelCacheExpirationCycleDuration, err = meter.Float64Histogram(
 		metricsNamePrefix+"expiration.duration",
 		otelmetrics.WithDescription("Duration of cache expiration logic"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -150,6 +176,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"outgoing.queue.wait",
 		otelmetrics.WithDescription("Time an outgoing replication update spends queued and being sent before returning a response"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -159,6 +186,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"outgoing.send.duration",
 		otelmetrics.WithDescription("Duration of sending a batch of outgoing replication updates to state storage"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -192,6 +220,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"incoming.poll.duration",
 		otelmetrics.WithDescription("Duration of polling state storage for incoming replication updates"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -201,6 +230,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"incoming.poll.wait",
 		otelmetrics.WithDescription("Post-poll pause before the next incoming replication poll (OM_CACHE_IN_POLL_WAIT_MS after a partial poll, OM_CACHE_IN_FULL_POLL_WAIT_MS after a full poll, or any remaining OM_CACHE_IN_WAIT_TIMEOUT_MS if an empty poll returned early on error)"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -210,6 +240,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"incoming.queue.wait",
 		otelmetrics.WithDescription("Time the incoming poller spent pushing polled updates into the local replication channel"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -219,6 +250,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"incoming.apply.duration",
 		otelmetrics.WithDescription("Time spent applying incoming replication updates to the local cache per cycle"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -228,6 +260,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"incoming.apply.sleep",
 		otelmetrics.WithDescription("Time spent sleeping between incoming cache apply cycles (OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS after draining the queue, or OM_CACHE_IN_FULL_APPLY_SLEEP_MS after hitting OM_CACHE_IN_MAX_APPLY_DURATION_MS)"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -237,6 +270,7 @@ func RegisterMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"replication.lag",
 		otelmetrics.WithDescription("Time elapsed between when a state update is written to state storage and when it is applied to the local cache"),
 		otelmetrics.WithUnit("ms"),
+		msBucketOpt,
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

@@ -1250,11 +1250,20 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			// Wait for all match ticket deactivation goroutines to complete.
 			defer tdwg.Wait()
 
-			// i counts the number of results (which equates to matches
-			// received) for metrics reporting; this loop reads streaming
-			// match responses from the mmf and runs until a break
+			// i counts the number of valid matches received from the MMF (matches
+			// containing at least one valid ticket ID that will be deactivated and
+			// streamed back to the caller, excluding empty/no-op MMF responses) for
+			// otelMatches (om_core.match.received) metrics reporting; this loop
+			// reads streaming match responses from the mmf and runs until a break
 			// statement is encountered.
 			var i int64
+			// receivedAnyResponse tracks whether mmfStream.Recv() has returned at
+			// least one non-error StreamedMmfResponse, even if that response was an
+			// empty/no-op match that did not increment i. Tracking this separately
+			// from i ensures the initial HTTPS auth-rejection retry check below
+			// only triggers when the stream fails before the MMF sends any response
+			// at all, while keeping i strictly as the valid match counter.
+			receivedAnyResponse := false
 			// Track matches received from mmfs
 			defer func() {
 				otelMatches.Add(ctx, i, metric.WithAttributes(
@@ -1262,6 +1271,11 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					attribute.String("profile.name", profileName),
 				))
 			}()
+			// Hoist the deactivation stage logger and ticket ID validator outside
+			// the Recv() loop to avoid reallocating logrus.Fields/Entry on every
+			// streamed MMF response.
+			deactLogger := logger.WithFields(logrus.Fields{"stage": "deactivation"})
+			idValidator := tc.Replicator.GetReplIdValidator()
 			for {
 				// Get results from MMF
 				var result *pb.StreamedMmfResponse
@@ -1273,9 +1287,12 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					break
 				}
 				if err != nil { // MMF has an error
-					// If the MMF rejected our cached ID token before returning any matches,
-					// refresh the token once and re-open the stream.
-					if mmfUrl.Scheme == "https" && i == 0 && !retriedAuth && mmfauth.IsAuthRejection(err) {
+					// If the MMF rejected our cached ID token before returning any responses,
+					// refresh the token once and re-open the stream. We check
+					// !receivedAnyResponse rather than i == 0 because i only counts valid
+					// non-empty matches, whereas receiving even an empty/no-op response
+					// proves the initial stream authentication succeeded.
+					if mmfUrl.Scheme == "https" && !receivedAnyResponse && !retriedAuth && mmfauth.IsAuthRejection(err) {
 						retriedAuth = true
 						httpsLogger.Warnf("MMF rejected cached ID token (%v); refreshing token and retrying once", err)
 						refreshedToken, refreshErr := mmfIDTokens.Refresh(audience, token.AccessToken)
@@ -1299,6 +1316,47 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					))
 					return fmt.Errorf("%w", err)
 				}
+				receivedAnyResponse = true
+
+				resultCopy := result.GetMatch()
+
+				// Get ticket ids to deactivate from all rosters in this match.
+				// TODO: This section /could/ be optimized by
+				// de-duplicating tickets before sending them for
+				// deactivation, but we'd only expect big gains doing that
+				// if there are /lots/ of tickets appearing in multiple
+				// matches. Since we expect /most/ matchmakers to try and
+				// minimize collisions, it's likely a premature
+				// optimization to do this before we hear concrete feedback
+				// that it is a performance bottleneck.
+				ticketIdsToDeactivate := []string{}
+				for _, roster := range resultCopy.GetRosters() {
+					for _, ticket := range roster.GetTickets() {
+						id := ticket.GetId()
+						if idValidator != nil && !idValidator.MatchString(id) {
+							deactLogger.WithFields(logrus.Fields{
+								"match_id":  resultCopy.GetId(),
+								"ticket_id": id,
+							}).Errorf("Skipping invalid ticket ID in match response: %v", InvalidIdErr)
+							continue
+						}
+						ticketIdsToDeactivate = append(ticketIdsToDeactivate, id)
+					}
+				}
+
+				// Skip empty/no-op MMF responses (or matches where every ticket ID
+				// was invalid) before incrementing i (otelMatches / om_core.match.received)
+				// or spawning a ticket deactivation goroutine. Diagnostic MMFs (such as
+				// mmf-debug) or no-op responses with zero valid tickets are discarded
+				// and never forwarded on matchChan, so counting them would inflate
+				// om_core_match_received_total relative to actual match proposals.
+				if len(ticketIdsToDeactivate) == 0 {
+					deactLogger.WithFields(logrus.Fields{
+						"match_id": resultCopy.GetId(),
+						"reason":   "no tickets in match response",
+					}).Warn("Skipping deactivation for match with no tickets.")
+					continue
+				}
 				i++
 
 				// deactivate tickets & send match back to the matchmaker
@@ -1311,46 +1369,11 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				// consistent nature of om-core implementation means there
 				// is no feasible way to wait for replication to every
 				// instance.
-				resultCopy := result.GetMatch()
 				tdwg.Add(1)
-				go func(res *pb.Match) {
+				go func(res *pb.Match, ticketIdsToDeactivate []string) {
 					// Local logger with a flag to indicate logs are from this goroutine.
-					logger := logger.WithFields(logrus.Fields{"stage": "deactivation"})
+					logger := deactLogger
 					defer tdwg.Done()
-
-					// Get ticket ids to deactivate from all rosters in this match.
-					// TODO: This section /could/ be optimized by
-					// de-duplicating tickets before sending them for
-					// deactivation, but we'd only expect big gains doing that
-					// if there are /lots/ of tickets appearing in multiple
-					// matches. Since we expect /most/ matchmakers to try and
-					// minimize collisions, it's likely a premature
-					// optimization to do this before we hear concrete feedback
-					// that it is a performance bottleneck.
-					ticketIdsToDeactivate := []string{}
-					idValidator := tc.Replicator.GetReplIdValidator()
-					for _, roster := range res.GetRosters() {
-						for _, ticket := range roster.GetTickets() {
-							id := ticket.GetId()
-							if idValidator != nil && !idValidator.MatchString(id) {
-								logger.WithFields(logrus.Fields{
-									"match_id":  res.GetId(),
-									"ticket_id": id,
-								}).Errorf("Skipping invalid ticket ID in match response: %v", InvalidIdErr)
-								continue
-							}
-							ticketIdsToDeactivate = append(ticketIdsToDeactivate, id)
-						}
-					}
-
-					// Skipping deactivation for match with no tickets.
-					if len(ticketIdsToDeactivate) == 0 {
-						logger.WithFields(logrus.Fields{
-							"match_id": res.GetId(),
-							"reason":   "no tickets in match response",
-						}).Warn("Skipping deactivation for match with no tickets.")
-						return
-					}
 
 					deactivateMatchTickets := func(annotateOnTimeout bool) {
 						// Kick off deactivation
@@ -1419,7 +1442,7 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 						deactivateMatchTickets(false)
 						logger.Trace("ticket deactivations complete for previously returned match")
 					}
-				}(resultCopy) // End of match return & ticket deactivation goroutine
+				}(resultCopy, ticketIdsToDeactivate) // End of match return & ticket deactivation goroutine
 
 			} // End of match stream receiving loop
 

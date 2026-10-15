@@ -29,17 +29,24 @@ import (
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/metric/noop"
+	otelmetrics "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// TestMain initializes no-op OpenTelemetry cache metrics once before running
-// the package's unit tests and benchmarks.
+// testCacheMetricReader collects OpenTelemetry metrics recorded through the
+// package-level cache instruments registered once in TestMain.
+var testCacheMetricReader *sdkmetric.ManualReader
+
+// TestMain initializes OpenTelemetry cache metrics once before running the
+// package's unit tests and benchmarks so concurrent tests never race on the
+// package-level instrument variables.
 func TestMain(m *testing.M) {
-	meter := noop.NewMeterProvider().Meter("cache-test")
+	testCacheMetricReader = sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(testCacheMetricReader))
+	meter := provider.Meter("cache-test")
 	RegisterMetrics(&meter)
 	os.Exit(m.Run())
 }
@@ -1676,3 +1683,145 @@ func TestIncomingReplicationQueueInitialCatchUp(t *testing.T) {
 		assert.False(t, tc.IsCaughtUp())
 	})
 }
+
+// TestCacheDurationHistogramsHaveSubMillisecondBucketBoundaries verifies Task E2E-04:
+//  1. Every millisecond-unit Float64Histogram registered by RegisterMetrics in
+//     internal/statestore/cache/metrics.go is configured with explicit sub-millisecond
+//     bucket boundaries (cacheDurationMsBuckets: 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, ..., 10000 ms)
+//     rather than the coarse OpenTelemetry default [0, 5, 10, ...].
+//  2. Exercising real OutgoingReplicationQueue, IncomingReplicationQueue, and
+//     cache expiration cycles populates all 9 duration histograms with those
+//     exact bucket boundaries.
+//  3. Sub-millisecond observations (< 0.5 ms) land in fine-grained sub-millisecond
+//     buckets (<= 0.05, <= 0.1, <= 0.25, <= 0.5 ms) so Prometheus histogram_quantile
+//     does not linearly interpolate across a wide [0, 5] ms bucket.
+func TestCacheDurationHistogramsHaveSubMillisecondBucketBoundaries(t *testing.T) {
+	cfg := config.Read()
+	cfg.Set("OM_CACHE_OUT_WAIT_TIMEOUT_MS", 5)
+	cfg.Set("OM_CACHE_IN_WAIT_TIMEOUT_MS", 5)
+	cfg.Set("OM_CACHE_IN_POLL_WAIT_MS", 5)
+	cfg.Set("OM_CACHE_IN_FULL_POLL_WAIT_MS", 5)
+	cfg.Set("OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS", 5)
+	cfg.Set("OM_CACHE_EXPIRATION_INTERVAL_MS", 10)
+
+	rep := memoryReplicator.New(cfg)
+	tc := New(cfg, rep)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	outDone := make(chan struct{})
+	inDone := make(chan struct{})
+	go func() {
+		defer close(outDone)
+		tc.OutgoingReplicationQueue(ctx)
+	}()
+	go func() {
+		defer close(inDone)
+		tc.IncomingReplicationQueue(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-outDone
+		<-inDone
+	}()
+
+	// Enqueue a ticket creation through OutgoingReplicationQueue and wait for
+	// IncomingReplicationQueue to poll, enqueue, apply, and sleep, and for at
+	// least one cache expiration cycle to run.
+	ticketBytes, err := proto.Marshal(&pb.Ticket{
+		ExpirationTime: timestamppb.New(time.Now().Add(time.Hour)),
+		Attributes:     &pb.Ticket_FilterableData{CreationTime: timestamppb.Now()},
+	})
+	require.NoError(t, err)
+	resChan := make(chan *store.StateResponse, 1)
+	tc.UpRequests <- &UpdateRequest{
+		Ctx:         ctx,
+		ResultsChan: resChan,
+		EnqueuedAt:  time.Now(),
+		Update: store.StateUpdate{
+			Cmd:   store.Ticket,
+			Value: string(ticketBytes),
+		},
+	}
+	res := <-resChan
+	require.NotNil(t, res)
+	require.NoError(t, res.Err)
+
+	require.Eventually(t, func() bool {
+		return tc.TicketCount() == 1
+	}, time.Second, 5*time.Millisecond)
+	// Allow one expiration cycle (10ms) and one post-apply sleep (5ms) to record.
+	time.Sleep(25 * time.Millisecond)
+
+	expectedBounds := []float64{
+		0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+	}
+	assert.Equal(t, expectedBounds, cacheDurationMsBuckets)
+
+	expectedDurationHistograms := []string{
+		"om_core.cache.expiration.duration",
+		"om_core.cache.outgoing.queue.wait",
+		"om_core.cache.outgoing.send.duration",
+		"om_core.cache.incoming.poll.duration",
+		"om_core.cache.incoming.poll.wait",
+		"om_core.cache.incoming.queue.wait",
+		"om_core.cache.incoming.apply.duration",
+		"om_core.cache.incoming.apply.sleep",
+		"om_core.cache.replication.lag",
+	}
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, testCacheMetricReader.Collect(context.Background(), &rm))
+
+	foundHistograms := make(map[string]metricdata.HistogramDataPoint[float64], len(expectedDurationHistograms))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				continue
+			}
+			assert.Equal(t, "ms", m.Unit, "Float64Histogram %s must use 'ms' unit", m.Name)
+			require.NotEmpty(t, hist.DataPoints, "Float64Histogram %s must have recorded at least one observation", m.Name)
+			foundHistograms[m.Name] = hist.DataPoints[0]
+		}
+	}
+
+	for _, name := range expectedDurationHistograms {
+		dp, exists := foundHistograms[name]
+		require.True(t, exists, "expected Float64Histogram %s to be registered and recorded", name)
+		assert.Equal(t, expectedBounds, dp.Bounds, "Float64Histogram %s must use explicit sub-millisecond bucket boundaries", name)
+		assert.GreaterOrEqual(t, dp.Count, uint64(1), "Float64Histogram %s must have >= 1 observation", name)
+	}
+
+	// Verify sub-millisecond bucket placement on an isolated reader configured
+	// with cacheDurationMsBuckets:
+	// - 0.03 ms lands in BucketCounts[0] (<= 0.05 ms)
+	// - 0.20 ms lands in BucketCounts[2] ((0.1, 0.25] ms)
+	// - 0.45 ms lands in BucketCounts[3] ((0.25, 0.5] ms)
+	subMsReader := sdkmetric.NewManualReader()
+	subMsProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(subMsReader))
+	defer subMsProvider.Shutdown(context.Background()) //nolint:errcheck
+	subMsMeter := subMsProvider.Meter("open_match.cache.e2e04_subms_placement")
+	subMsHist, err := subMsMeter.Float64Histogram(
+		"om_core.cache.subms_test.duration",
+		otelmetrics.WithUnit("ms"),
+		otelmetrics.WithExplicitBucketBoundaries(cacheDurationMsBuckets...),
+	)
+	require.NoError(t, err)
+
+	subMsHist.Record(context.Background(), 0.03)
+	subMsHist.Record(context.Background(), 0.20)
+	subMsHist.Record(context.Background(), 0.45)
+
+	var subMsRM metricdata.ResourceMetrics
+	require.NoError(t, subMsReader.Collect(context.Background(), &subMsRM))
+	require.Len(t, subMsRM.ScopeMetrics, 1)
+	require.Len(t, subMsRM.ScopeMetrics[0].Metrics, 1)
+	subMsDP := subMsRM.ScopeMetrics[0].Metrics[0].Data.(metricdata.Histogram[float64]).DataPoints[0]
+	assert.Equal(t, expectedBounds, subMsDP.Bounds)
+	require.Len(t, subMsDP.BucketCounts, len(expectedBounds)+1)
+	assert.Equal(t, uint64(1), subMsDP.BucketCounts[0], "0.03 ms observation must land in bucket 0 (<= 0.05 ms)")
+	assert.Equal(t, uint64(0), subMsDP.BucketCounts[1], "bucket 1 ((0.05, 0.1] ms) must be empty")
+	assert.Equal(t, uint64(1), subMsDP.BucketCounts[2], "0.20 ms observation must land in bucket 2 ((0.1, 0.25] ms)")
+	assert.Equal(t, uint64(1), subMsDP.BucketCounts[3], "0.45 ms observation must land in bucket 3 ((0.25, 0.5] ms)")
+}
+

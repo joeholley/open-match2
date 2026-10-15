@@ -53,10 +53,69 @@ def audit_manifest(file_path: Path) -> list[str]:
     issues: list[str] = []
     lines = file_path.read_text(encoding="utf-8").splitlines()
 
+    has_otelcol_google_base = False
+    has_otelcol_contrib_base = False
+    has_otelcol_google_config = False
+    has_otelcol_contrib_config = False
+    entrypoint_line: tuple[int, str] | None = None
+    has_cmd_or_config_flag = False
+
+    is_knative_service = False
+    is_om_core_service = False
+    has_cpu_throttling_false = False
+    has_gen2_exec_env = False
+    min_scale_value: int | None = None
+
+    is_cloudbuild_run_deploy = False
+    has_no_cpu_throttling_flag = False
+    has_exec_env_gen2_flag = False
+    has_min_instances_flag = False
+
     for line_num, raw_line in enumerate(lines, start=1):
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+
+        if re.match(r"^apiVersion:\s*serving\.knative\.dev/v1\b", stripped):
+            is_knative_service = True
+        if re.match(r"^name:\s*['\"]?om-core['\"]?\b", stripped) or "_JOB_NAME: om-core" in stripped:
+            is_om_core_service = True
+        if re.search(r"run\.googleapis\.com/cpu-throttling:\s*['\"]?false['\"]?", stripped, re.IGNORECASE):
+            has_cpu_throttling_false = True
+        if re.search(r"run\.googleapis\.com/execution-environment:\s*['\"]?gen2['\"]?", stripped, re.IGNORECASE):
+            has_gen2_exec_env = True
+        min_scale_match = re.search(r"autoscaling\.knative\.dev/minScale:\s*['\"]?(\d+)['\"]?", stripped)
+        if min_scale_match:
+            min_scale_value = int(min_scale_match.group(1))
+
+        if stripped in ("- deploy", "deploy"):
+            is_cloudbuild_run_deploy = True
+        if "--no-cpu-throttling" in stripped:
+            has_no_cpu_throttling_flag = True
+        if "--execution-environment" in stripped:
+            has_exec_env_gen2_flag = True
+        if "--min-instances" in stripped:
+            has_min_instances_flag = True
+
+        if re.match(r"^FROM\b", stripped, re.IGNORECASE):
+            if "otelcol-google" in stripped:
+                has_otelcol_google_base = True
+            if "opentelemetry-collector-contrib" in stripped:
+                has_otelcol_contrib_base = True
+
+        if re.match(r"^(ADD|COPY)\b", stripped, re.IGNORECASE):
+            if re.search(r"\bconfig\.yaml\s+/etc/otelcol-google/config\.yaml\b", stripped):
+                has_otelcol_google_config = True
+            if re.search(r"\bconfig\.yaml\s+/etc/otelcol-contrib/config\.yaml\b", stripped):
+                has_otelcol_contrib_config = True
+
+        if re.match(r"^ENTRYPOINT\b", stripped, re.IGNORECASE):
+            entrypoint_line = (line_num, stripped)
+            if "--config" in stripped:
+                has_cmd_or_config_flag = True
+
+        if re.match(r"^CMD\b", stripped, re.IGNORECASE):
+            has_cmd_or_config_flag = True
 
         for placeholder in UNREPLACED_PLACEHOLDERS:
             if placeholder in stripped:
@@ -78,6 +137,48 @@ def audit_manifest(file_path: Path) -> list[str]:
                     issues.append(
                         f"{file_path}:{line_num}: '{var_name}' must be > 0 (got {val})"
                     )
+
+    if has_otelcol_google_base and not has_otelcol_google_config:
+        issues.append(
+            f"{file_path}: Dockerfile uses 'otelcol-google' base image but does not ADD/COPY config.yaml to /etc/otelcol-google/config.yaml"
+        )
+    if has_otelcol_contrib_base and not has_otelcol_contrib_config:
+        issues.append(
+            f"{file_path}: Dockerfile uses 'opentelemetry-collector-contrib' base image but does not ADD/COPY config.yaml to /etc/otelcol-contrib/config.yaml"
+        )
+    if (has_otelcol_google_base or has_otelcol_contrib_base) and entrypoint_line and not has_cmd_or_config_flag:
+        ep_line_num, ep_text = entrypoint_line
+        issues.append(
+            f"{file_path}:{ep_line_num}: Overriding ENTRYPOINT without CMD or --config clears the base collector image's default --config CMD: {ep_text}"
+        )
+
+    if is_knative_service and is_om_core_service:
+        if not has_cpu_throttling_false:
+            issues.append(
+                f"{file_path}: Cloud Run om-core Service must set run.googleapis.com/cpu-throttling: 'false' so background replication goroutines are not throttled between requests"
+            )
+        if not has_gen2_exec_env:
+            issues.append(
+                f"{file_path}: Cloud Run om-core Service should set run.googleapis.com/execution-environment: gen2"
+            )
+        if min_scale_value is None or min_scale_value < 1:
+            issues.append(
+                f"{file_path}: Cloud Run om-core Service must set autoscaling.knative.dev/minScale >= 1 (got {min_scale_value}) to keep warm instances with replicated ticket caches"
+            )
+
+    if is_cloudbuild_run_deploy and is_om_core_service:
+        if not has_no_cpu_throttling_flag:
+            issues.append(
+                f"{file_path}: Cloud Build gcloud run deploy for om-core must include --no-cpu-throttling"
+            )
+        if not has_exec_env_gen2_flag:
+            issues.append(
+                f"{file_path}: Cloud Build gcloud run deploy for om-core should include --execution-environment gen2"
+            )
+        if not has_min_instances_flag:
+            issues.append(
+                f"{file_path}: Cloud Build gcloud run deploy for om-core must include --min-instances"
+            )
 
     return issues
 

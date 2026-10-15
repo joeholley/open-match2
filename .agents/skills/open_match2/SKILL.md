@@ -164,12 +164,17 @@ python3 .agents/skills/open_match2/scripts/validate_deploy_config.py deploy/clou
 1. **Prerequisites**:
    - A VPC network (e.g., `default`) and a **Cloud Memorystore for Redis** instance reachable from that VPC (Direct VPC egress `all-traffic`). Configure `OM_REDIS_WRITE_HOST` to the primary IP and `OM_REDIS_READ_HOST` to the read replica IP (or primary IP if not using replicas).
    - A dedicated Service Account with the roles listed in `deploy/cloud_run/cloudrun-sa.iam` (`roles/compute.viewer`, `roles/iam.serviceAccountUser`, `roles/logging.bucketWriter`, `roles/redis.admin`, `roles/run.developer`, `roles/storage.admin`, `roles/vpcaccess.admin`, `roles/monitoring.metricWriter`).
+   - If building a custom `deploy/cloud_run/otel-collector-sidecar` image (`otelcol-google`), ensure `config.yaml` is copied to `/etc/otelcol-google/config.yaml` (not only `/etc/otelcol-contrib/config.yaml`) so the `googlemanagedprometheus` exporter is active.
+   - Always pass `--no-cpu-throttling` (`run.googleapis.com/cpu-throttling: 'false'`), `--execution-environment=gen2`, and `--min-instances=2` on `om-core` so background `IncomingReplicationQueue` (`XREAD`), `OutgoingReplicationQueue`, and `expireCacheEntries` goroutines are never CPU-throttled between HTTP requests.
 2. **Deploy via `gcloud run deploy` (or `gcloud run services replace`)**:
    ```bash
    gcloud run deploy om-core \
      --region="${REGION}" \
      --no-allow-unauthenticated \
      --concurrency=1000 \
+     --no-cpu-throttling \
+     --execution-environment=gen2 \
+     --min-instances=2 \
      --service-account="${OM_SERVICE_ACCOUNT}" \
      --network=default \
      --subnet=default \
