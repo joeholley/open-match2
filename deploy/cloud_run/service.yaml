@@ -16,8 +16,8 @@ apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
   annotations:
-    run.googleapis.com/ingress: all
-    run.googleapis.com/ingress-status: all
+    run.googleapis.com/ingress: internal
+    run.googleapis.com/ingress-status: internal
     run.googleapis.com/launch-stage: BETA
   labels:
     cloud.googleapis.com/location: us-central1
