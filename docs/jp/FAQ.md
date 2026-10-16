@@ -78,7 +78,7 @@ A: エッジケースや「いつまでも終わらない」キューを処理�
 Open Matchは、`OM_CACHE_TICKET_TTL_MS`による有効期限切れを以下の2つのレイヤーで処理します：
 
 * **ローカルキャッシュの有効期限切れ（`ReplicatedTicketCache`）**: 各`om-core`インスタンスは、有効期限のデッドライン順の最小ヒープ（min-heap）を使用して、チケット、非アクティブ状態、およびアサインメントの正確な有効期限を管理します。`OM_CACHE_EXPIRATION_INTERVAL_MS`（デフォルト`1000`ミリ秒）ごとに実行される各スキャンでは、実際に期限切れになったエントリのみを取り出します。大量の同時期限切れバーストが受信レプリケーション更新の適用を遅延させるのを防ぐため、1回のサイクルで削除されるエントリ数は最大`OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE`件（デフォルト`5000`件、小さなロックチャンク単位で処理）に制限され、残りの期限切れエントリは次のサイクルでクリーンアップされます。ローカルの有効期限切れ処理の状況は`om_core.cache.expiration.duration`、`om_core.cache.ticket.expirations`、および`om_core.cache.ticket.inactive.expirations`で監視できます。
-* **Redisストリームのトリミング（`om-replication`）**: 各送信書き込みバッチの末尾で、`om-core`は`XTRIM om-replication MINID ~ <threshold>`（`<threshold>`は`現在時刻 - OM_CACHE_TICKET_TTL_MS`）を実行します。近似トリミング（`~`）を使用することで、Redisは毎回の書き込みバッチでエントリ単位の書き換えオーバーヘッドを発生させることなく、基数ツリー（radix-tree）のマクロノード全体をO(1)で削除でき、一方で各`om-core`インスタンスのローカル最小ヒープがチケットごとの正確な有効期限切れを保証します。
+* **Redisストリームのトリミング（`om-replication`）**: 各送信書き込みバッチの末尾で、`om-core`は`XTRIM om-replication MINID ~ <threshold>`（`<threshold>`は`現在時刻 - OM_CACHE_TICKET_TTL_MS - OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS`）を実行します。近似トリミング（`~`）を使用することで、Redisは毎回の書き込みバッチでエントリ単位の書き換えオーバーヘッドを発生させることなく、基数ツリー（radix-tree）のマクロノード全体をO(1)で削除でき、一方で各`om-core`インスタンスのローカル最小ヒープがチケットごとの正確な有効期限切れを保証します。
 
 `OM_CACHE_TICKET_TTL_MS`を導き出すための実践的な例を挙げます：
 
