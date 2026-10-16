@@ -21,7 +21,7 @@ There is no `cloudbuild.yaml` or `Dockerfile` required for this. [Google Cloud's
 
 The following represent best practices but not required when doing a new release:
 
-* Go to [cloud.google.com](cloud.google.com) and open a clean Cloud Shell terminal. Run `go version` to find the version offered by default in Cloud Shell. Then kick off a Cloud Build using pack (as in the command above) and find the lines that specify the default version of Golang being used there.  You should see lines similar to this in the build logs:
+* Go to [cloud.google.com](https://cloud.google.com) and open a clean Cloud Shell terminal. Run `go version` to find the version offered by default in Cloud Shell. Then kick off a Cloud Build using pack (as in the command above) and find the lines that specify the default version of Golang being used there.  You should see lines similar to this in the build logs:
 ```
 Step #1: ===> BUILDING
 Step #1: [builder] target distro name/version labels not found, reading /etc/os-release file

@@ -2,7 +2,7 @@
 
 # Open Match 2 Telemetry
 
-Open Match 2 uses OpenTelemetry to emit detailed metrics on core operations, RPC calls, and cache performance, providing deep visibility into the matchmaking process.  Some of the provided metrics are provided out-of-the-box by golang modules om-core imports, and aren't covered in this document (i.e. rpc, etc).  We recommend you use OpenTelemetry to emit telemetry from the matchmaker you write against Open Match 2 as well \- for some examples of matchmaker telemetry, have a look at the [example in the open-match-ecosystem repository](https://github.com/googleforgames/open-match-ecosystem/tree/main/v2/METRICS.md).
+Open Match 2 uses OpenTelemetry to emit detailed metrics on core operations, RPC calls, and cache performance, providing deep visibility into the matchmaking process.  Some of the provided metrics are provided out-of-the-box by golang modules om-core imports, and aren't covered in this document (i.e. rpc, etc).  We recommend you use OpenTelemetry to emit telemetry from the matchmaker you write against Open Match 2 as well \- for some examples of matchmaker telemetry, have a look at the [example in the open-match-ecosystem repository](https://github.com/googleforgames/open-match-ecosystem/tree/main/v2/examples/README.md).
 
 ### **Enabling and Configuring OpenTelemetry for Open Match 2**
 
