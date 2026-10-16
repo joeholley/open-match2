@@ -44,11 +44,19 @@ steps:
     args:
       - run
       - deploy
-      # service config
+      # service config: disable CPU throttling, use gen2 execution environment,
+      # and keep at least 2 warm instances so background Redis Stream replication
+      # and cache expiration goroutines are never CPU-throttled between requests
+      # and warm instances maintain replicated ticket caches.
       - ${_JOB_NAME}
       - --no-allow-unauthenticated
       - --concurrency
       - "1000"
+      - --no-cpu-throttling
+      - --execution-environment
+      - gen2
+      - --min-instances
+      - "2"
       - --service-account
       - ${_SERVICE_ACCOUNT}
       - --region
@@ -62,7 +70,10 @@ steps:
       - --vpc-egress
       - all-traffic 
 
-      # ingress config
+      # ingress config: CI uses 'all' (authenticated via IAM) so the subsequent
+      # Cloud Build health-check step running in the default Cloud Build worker
+      # pool can reach the *.run.app endpoint; production deployments in
+      # deploy/cloud_run/ default to 'internal'.
       - --ingress
       - all
 

@@ -5453,3 +5453,44 @@ func TestOtelServiceVersion(t *testing.T) {
 	defer cancel()
 	_ = shutdown(shutdownCtx)
 }
+
+// TestCloudRunDeployConfigFlags verifies REL-12: ci.yaml,
+// deploy/cloud_run/cloudbuild.yaml, deploy/cloud_run/service.yaml, and
+// .agents/skills/open_match2/SKILL.md consistently configure CPU throttling
+// disabled, gen2 execution environment, min-instances / minScale of 2, and
+// internal ingress in production deploy templates / SKILL.md.
+func TestCloudRunDeployConfigFlags(t *testing.T) {
+	ciBytes, err := os.ReadFile("ci.yaml")
+	require.NoError(t, err)
+	ciText := string(ciBytes)
+	assert.Contains(t, ciText, "--no-cpu-throttling")
+	assert.Contains(t, ciText, "--execution-environment\n      - gen2")
+	assert.Contains(t, ciText, "--min-instances\n      - \"2\"")
+	assert.Contains(t, ciText, "--ingress\n      - all")
+
+	cbBytes, err := os.ReadFile("deploy/cloud_run/cloudbuild.yaml")
+	require.NoError(t, err)
+	cbText := string(cbBytes)
+	assert.Contains(t, cbText, "--no-cpu-throttling")
+	assert.Contains(t, cbText, "--execution-environment\n      - gen2")
+	assert.Contains(t, cbText, "--min-instances\n      - \"2\"")
+	assert.Contains(t, cbText, "--ingress\n      - internal")
+
+	svcBytes, err := os.ReadFile("deploy/cloud_run/service.yaml")
+	require.NoError(t, err)
+	svcText := string(svcBytes)
+	assert.Contains(t, svcText, "run.googleapis.com/cpu-throttling: 'false'")
+	assert.Contains(t, svcText, "run.googleapis.com/execution-environment: gen2")
+	assert.Contains(t, svcText, "autoscaling.knative.dev/minScale: '2'")
+	assert.Contains(t, svcText, "run.googleapis.com/ingress: internal")
+
+	skillBytes, err := os.ReadFile(".agents/skills/open_match2/SKILL.md")
+	require.NoError(t, err)
+	skillText := string(skillBytes)
+	assert.Contains(t, skillText, "--no-cpu-throttling")
+	assert.Contains(t, skillText, "--execution-environment=gen2")
+	assert.Contains(t, skillText, "--min-instances=2")
+	assert.Contains(t, skillText, "--ingress=internal")
+	assert.NotContains(t, skillText, "--ingress=all")
+}
+
