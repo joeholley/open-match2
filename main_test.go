@@ -5438,3 +5438,18 @@ func TestInvokeMMFsEmptyAndInvalidTicketMatchesDoNotIncrementMatchCounter(t *tes
 		assert.Equal(t, int64(1), failuresCount)
 	})
 }
+
+// TestOtelServiceVersion verifies REL-06: the OpenTelemetry service.version
+// resource attribute constant is updated to "2.1.0" and initializeOtel returns
+// a valid Meter pointer and shutdown function.
+func TestOtelServiceVersion(t *testing.T) {
+	assert.Equal(t, "2.1.0", serviceVersion)
+
+	meterPtr, shutdown := initializeOtel()
+	require.NotNil(t, meterPtr)
+	require.NotNil(t, shutdown)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = shutdown(shutdownCtx)
+}

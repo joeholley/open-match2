@@ -30,7 +30,13 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
-const metricsNamePrefix = "om_core."
+const (
+	metricsNamePrefix = "om_core."
+
+	// serviceVersion is the default OpenTelemetry service.version resource
+	// attribute reported by initializeOtel and initializeOtelWithLocalProm.
+	serviceVersion = "2.1.0"
+)
 
 var (
 	otelLogger = logrus.WithFields(logrus.Fields{
@@ -79,15 +85,16 @@ func initializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 		context.Background(),
 		// Use the GCP resource detector to detect information about the GCP platform
 		resource.WithDetectors(gcp.NewDetector()),
-		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
-		resource.WithFromEnv(),
 		// Discover and provide information about the OpenTelemetry SDK used.
 		resource.WithTelemetrySDK(),
-		// Open Match attributes
+		// Default Open Match attributes (service.name="open_match", service.version=serviceVersion);
+		// placed before resource.WithFromEnv() so OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME can override them.
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String("open_match"),
-			semconv.ServiceVersionKey.String("2.0.0"),
+			semconv.ServiceVersionKey.String(serviceVersion),
 		),
+		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
+		resource.WithFromEnv(),
 	)
 	if errors.Is(err, resource.ErrPartialResource) || errors.Is(err, resource.ErrSchemaURLConflict) {
 		otelLogger.Println(err) // Log non-fatal issues.
@@ -123,15 +130,16 @@ func initializeOtelWithLocalProm() (*otelmetrics.Meter, func(context.Context) er
 		context.Background(),
 		// Use the GCP resource detector to detect information about the GCP platform
 		resource.WithDetectors(gcp.NewDetector()),
-		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
-		resource.WithFromEnv(),
 		// Discover and provide information about the OpenTelemetry SDK used.
 		resource.WithTelemetrySDK(),
-		// Open Match attributes
+		// Default Open Match attributes (service.name="open_match", service.version=serviceVersion);
+		// placed before resource.WithFromEnv() so OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME can override them.
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String("open_match"),
-			semconv.ServiceVersionKey.String("2.0.0"),
+			semconv.ServiceVersionKey.String(serviceVersion),
 		),
+		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
+		resource.WithFromEnv(),
 	)
 	if errors.Is(err, resource.ErrPartialResource) || errors.Is(err, resource.ErrSchemaURLConflict) {
 		otelLogger.Println(err) // Log non-fatal issues.
