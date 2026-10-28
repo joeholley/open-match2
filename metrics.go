@@ -304,7 +304,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	// 14. om_core.match.received
 	otelMatches, err = meter.Int64Counter(
 		metricsNamePrefix+"match.received",
-		otelmetrics.WithDescription("Number of matches received from Matchmaking Functions (MMFs)"),
+		otelmetrics.WithDescription("Number of matches received from Matchmaking Functions (MMFs) and returned to the caller; attribute match.has_tickets indicates whether the match had any valid ticket IDs"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

@@ -32,7 +32,7 @@ These metrics are defined in `metrics.go` and provide insights into the overall 
 | `om_core.profile.pools` | Number of pools in the profile provided to the InvokeMatchmakingFunctions() call. | count |
 | `om_core.mmf.failures` | Number of MMF failures. | count |
 | `om_core.mmf.deactivations` | Number of deactivations due to tickets being returned in matches by MMFs. | count |
-| `om_core.match.received` | Total matches received from MMFs. | count |
+| `om_core.match.received` | Total matches received from MMFs (all of which are returned to the caller). Attribute `match.has_tickets` is `true` for matches with at least one valid ticket ID and `false` for matches with none (e.g. diagnostic matches, or responses with no match). | count |
 | `om_core.mmf.prep.duration` | Time spent snapshotting active tickets, filtering pools, and chunking requests in InvokeMatchmakingFunctions before invoking MMFs. | ms |
 | `om_core.mmf.deactivation.wait` | Time spent waiting for match ticket deactivations to replicate to the local cache. | ms |
 | `om_core.mmf.deactivation.timeouts` | Number of times waiting for match ticket deactivations to replicate to the local cache timed out. | count |

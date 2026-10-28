@@ -133,7 +133,7 @@ All 9 millisecond duration histograms in `internal/statestore/cache` use explici
 | 11 | `om_core.mmf.calls` | `Int64Counter` | *(none)* | N/A | `Number of Matchmaking Function (MMF) calls made` |
 | 12 | `om_core.mmf.failures` | `Int64Counter` | *(none)* | N/A | `Number of Matchmaking Function (MMF) calls that returned an error` |
 | 13 | `om_core.mmf.ticket.deactivations` | `Int64Counter` | *(none)* | N/A | `Number of ticket deactivations initiated on behalf of Matchmaking Functions (MMFs)` |
-| 14 | `om_core.match.received` | `Int64Counter` | *(none)* | N/A | `Number of matches received from Matchmaking Functions (MMFs)` |
+| 14 | `om_core.match.received` | `Int64Counter` | *(none)* | N/A | `Number of matches received from Matchmaking Functions (MMFs) and returned to the caller; attribute match.has_tickets indicates whether the match had any valid ticket IDs` |
 | 15 | `om_core.mmf.prep.duration` | `Float64Histogram` | `ms` | SDK default | `Time spent snapshotting active tickets, filtering pools, and chunking requests in InvokeMatchmakingFunctions before invoking MMFs` |
 | 16 | `om_core.mmf.deactivation.wait` | `Float64Histogram` | `ms` | SDK default | `Time spent waiting for match ticket deactivations to replicate to the local cache` |
 | 17 | `om_core.mmf.deactivation.timeouts` | `Int64Counter` | *(none)* | N/A | `Number of times waiting for match ticket deactivations to replicate to the local cache timed out` |
