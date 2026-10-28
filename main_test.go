@@ -3254,6 +3254,81 @@ func TestFailedDeactivationWritesReportedOnlyWhenWaitingForDeactivation(t *testi
 	}
 }
 
+func mustBytesAny(t *testing.T, data []byte) *anypb.Any {
+	t.Helper()
+	wrapped, err := anypb.New(wrapperspb.Bytes(data))
+	require.NoError(t, err)
+	return wrapped
+}
+
+// Scenario 23d: MMF Request Chunks Respect the 4 MiB Soft Limit
+func TestMmfRequestChunksRespectFourMiBSoftLimit(t *testing.T) {
+	sampleTickets := []*pb.Ticket{
+		{Id: "1-1"},
+		{
+			Id:         "1730000000000-123",
+			Attributes: &pb.Ticket_FilterableData{Tags: []string{"a", "b"}},
+		},
+		{
+			Id:         "x",
+			Extensions: map[string]*anypb.Any{"big": mustBytesAny(t, make([]byte, 300))},
+		},
+	}
+	for _, tk := range sampleTickets {
+		oneTicketRoster := &pb.Roster{Name: "r", Tickets: []*pb.Ticket{tk}}
+		twoTicketRoster := &pb.Roster{Name: "r", Tickets: []*pb.Ticket{tk, tk}}
+		assert.Equal(t, proto.Size(twoTicketRoster)-proto.Size(oneTicketRoster), encodedRosterTicketSize(tk))
+	}
+
+	profile := &pb.Profile{
+		Name: "com.example.softlimit",
+		Pools: map[string]*pb.Pool{
+			"everyone":       {Name: "everyone"},
+			"everyone-again": {Name: "everyone-again"},
+			"nobody": {
+				Name:              "nobody",
+				TagPresentFilters: []*pb.Pool_TagPresentFilter{{Tag: "no-such-tag"}},
+			},
+		},
+	}
+	validPools := map[string][]*pb.Ticket{
+		"everyone":       {},
+		"everyone-again": {},
+		"nobody":         {},
+	}
+
+	const totalTickets = 600_000
+	activeSnapshot := make(map[any]any, totalTickets)
+	for idx := 0; idx < totalTickets; idx++ {
+		id := strconv.Itoa(idx/1000) + "-" + strconv.Itoa(idx%1000)
+		activeSnapshot[id] = &pb.Ticket{Id: id}
+	}
+
+	packedChunks := packPoolTicketChunks(profile, validPools, activeSnapshot)
+	chunkRequests := getChunkedRequests(profile, packedChunks)
+
+	require.Greater(t, len(chunkRequests), 1)
+
+	var everyoneTotal, everyoneAgainTotal, nobodyTotal int
+	for idx, chunk := range chunkRequests {
+		chunkBytes := proto.Size(chunk)
+		assert.LessOrEqual(t, chunkBytes, mmfChunkSoftLimitBytes, "chunk %d exceeded 4 MiB soft limit", idx)
+		if idx < len(chunkRequests)-1 {
+			assert.Greater(t, chunkBytes, mmfChunkFillTargetBytes-1000, "non-final chunk %d was not filled close to target", idx)
+		}
+
+		pools := chunk.GetProfile().GetPools()
+		require.Len(t, pools, 3)
+		everyoneTotal += len(pools["everyone"].GetParticipants().GetTickets())
+		everyoneAgainTotal += len(pools["everyone-again"].GetParticipants().GetTickets())
+		nobodyTotal += len(pools["nobody"].GetParticipants().GetTickets())
+	}
+
+	assert.Equal(t, totalTickets, everyoneTotal)
+	assert.Equal(t, totalTickets, everyoneAgainTotal)
+	assert.Equal(t, 0, nobodyTotal)
+}
+
 // Scenario 24: OpenTelemetry Service Version Verification
 func TestOpenTelemetryServiceVersionAndInitializer(t *testing.T) {
 	assert.Equal(t, "2.1.0", serviceVersion)

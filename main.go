@@ -737,6 +737,82 @@ enqueueLoop:
 // Matchmaking Helpers (Chunking, URL Parsing, Deactivation Wait)
 //----------------------------------------------------------------------------------
 
+const (
+	// mmfChunkSoftLimitBytes is the 4 MiB soft limit every message om-core sends to an MMF
+	// must stay under. It is gRPC's default maximum received message size; some middleware
+	// (proxies, service meshes, load balancers) enforces the same limit and silently
+	// discards larger messages. Staying under it means MMFs work with default gRPC settings
+	// and through that middleware without anyone raising limits.
+	mmfChunkSoftLimitBytes = 4 * 1024 * 1024
+
+	// mmfChunkFillTargetBytes is the size each chunk is filled up to. Ticket and pool bytes
+	// counted are exact (measured from the generated protobuf messages), but the length
+	// prefixes of enclosing messages (the profile, each pool map entry, each pool, each
+	// pool's participant roster) are measured while those messages are empty and can each
+	// grow by a few bytes as their varint length prefixes widen while the chunk fills. The
+	// 194,304-byte difference between the target and the soft limit leaves far more room
+	// than that growth can use.
+	mmfChunkFillTargetBytes = 4 * 1000 * 1000
+)
+
+// poolParticipantRosterName returns the name of the roster holding a pool's tickets
+// in requests sent to MMFs.
+func poolParticipantRosterName(poolName string) string {
+	return poolName + "_roster"
+}
+
+// encodedRosterTicketSize returns the serialized size of a single ticket inside a
+// Roster's repeated tickets field (the ticket's bytes plus the field tag and length
+// prefix for one element of a repeated message field). It is measured with the generated
+// protobuf message rather than computed from hardcoded field numbers or wire-format
+// constants, so it stays correct if the protobuf definitions change.
+func encodedRosterTicketSize(ticket *pb.Ticket) int {
+	return proto.Size(&pb.Roster{Tickets: []*pb.Ticket{ticket}}) - proto.Size(&pb.Roster{})
+}
+
+// packPoolTicketChunks filters the active tickets into the profile's valid pools and
+// splits the result into chunks that each serialize (with the rest of the request, as
+// built by getChunkedRequests) to less than mmfChunkSoftLimitBytes. Every chunk contains
+// every valid pool (possibly empty) plus a portion of the pools' tickets; MMFs
+// re-assemble pools with a simple loop and concatenation over all chunks.
+func packPoolTicketChunks(reqProfile *pb.Profile, validPools map[string][]*pb.Ticket, activeTickets map[any]any) []map[string][]*pb.Ticket {
+	emptyChunk := getChunkedRequests(reqProfile, nil)[0]
+	emptyChunk.NumChunks = math.MaxInt32
+	emptyChunkSize := proto.Size(emptyChunk)
+	curChunkSize := emptyChunkSize
+
+	initialChunk := make(map[string][]*pb.Ticket, len(validPools))
+	maps.Copy(initialChunk, validPools)
+	chunkedPools := []map[string][]*pb.Ticket{initialChunk}
+	chunkIndex := 0
+
+	profilePools := reqProfile.GetPools()
+	for _, rawTicket := range activeTickets {
+		t, ok := rawTicket.(*pb.Ticket)
+		if !ok || t == nil {
+			continue
+		}
+		ticketSize := -1
+		for poolName := range validPools {
+			if !filter.In(profilePools[poolName], t) {
+				continue
+			}
+			if ticketSize < 0 {
+				ticketSize = encodedRosterTicketSize(t)
+			}
+			if curChunkSize+ticketSize > mmfChunkFillTargetBytes {
+				curChunkSize = emptyChunkSize
+				chunkIndex++
+				chunkedPools = append(chunkedPools, map[string][]*pb.Ticket{})
+			}
+			chunkedPools[chunkIndex][poolName] = append(chunkedPools[chunkIndex][poolName], t)
+			curChunkSize += ticketSize
+		}
+	}
+
+	return chunkedPools
+}
+
 func getChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*pb.Ticket) []*pb.ChunkedMmfRunRequest {
 	if len(chunkedPools) == 0 {
 		chunkedPools = []map[string][]*pb.Ticket{{}}
@@ -765,7 +841,7 @@ func getChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*pb.
 				participantRoster = []*pb.Ticket{}
 			}
 			poolCopy.Participants = &pb.Roster{
-				Name:    name + "_roster",
+				Name:    poolParticipantRosterName(name),
 				Tickets: participantRoster,
 			}
 			pools[name] = poolCopy
@@ -778,7 +854,7 @@ func getChunkedRequests(reqProfile *pb.Profile, chunkedPools []map[string][]*pb.
 			if valid, _ := filter.ValidatePoolFilters(srcPool); valid {
 				poolCopy := proto.Clone(srcPool).(*pb.Pool)
 				poolCopy.Participants = &pb.Roster{
-					Name:    name + "_roster",
+					Name:    poolParticipantRosterName(name),
 					Tickets: []*pb.Ticket{},
 				}
 				pools[name] = poolCopy
@@ -1130,51 +1206,22 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 		}
 	}
 
-	// Perform filtering, and 'chunk' the pools into 4mb pieces for streaming
-	// (4mb is default max pb size.)
-	// 1000 instead of 1024 for a little extra headroom, we're not trying to
-	// hyper-optimize here. Every chunk contains the entire profile, and a
-	// portion of the tickets in that profile's pools.
-	maxPbSize := 4 * 1000 * 1000
-	// Figure out how big the message is with the profile populated, but all pools empty
-	emptyChunkSize := proto.Size(&pb.ChunkedMmfRunRequest{Profile: req.GetProfile(), NumChunks: math.MaxInt32})
-	curChunkSize := emptyChunkSize
-
-	// Array of 'chunks', each consisting of a portion of the pools in this profile.
-	// MMFs need to re-assemble the pools with a simple loop+concat over all chunks.
-	// Seed chunk 0 with validPools so valid empty pools are retained.
-	var chunkCount int32
-	chunkedPools := make([]map[string][]*pb.Ticket, 0, 1)
-	initialChunk := make(map[string][]*pb.Ticket, len(validPools))
-	for name, tickets := range validPools {
-		initialChunk[name] = tickets
-	}
-	chunkedPools = append(chunkedPools, initialChunk)
-
-	for _, ticket := range activeTickets {
-		t, ok := ticket.(*pb.Ticket)
-		if !ok || t == nil {
-			continue
-		}
-		for name := range validPools {
-			// All the implementation details of filtering are in github.com/googleforgames/open-match2/v2/internal/filter/filter.go
-			if filter.In(req.GetProfile().GetPools()[name], t) {
-				ticketSize := proto.Size(t)
-				// Check if this ticket will put us over the max pb size for this chunk
-				if (curChunkSize + ticketSize) >= maxPbSize {
-					// Start a new chunk
-					curChunkSize = emptyChunkSize
-					chunkCount++
-					chunkedPools = append(chunkedPools, map[string][]*pb.Ticket{})
-				}
-				chunkedPools[chunkCount][name] = append(chunkedPools[chunkCount][name], t)
-				curChunkSize += ticketSize
-			}
-		}
-	}
+	// Filter active tickets into the pools and chunk them into pieces that each
+	// stay under the 4 MiB gRPC message soft limit.
+	chunkedPools := packPoolTicketChunks(req.GetProfile(), validPools, activeTickets)
 
 	logger.Debugf("%v pools packed into %v chunks", len(validPools), len(chunkedPools))
 	chunkedRequest := getChunkedRequests(req.GetProfile(), chunkedPools)
+
+	// Packing should always keep every chunk under the limit; if it ever doesn't
+	// (for example after a protobuf change), log it loudly since some middleware
+	// silently drops larger messages.
+	for chunkIndex, chunk := range chunkedRequest {
+		if chunkSize := proto.Size(chunk); chunkSize > mmfChunkSoftLimitBytes {
+			logger.Errorf("MMF request chunk %d is %d bytes, over the %d byte gRPC message soft limit; some gRPC middleware may drop it",
+				chunkIndex, chunkSize, mmfChunkSoftLimitBytes)
+		}
+	}
 
 	prepElapsedMs := float64(time.Since(prepStart).Microseconds()) / 1000.0
 	if prepElapsedMs < 0 {
