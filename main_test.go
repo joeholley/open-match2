@@ -64,6 +64,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -827,6 +828,148 @@ func sumInt64CounterByAttr(t *testing.T, snap *testMeterSnapshot, name, attrKey,
 	t.Helper()
 	rm := collectMetrics(t, snap)
 	return rawSumInt64CounterByAttr(rm, name, attrKey, attrVal) - rawSumInt64CounterByAttr(snap.baseline, name, attrKey, attrVal)
+}
+
+func rawSumInt64CounterByAttrs(rm metricdata.ResourceMetrics, name string, expectedAttrs map[string]string) int64 {
+	m, ok := findMetricByName(rm, name)
+	if !ok {
+		return 0
+	}
+	sumData, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		return 0
+	}
+	var total int64
+dataPointLoop:
+	for _, dp := range sumData.DataPoints {
+		for k, wantVal := range expectedAttrs {
+			val, found := dp.Attributes.Value(attribute.Key(k))
+			if !found || val.Emit() != wantVal {
+				continue dataPointLoop
+			}
+		}
+		total += dp.Value
+	}
+	return total
+}
+
+func sumInt64CounterByAttrs(t *testing.T, snap *testMeterSnapshot, name string, expectedAttrs map[string]string) int64 {
+	t.Helper()
+	rm := collectMetrics(t, snap)
+	return rawSumInt64CounterByAttrs(rm, name, expectedAttrs) - rawSumInt64CounterByAttrs(snap.baseline, name, expectedAttrs)
+}
+
+func sumMatchesReceived(t *testing.T, snap *testMeterSnapshot, mmfName string, hasTickets bool) int64 {
+	t.Helper()
+	return sumInt64CounterByAttrs(t, snap, "om_core.match.received", map[string]string{
+		"mmf.name":          mmfName,
+		"match.has_tickets": strconv.FormatBool(hasTickets),
+	})
+}
+
+func assertMmfFailureStatus(t *testing.T, err error, totalMmfs int, expectedFailedMmfNames []string) {
+	t.Helper()
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok, "expected gRPC status error, got %T: %v", err, err)
+	assert.Equal(t, codes.Internal, st.Code())
+	assert.Contains(t, st.Message(), fmt.Sprintf("%d of %d matchmaking functions failed", len(expectedFailedMmfNames), totalMmfs))
+
+	var actualFailedNames []string
+	for _, detail := range st.Details() {
+		info, isErrorInfo := detail.(*errdetails.ErrorInfo)
+		if !isErrorInfo {
+			continue
+		}
+		assert.Equal(t, mmfFailureErrorInfoReason, info.GetReason())
+		assert.Equal(t, mmfFailureErrorInfoDomain, info.GetDomain())
+		md := info.GetMetadata()
+		assert.NotEmpty(t, md["grpc_code"])
+		assert.NotEmpty(t, md["message"])
+		assert.Contains(t, st.Message(), fmt.Sprintf("%s: %s", md["mmf_name"], md["message"]))
+		actualFailedNames = append(actualFailedNames, md["mmf_name"])
+	}
+	assert.ElementsMatch(t, expectedFailedMmfNames, actualFailedNames)
+}
+
+func decodeMatchInvalidTicketIds(t *testing.T, match *pb.Match) ([]string, bool) {
+	t.Helper()
+	extAny, ok := match.GetExtensions()[MatchInvalidTicketIdsExtensionKey]
+	if !ok {
+		return nil, false
+	}
+	var listVal structpb.ListValue
+	require.NoError(t, extAny.UnmarshalTo(&listVal))
+	ids := make([]string, len(listVal.GetValues()))
+	for idx, val := range listVal.GetValues() {
+		ids[idx] = val.GetStringValue()
+	}
+	return ids, true
+}
+
+type selectiveDeactivateFailureReplicator struct {
+	base    store.StateReplicator
+	mu      sync.Mutex
+	failSet map[string]struct{}
+}
+
+func newSelectiveDeactivateFailureReplicator(base store.StateReplicator) *selectiveDeactivateFailureReplicator {
+	return &selectiveDeactivateFailureReplicator{
+		base:    base,
+		failSet: make(map[string]struct{}),
+	}
+}
+
+func (r *selectiveDeactivateFailureReplicator) setFailedTicketIds(ids ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failSet = make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		r.failSet[id] = struct{}{}
+	}
+}
+
+func (r *selectiveDeactivateFailureReplicator) shouldFail(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.failSet[id]
+	return ok
+}
+
+func (r *selectiveDeactivateFailureReplicator) GetUpdates() []*store.StateUpdate {
+	return r.base.GetUpdates()
+}
+
+func (r *selectiveDeactivateFailureReplicator) GetReplIdValidator() *regexp.Regexp {
+	return r.base.GetReplIdValidator()
+}
+
+func (r *selectiveDeactivateFailureReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
+	responses := make([]*store.StateResponse, len(updates))
+	forwarded := make([]*store.StateUpdate, 0, len(updates))
+	forwardedIndices := make([]int, 0, len(updates))
+
+	for i, u := range updates {
+		if u != nil && u.Cmd == store.Deactivate && r.shouldFail(u.PrimaryKey()) {
+			responses[i] = &store.StateResponse{
+				Result: u.PrimaryKey(),
+				Err:    errors.New("simulated deactivation write failure"),
+			}
+			continue
+		}
+		forwarded = append(forwarded, u)
+		forwardedIndices = append(forwardedIndices, i)
+	}
+
+	if len(forwarded) > 0 {
+		baseResponses := r.base.SendUpdates(forwarded)
+		for j, origIdx := range forwardedIndices {
+			if j < len(baseResponses) {
+				responses[origIdx] = baseResponses[j]
+			}
+		}
+	}
+	return responses
 }
 
 func rawFloat64HistogramCount(rm metricdata.ResourceMetrics, name string) uint64 {
@@ -1632,7 +1775,9 @@ func TestInvokeMatchmakingFunctionsMidStreamErrorDeactivationWaitAndMetrics(t *t
 					{Name: "healthy-mmf", Host: "http://" + host2, Port: port2, Type: pb.MatchmakingFunctionSpec_GRPC},
 				},
 			}, callerStream)
-			require.NoError(t, err)
+			// The mid-stream MMF crash is reported after all matches have been streamed.
+			assertMmfFailureStatus(t, err, 2, []string{"crashing-mmf"})
+			assert.Contains(t, err.Error(), "simulated mid-stream MMF crash")
 
 			// Verify all 3 matches were delivered to the caller.
 			matches := callerStream.receivedMatches()
@@ -1729,7 +1874,8 @@ func TestInvokeMatchmakingFunctionsCloseSendMultiChunkAndSendEOFUnwrap(t *testin
 			{Name: "early-abort-mmf", Host: "http://" + hostFail, Port: portFail, Type: pb.MatchmakingFunctionSpec_GRPC},
 		},
 	}, callerStream)
-	require.NoError(t, err)
+	assertMmfFailureStatus(t, err, 2, []string{"early-abort-mmf"})
+	assert.Contains(t, err.Error(), "mmf capacity exceeded during send")
 
 	chunkMu.Lock()
 	chunksCopy := slices.Clone(receivedChunks)
@@ -2418,7 +2564,7 @@ func TestInvokeMatchmakingFunctionsValidationMultiChunkFanOutAndDrain(t *testing
 	assert.Contains(t, err.Error(), "list of mmfs to invoke is required")
 
 	// 2. 45-ticket multi-chunk splitting (> 4 MB) and reassembly, plus REST & bad-URI fan-out errors,
-	// plus skipping matches with zero or only invalid ticket IDs.
+	// plus returning and counting matches with zero or only invalid ticket IDs.
 	ticketIds := createAndActivateTicketsInCache(t, &tc, 45, []string{"split45"}, 100*1000)
 
 	var reassembledIds []string
@@ -2487,7 +2633,7 @@ func TestInvokeMatchmakingFunctionsValidationMultiChunkFanOutAndDrain(t *testing
 			{Name: "bad-uri-mmf", Host: "ftp://invalid-scheme", Port: 21, Type: pb.MatchmakingFunctionSpec_GRPC},
 		},
 	}, failingCallerStream)
-	require.NoError(t, err)
+	assertMmfFailureStatus(t, err, 3, []string{"rest-nyi-mmf", "bad-uri-mmf"})
 
 	reassembleMu.Lock()
 	assert.Greater(t, numChunksSeen, int32(1), "45 tickets at 100KB each must split across multiple chunks")
@@ -2496,7 +2642,9 @@ func TestInvokeMatchmakingFunctionsValidationMultiChunkFanOutAndDrain(t *testing
 
 	assert.Equal(t, int64(1), sumInt64CounterByAttr(t, reader, "om_core.mmf.failures", "mmf.name", "rest-nyi-mmf"))
 	assert.Equal(t, int64(1), sumInt64CounterByAttr(t, reader, "om_core.mmf.failures", "mmf.name", "bad-uri-mmf"))
-	assert.Equal(t, int64(3), sumInt64CounterByAttr(t, reader, "om_core.match.received", "mmf.name", "valid-grpc-mmf"))
+	// Both the empty match and the invalid-IDs-only match are now returned and counted with match.has_tickets=false.
+	assert.Equal(t, int64(3), sumMatchesReceived(t, reader, "valid-grpc-mmf", true))
+	assert.Equal(t, int64(2), sumMatchesReceived(t, reader, "valid-grpc-mmf", false))
 }
 
 // Scenario 20: Exhaustive 23-Case MMF URL Parser Table and Scheme-Less Invocation
@@ -2827,13 +2975,13 @@ func TestInvokeMatchmakingFunctionsColdStartCatchUpBarrier(t *testing.T) {
 	})
 }
 
-// Scenario 23: Empty and Invalid-Ticket Matches Excluded from Match Counter
-func TestEmptyAndInvalidTicketMatchesExcludedFromCounterAndMidStreamAuth(t *testing.T) {
+// Scenario 23: Empty and Invalid-Ticket Matches Returned to the Caller
+func TestEmptyAndInvalidTicketMatchesReturnedToCallerAndMidStreamAuth(t *testing.T) {
 	setupGlobalTestCache(t, nil, nil)
 	reader := setupTestMeter(t)
 	srv := &grpcServer{}
 
-	// 1. Diagnostic empty match and invalid-only match must record 0 in om_core.match.received.
+	// 1. Diagnostic empty match and invalid-only match are returned to the caller and counted with match.has_tickets=false.
 	hostDiag, portDiag := startTestMmfGrpcServer(t, nil, func(stream pb.MatchMakingFunctionService_RunServer) error {
 		for {
 			if _, err := stream.Recv(); errors.Is(err, io.EOF) {
@@ -2855,8 +3003,25 @@ func TestEmptyAndInvalidTicketMatchesExcludedFromCounterAndMidStreamAuth(t *test
 		Mmfs:    []*pb.MatchmakingFunctionSpec{{Name: "diag-mmf", Host: "http://" + hostDiag, Port: portDiag, Type: pb.MatchmakingFunctionSpec_GRPC}},
 	}, callerStream)
 	require.NoError(t, err)
-	assert.Empty(t, callerStream.receivedMatches())
-	assert.Equal(t, int64(0), sumInt64CounterByAttr(t, reader, "om_core.match.received", "mmf.name", "diag-mmf"))
+
+	diagMatches := callerStream.receivedMatches()
+	require.Len(t, diagMatches, 2)
+	diagById := make(map[string]*pb.Match, len(diagMatches))
+	for _, m := range diagMatches {
+		require.NotNil(t, m)
+		diagById[m.GetId()] = m
+	}
+	require.Contains(t, diagById, "diag-empty")
+	require.Contains(t, diagById, "diag-bad-id")
+
+	_, hasEmptyInvalidExt := decodeMatchInvalidTicketIds(t, diagById["diag-empty"])
+	assert.False(t, hasEmptyInvalidExt)
+	badIds, hasBadInvalidExt := decodeMatchInvalidTicketIds(t, diagById["diag-bad-id"])
+	require.True(t, hasBadInvalidExt)
+	assert.Equal(t, []string{"bad-id"}, badIds)
+
+	assert.Equal(t, int64(2), sumMatchesReceived(t, reader, "diag-mmf", false))
+	assert.Equal(t, int64(0), sumMatchesReceived(t, reader, "diag-mmf", true))
 
 	// 2. Mid-stream codes.Unauthenticated after an empty match must NOT re-trigger initial HTTPS OIDC token refresh.
 	serverCreds, clientTLS := generateTestTLSConfig(t)
@@ -2892,17 +3057,201 @@ func TestEmptyAndInvalidTicketMatchesExcludedFromCounterAndMidStreamAuth(t *test
 		return status.Error(codes.Unauthenticated, "mid-stream unauthenticated after response")
 	})
 
+	httpsCallerStream := &mockInvokeMmfServerStream{ctx: context.Background()}
 	err = srv.InvokeMatchmakingFunctions(&pb.MmfRequest{
 		Profile: &pb.Profile{Name: "com.example.diag.https"},
 		Mmfs: []*pb.MatchmakingFunctionSpec{
 			{Name: "midstream-unauth-mmf", Host: fmt.Sprintf("https://127.0.0.1:%d", portHttps), Port: 0, Type: pb.MatchmakingFunctionSpec_GRPC},
 		},
-	}, &mockInvokeMmfServerStream{ctx: context.Background()})
-	require.NoError(t, err)
+	}, httpsCallerStream)
+	assertMmfFailureStatus(t, err, 1, []string{"midstream-unauth-mmf"})
+
+	httpsMatches := httpsCallerStream.receivedMatches()
+	require.Len(t, httpsMatches, 1)
+	assert.Equal(t, []string{"empty-before-unauth"}, []string{httpsMatches[0].GetId()})
+
 	assert.Equal(t, int32(1), httpsServerCalls.Load(), "mid-stream Unauthenticated after an empty response must not retry")
 	assert.Equal(t, int32(1), tokenFactoryCalls.Load(), "mid-stream Unauthenticated after an empty response must not refresh token")
 	assert.Equal(t, int64(1), sumInt64CounterByAttr(t, reader, "om_core.mmf.failures", "mmf.name", "midstream-unauth-mmf"))
-	assert.Equal(t, int64(0), sumInt64CounterByAttr(t, reader, "om_core.match.received", "mmf.name", "midstream-unauth-mmf"))
+	assert.Equal(t, int64(1), sumMatchesReceived(t, reader, "midstream-unauth-mmf", false))
+	assert.Equal(t, int64(0), sumMatchesReceived(t, reader, "midstream-unauth-mmf", true))
+}
+
+// Scenario 23b: Every MMF Response Returned, in Both Deactivation Modes
+func TestEveryMmfResponseReturnedInBothDeactivationModes(t *testing.T) {
+	for _, waitEnabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("DeactivationWait=%v", waitEnabled), func(t *testing.T) {
+			localCfg := newFastCoreTestConfig()
+			localCfg.Set("OM_MATCH_TICKET_DEACTIVATION_WAIT", waitEnabled)
+			setupGlobalTestCache(t, localCfg, nil)
+			reader := setupTestMeter(t)
+
+			ids := createAndActivateTicketsInCache(t, &tc, 2, []string{"every-response"}, 0)
+			ticketA, ticketB := ids[0], ids[1]
+
+			host, port := startTestMmfGrpcServer(t, nil, func(stream pb.MatchMakingFunctionService_RunServer) error {
+				for {
+					if _, err := stream.Recv(); errors.Is(err, io.EOF) {
+						break
+					} else if err != nil {
+						return err
+					}
+				}
+				responses := []*pb.StreamedMmfResponse{
+					{Match: &pb.Match{Id: "no-tickets"}},
+					{Match: nil},
+					{Match: &pb.Match{
+						Id: "only-invalid",
+						Rosters: map[string]*pb.Roster{
+							"r": {Name: "r", Tickets: []*pb.Ticket{{Id: "bad-1"}, {Id: ""}}},
+						},
+					}},
+					{Match: &pb.Match{
+						Id: "mixed",
+						Rosters: map[string]*pb.Roster{
+							"r": {Name: "r", Tickets: []*pb.Ticket{{Id: ticketA}, {Id: "bad-2"}}},
+						},
+					}},
+					{Match: &pb.Match{
+						Id: "valid",
+						Rosters: map[string]*pb.Roster{
+							"r": {Name: "r", Tickets: []*pb.Ticket{{Id: ticketB}}},
+						},
+					}},
+				}
+				for _, resp := range responses {
+					if err := stream.Send(resp); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+
+			callerStream := &mockInvokeMmfServerStream{ctx: context.Background()}
+			srv := &grpcServer{}
+			err := srv.InvokeMatchmakingFunctions(&pb.MmfRequest{
+				Profile: &pb.Profile{
+					Name: "com.example.everyresponse.v1",
+					Pools: map[string]*pb.Pool{
+						"p": {Name: "p", TagPresentFilters: []*pb.Pool_TagPresentFilter{{Tag: "every-response"}}},
+					},
+				},
+				Mmfs: []*pb.MatchmakingFunctionSpec{
+					{Name: "every-response-mmf", Host: "http://" + host, Port: port, Type: pb.MatchmakingFunctionSpec_GRPC},
+				},
+			}, callerStream)
+			require.NoError(t, err)
+
+			matches := callerStream.receivedMatches()
+			require.Len(t, matches, 5)
+
+			var nilCount int
+			byId := make(map[string]*pb.Match, 4)
+			for _, m := range matches {
+				if m == nil {
+					nilCount++
+					continue
+				}
+				byId[m.GetId()] = m
+			}
+			assert.Equal(t, 1, nilCount)
+			require.Len(t, byId, 4)
+			require.Contains(t, byId, "no-tickets")
+			require.Contains(t, byId, "only-invalid")
+			require.Contains(t, byId, "mixed")
+			require.Contains(t, byId, "valid")
+
+			_, hasInvalidNoTickets := decodeMatchInvalidTicketIds(t, byId["no-tickets"])
+			assert.False(t, hasInvalidNoTickets)
+			_, hasInvalidValid := decodeMatchInvalidTicketIds(t, byId["valid"])
+			assert.False(t, hasInvalidValid)
+
+			onlyInvalidIds, hasOnlyInvalid := decodeMatchInvalidTicketIds(t, byId["only-invalid"])
+			require.True(t, hasOnlyInvalid)
+			assert.Equal(t, []string{"bad-1", ""}, onlyInvalidIds)
+
+			mixedInvalidIds, hasMixedInvalid := decodeMatchInvalidTicketIds(t, byId["mixed"])
+			require.True(t, hasMixedInvalid)
+			assert.Equal(t, []string{"bad-2"}, mixedInvalidIds)
+
+			assert.True(t, tc.WaitForDeactivation(ticketA, "", 2*time.Second))
+			assert.True(t, tc.WaitForDeactivation(ticketB, "", 2*time.Second))
+			assert.Equal(t, int64(2), sumInt64Counter(t, reader, "om_core.mmf.ticket.deactivations"))
+			assert.Equal(t, int64(2), sumMatchesReceived(t, reader, "every-response-mmf", true))
+			assert.Equal(t, int64(3), sumMatchesReceived(t, reader, "every-response-mmf", false))
+		})
+	}
+}
+
+// Scenario 23c: Failed Deactivation Writes Reported Only When Waiting for Deactivation
+func TestFailedDeactivationWritesReportedOnlyWhenWaitingForDeactivation(t *testing.T) {
+	for _, waitEnabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("DeactivationWait=%v", waitEnabled), func(t *testing.T) {
+			localCfg := newFastCoreTestConfig()
+			localCfg.Set("OM_MATCH_TICKET_DEACTIVATION_WAIT", waitEnabled)
+			failRepl := newSelectiveDeactivateFailureReplicator(memoryReplicator.New(localCfg))
+			setupGlobalTestCache(t, localCfg, failRepl)
+
+			ids := createAndActivateTicketsInCache(t, &tc, 3, []string{"deact-fail"}, 0)
+			failRepl.setFailedTicketIds(ids[1])
+
+			host, port := startTestMmfGrpcServer(t, nil, func(stream pb.MatchMakingFunctionService_RunServer) error {
+				for {
+					if _, err := stream.Recv(); errors.Is(err, io.EOF) {
+						break
+					} else if err != nil {
+						return err
+					}
+				}
+				return stream.Send(&pb.StreamedMmfResponse{
+					Match: &pb.Match{
+						Id: "partially-deactivated",
+						Rosters: map[string]*pb.Roster{
+							"r": {
+								Name:    "r",
+								Tickets: []*pb.Ticket{{Id: ids[0]}, {Id: ids[1]}, {Id: ids[2]}},
+							},
+						},
+					},
+				})
+			})
+
+			callerStream := &mockInvokeMmfServerStream{ctx: context.Background()}
+			srv := &grpcServer{}
+			err := srv.InvokeMatchmakingFunctions(&pb.MmfRequest{
+				Profile: &pb.Profile{
+					Name: "com.example.deactfail.v1",
+					Pools: map[string]*pb.Pool{
+						"p": {Name: "p", TagPresentFilters: []*pb.Pool_TagPresentFilter{{Tag: "deact-fail"}}},
+					},
+				},
+				Mmfs: []*pb.MatchmakingFunctionSpec{
+					{Name: "deact-fail-mmf", Host: "http://" + host, Port: port, Type: pb.MatchmakingFunctionSpec_GRPC},
+				},
+			}, callerStream)
+			require.NoError(t, err)
+
+			matches := callerStream.receivedMatches()
+			require.Len(t, matches, 1)
+			m := matches[0]
+			require.NotNil(t, m)
+
+			if !waitEnabled {
+				assert.NotContains(t, m.GetExtensions(), MatchDeactivationFailedTicketIdsExtensionKey)
+			} else {
+				require.Contains(t, m.GetExtensions(), MatchDeactivationFailedTicketIdsExtensionKey)
+				var listVal structpb.ListValue
+				require.NoError(t, m.GetExtensions()[MatchDeactivationFailedTicketIdsExtensionKey].UnmarshalTo(&listVal))
+				failedIds := make([]string, len(listVal.GetValues()))
+				for idx, v := range listVal.GetValues() {
+					failedIds[idx] = v.GetStringValue()
+				}
+				assert.Equal(t, []string{ids[1]}, failedIds)
+				assert.NotContains(t, m.GetExtensions(), MatchDeactivationTimeoutExtensionKey)
+				assert.NotContains(t, m.GetExtensions(), MatchInvalidTicketIdsExtensionKey)
+			}
+		})
+	}
 }
 
 // Scenario 24: OpenTelemetry Service Version Verification

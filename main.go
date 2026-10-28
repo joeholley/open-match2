@@ -48,7 +48,9 @@ import (
 	grpcMetadata "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -73,6 +75,31 @@ import (
 // boolean true wrapperspb.BoolValue when waiting for match ticket deactivations to
 // replicate to the local cache times out or fails.
 const MatchDeactivationTimeoutExtensionKey = "deactivation_timeout"
+
+// MatchInvalidTicketIdsExtensionKey is the reserved Match.Extensions key whose value is
+// a google.protobuf.Any wrapping a google.protobuf.ListValue (*structpb.ListValue) of
+// string values listing every roster ticket ID in the match that failed ticket ID
+// validation (om-core does not and cannot deactivate these tickets). It is set only
+// when at least one roster ticket ID is invalid, and is set in both deactivation modes
+// (whether OM_MATCH_TICKET_DEACTIVATION_WAIT is true or false).
+const MatchInvalidTicketIdsExtensionKey = "invalid_ticket_ids"
+
+// MatchDeactivationFailedTicketIdsExtensionKey is the reserved Match.Extensions key whose
+// value is a google.protobuf.Any wrapping a google.protobuf.ListValue (*structpb.ListValue)
+// of string values listing every valid roster ticket ID whose deactivation write to state
+// storage failed, so the ticket may still be active and could be matched again. It is set
+// only when OM_MATCH_TICKET_DEACTIVATION_WAIT is true (when false, the match is returned
+// before deactivation is attempted) and only when at least one deactivation write failed.
+// If every deactivation write failed, MatchDeactivationTimeoutExtensionKey is also set.
+const MatchDeactivationFailedTicketIdsExtensionKey = "deactivation_failed_ticket_ids"
+
+// mmfFailureErrorInfoReason and mmfFailureErrorInfoDomain identify the errdetails.ErrorInfo
+// entries (one per failed MMF) attached to the gRPC status returned by InvokeMatchmakingFunctions
+// when any invoked MMF fails.
+const (
+	mmfFailureErrorInfoReason = "MMF_FAILURE"
+	mmfFailureErrorInfoDomain = "open-match"
+)
 
 // Required by protobuf compiler's golang gRPC auto-generated code.
 type grpcServer struct {
@@ -845,6 +872,94 @@ func annotateMatchDeactivationTimeout(match *pb.Match) {
 	match.Extensions[MatchDeactivationTimeoutExtensionKey] = timeoutAny
 }
 
+func annotateMatchTicketIdList(match *pb.Match, key string, ids []string) {
+	if match == nil || len(ids) == 0 {
+		return
+	}
+	vals := make([]any, len(ids))
+	for idx, id := range ids {
+		vals[idx] = id
+	}
+	listVal, err := structpb.NewList(vals)
+	if err != nil {
+		logger.Errorf("Failed to build %s extension: %v", key, err)
+		return
+	}
+	extAny, err := anypb.New(listVal)
+	if err != nil {
+		logger.Errorf("Failed to marshal %s extension: %v", key, err)
+		return
+	}
+	if match.Extensions == nil {
+		match.Extensions = make(map[string]*anypb.Any)
+	}
+	match.Extensions[key] = extAny
+}
+
+// annotateMatchInvalidTicketIds mutates match to store invalidIds under
+// MatchInvalidTicketIdsExtensionKey. Because it mutates the match, it must only
+// be called before the match is handed off for sending to avoid a data race.
+func annotateMatchInvalidTicketIds(match *pb.Match, invalidIds []string) {
+	annotateMatchTicketIdList(match, MatchInvalidTicketIdsExtensionKey, invalidIds)
+}
+
+// annotateMatchDeactivationFailedTicketIds mutates match to store failedIds under
+// MatchDeactivationFailedTicketIdsExtensionKey. It is only used when
+// OM_MATCH_TICKET_DEACTIVATION_WAIT is true, and because it mutates the match,
+// it must only be called before the match is handed off for sending to avoid a data race.
+func annotateMatchDeactivationFailedTicketIds(match *pb.Match, failedIds []string) {
+	annotateMatchTicketIdList(match, MatchDeactivationFailedTicketIdsExtensionKey, failedIds)
+}
+
+type mmfFailureRecord struct {
+	mmfName string
+	err     error
+}
+
+func unwrapGRPCStatus(err error) *status.Status {
+	var grpcStatusErr interface {
+		GRPCStatus() *status.Status
+	}
+	if errors.As(err, &grpcStatusErr) {
+		return grpcStatusErr.GRPCStatus()
+	}
+	return status.New(codes.Unknown, err.Error())
+}
+
+// buildMmfFailureStatus builds the aggregated codes.Internal status returned when one
+// or more invoked MMFs fail. Every match the MMFs returned has already been streamed
+// to the caller by the time this status is returned, so the caller receives all matches
+// followed by this error. One errdetails.ErrorInfo per failed MMF carries the MMF name,
+// gRPC code, and message for programmatic inspection.
+func buildMmfFailureStatus(totalMmfs int, failures []mmfFailureRecord) error {
+	summaryParts := make([]string, 0, len(failures))
+	details := make([]protoadapt.MessageV1, 0, len(failures))
+	for _, failure := range failures {
+		st := unwrapGRPCStatus(failure.err)
+		summaryParts = append(summaryParts, fmt.Sprintf("%s: %s", failure.mmfName, st.Message()))
+		details = append(details, &errdetails.ErrorInfo{
+			Reason: mmfFailureErrorInfoReason,
+			Domain: mmfFailureErrorInfoDomain,
+			Metadata: map[string]string{
+				"mmf_name":  failure.mmfName,
+				"grpc_code": st.Code().String(),
+				"message":   st.Message(),
+			},
+		})
+	}
+
+	baseStatus := status.New(codes.Internal, fmt.Sprintf(
+		"%d of %d matchmaking functions failed: %s",
+		len(failures), totalMmfs, strings.Join(summaryParts, "; "),
+	))
+	detailedStatus, err := baseStatus.WithDetails(details...)
+	if err != nil {
+		logger.Errorf("Failed to attach MMF failure details to status: %v", err)
+		return baseStatus.Err()
+	}
+	return detailedStatus.Err()
+}
+
 func waitForMatchTicketDeactivation(
 	ctx context.Context,
 	logger *logrus.Entry,
@@ -913,8 +1028,14 @@ func waitForMatchTicketDeactivation(
 // It then attempts to connect to every matchmaking function in the provided
 // list, and send the Profile with filled Pools to each. It processes resulting
 // matches from each matchmaking function asynchronously as they arrive. For
-// each match it receives, it deactivates all tickets contained in the match
+// each match it receives, it deactivates all valid tickets contained in the match
 // and streams the match back to the InvokeMatchmakingFunctions caller.
+//
+// From the caller's point of view, InvokeMatchmakingFunctions behaves like an
+// RPC framework: every response an MMF streams back is forwarded to the caller
+// (including matches with no valid tickets and responses with no match at all),
+// and if any MMF fails, the stream ends with an error status describing every
+// failure after all returned matches have been sent.
 //
 // NOTE: (complexity linters disabled) The complexity here is unavoidable as we're
 // using multiple nested goroutines to process lots of MMFs simultaneously
@@ -1106,15 +1227,31 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	)
 
 	// Invoke each requested MMF, and put the matches they stream back into the match channel.
+	// Any MMF failures are collected and returned to the caller after all matches have been
+	// streamed so that, like an RPC framework, om-core never hides an MMF failure.
 	var mmfwg sync.WaitGroup
+	var mmfFailuresMu sync.Mutex
+	var mmfFailures []mmfFailureRecord
 	for _, mmf := range req.GetMmfs() {
 		// Add this invocation to the MMF wait group.
 		mmfwg.Add(1)
 
 		// MMF fan-out goroutine
 		// Call the MMF asynchronously, so all processing happens concurrently
-		go func(mmf *pb.MatchmakingFunctionSpec) error {
+		go func(mmf *pb.MatchmakingFunctionSpec) (retErr error) {
 			defer mmfwg.Done()
+			// Registered after mmfwg.Done() so by LIFO ordering it runs BEFORE mmfwg.Done(),
+			// guaranteeing every MMF failure is recorded before mmfwg.Wait() returns.
+			defer func() {
+				if retErr != nil {
+					mmfFailuresMu.Lock()
+					mmfFailures = append(mmfFailures, mmfFailureRecord{
+						mmfName: mmf.GetName(),
+						err:     retErr,
+					})
+					mmfFailuresMu.Unlock()
+				}
+			}()
 
 			if otelMmfCalls != nil {
 				otelMmfCalls.Add(ctx, 1, metric.WithAttributes(
@@ -1282,15 +1419,23 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			// set to inactive by OM.)
 			var tdwg sync.WaitGroup
 
-			// i counts the number of valid matches received for metrics reporting.
+			// matchesWithTickets and matchesWithoutTickets count the matches received
+			// from this MMF for metrics reporting. Every counted match is returned to
+			// the caller, split by whether it had any valid ticket IDs.
 			// Register defers in LIFO order:
 			// 1. First registered (runs second on exit): unconditionally record otelMatches.
 			// 2. Second registered (runs first on exit): wait for all ticket deactivation goroutines.
-			var i int64
+			var matchesWithTickets, matchesWithoutTickets int64
 			defer func() {
-				otelMatches.Add(ctx, i, metric.WithAttributes(
+				otelMatches.Add(ctx, matchesWithTickets, metric.WithAttributes(
 					attribute.String("mmf.name", mmf.GetName()),
 					attribute.String("profile.name", profileName),
+					attribute.Bool("match.has_tickets", true),
+				))
+				otelMatches.Add(ctx, matchesWithoutTickets, metric.WithAttributes(
+					attribute.String("mmf.name", mmf.GetName()),
+					attribute.String("profile.name", profileName),
+					attribute.Bool("match.has_tickets", false),
 				))
 			}()
 			defer tdwg.Wait()
@@ -1351,8 +1496,15 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 
 				receivedAnyResponse = true
 				resultCopy := result.GetMatch()
+				if resultCopy == nil {
+					// om-core passes every MMF response through to the caller, like an RPC framework.
+					logger.Warn("MMF response contained no match; forwarding it to the caller unchanged")
+				}
 
+				// Validate ticket IDs synchronously before spawning the deactivation goroutine
+				// so that annotating invalid ticket IDs on the match cannot race with or delay forwarding.
 				ticketIdsToDeactivate := []string{}
+				invalidIds := []string{}
 				for _, roster := range resultCopy.GetRosters() {
 					for _, ticket := range roster.GetTickets() {
 						tid := ticket.GetId()
@@ -1361,28 +1513,32 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 								"match_id":  resultCopy.GetId(),
 								"ticket_id": tid,
 							}).Errorf("Invalid ticket id in match roster: %v", InvalidIdErr)
+							invalidIds = append(invalidIds, tid)
 							continue
 						}
 						if tid == "" {
 							logger.WithFields(logrus.Fields{
 								"match_id": resultCopy.GetId(),
 							}).Errorf("Invalid empty ticket id in match roster: %v", InvalidIdErr)
+							invalidIds = append(invalidIds, tid)
 							continue
 						}
 						ticketIdsToDeactivate = append(ticketIdsToDeactivate, tid)
 					}
 				}
 
-				// Skipping deactivation for match with no valid tickets.
+				annotateMatchInvalidTicketIds(resultCopy, invalidIds)
+
+				// Ticketless matches (for example diagnostic or feedback matches an MMF sends
+				// to the Director) are returned to the caller too; they simply have nothing to deactivate.
 				if len(ticketIdsToDeactivate) == 0 {
+					matchesWithoutTickets++
 					logger.WithFields(logrus.Fields{
 						"match_id": resultCopy.GetId(),
-						"reason":   "no tickets in match response",
-					}).Warn("Skipping deactivation for match with no tickets.")
-					continue
+					}).Debug("Match has no valid ticket IDs; returning it without deactivation")
+				} else {
+					matchesWithTickets++
 				}
-
-				i++
 
 				// deactivate tickets & send match back to the matchmaker
 				// asynchronously as streamed match results continue to be
@@ -1396,6 +1552,21 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 					streamCtx := ctx
 					if stream != nil && stream.Context() != nil {
 						streamCtx = stream.Context()
+					}
+
+					// Ticketless fast path: no valid ticket IDs to deactivate.
+					// Note that such a match may reach the caller ahead of earlier matches
+					// still waiting on deactivation; om-core makes no ordering guarantee between matches.
+					if len(ticketIds) == 0 {
+						if streamCtx.Err() != nil || ctx.Err() != nil {
+							logger.WithFields(logrus.Fields{
+								"error": streamCtx.Err(),
+								"stage": "queuing_for_send",
+							}).Warn("context cancelled")
+							return
+						}
+						matchChan <- res
+						return
 					}
 
 					// Option 1 (default): Wait for deactivation to complete
@@ -1413,6 +1584,24 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 							),
 						)
 						logger.Tracef("Done requesting deactivation of tickets in %v", res.GetId())
+
+						// Tell the caller which tickets om-core failed to deactivate (they may still
+						// be active). This is known only when OM_MATCH_TICKET_DEACTIVATION_WAIT is true
+						// because deactivation finishes before the match is returned; IDs are listed
+						// in roster order (de-duplicated).
+						if len(errs) > 0 {
+							failedIds := make([]string, 0, len(errs))
+							seenFailed := make(map[string]struct{}, len(errs))
+							for _, tid := range ticketIds {
+								if _, failed := errs[tid]; failed {
+									if _, seen := seenFailed[tid]; !seen {
+										seenFailed[tid] = struct{}{}
+										failedIds = append(failedIds, tid)
+									}
+								}
+							}
+							annotateMatchDeactivationFailedTicketIds(res, failedIds)
+						}
 
 						var targetTicketId string
 						for idx := len(ticketIds) - 1; idx >= 0; idx-- {
@@ -1501,10 +1690,10 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				}(resultCopy, ticketIdsToDeactivate)
 			}
 
-			// All done
+			// The MMF stream ended with io.EOF, which is success.
 			logger.Trace("async call to mmf complete")
-			return err //nolint:errcheck
-		}(mmf) //nolint:errcheck // End of MMF fan-out goroutine.
+			return nil
+		}(mmf) //nolint:errcheck // End of MMF fan-out goroutine; errors are recorded in mmfFailures.
 	} // end of for loop that runs once per MMF in the requested profile.
 
 	// Wait for all mmfs to complete (that is, all copies of the MMF fan-out
@@ -1516,6 +1705,10 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	close(matchChan) // tell the fan-in goroutine that we're done sending
 	fanwg.Wait()     // wait for the fan-in goroutine to finish anything left in the channel
 
+	// Every match has been streamed; now report any MMF failures.
+	if len(mmfFailures) > 0 {
+		return buildMmfFailureStatus(len(req.GetMmfs()), mmfFailures)
+	}
 	return nil
 }
 
