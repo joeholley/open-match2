@@ -4,6 +4,8 @@
 
 This document provides a detailed technical comparison between Open Match 1 (OM1) and Open Match 2 (OM2), focusing on the key architectural and design changes. For additional details, see [README.md](../README.md), [DEVELOPMENT.md](DEVELOPMENT.md), [ADVANCED.md](ADVANCED.md), [METRICS.md](METRICS.md), and [FAQ.md](FAQ.md).
 
+If you are already running Open Match 2 and are upgrading `om-core` from `v2.0.x` to `v2.1.0`, see [Upgrading from v2.0.x to v2.1.0](#upgrading-from-v20x-to-v210).
+
 ## **A Unified, Flexible Core Architecture & Deployment**
 
 The most significant architectural change in OM2 is the move from a distributed microservices architecture to a single, unified binary called `om-core`. In OM1, components like the `frontend`, `backend`, and `query` services were separate deployments. OM2 consolidates their functionality into one stateless service, which simplifies deployment, management, and reduces the number of network hops for most operations.
@@ -181,3 +183,36 @@ The most critical conceptual change is that the MMF's role is no longer to sugge
 * **In OM1,** the RunResponse message contained a Match object that was considered a proposal. This proposal was then sent to a separate Evaluator service to resolve conflicts and make the final decision.
 
 * **In OM2,** with the removal of the Evaluator, the Match your MMF creates is **the final, definitive match**. This means your matchmaking logic must be robust enough to be the source of truth.
+
+## **Upgrading from v2.0.x to v2.1.0**
+
+This section covers upgrading an existing Open Match 2 deployment from `om-core` `v2.0.x` to `v2.1.0`. Unlike the OM1-to-OM2 migration above, this is an in-place upgrade: no client, Director, or MMF code changes are required.
+
+#### **1\. Wire and Storage Compatibility**
+
+* **API compatibility is unchanged.** `v2.0.x` gRPC and HTTP (`grpc-gateway`) clients and MMFs remain wire-compatible with `v2.1.0`; you do not need to regenerate your protocol buffer libraries.
+* **State storage format is unchanged by default.** With `OM_CACHE_PACK_TICKET_STATE_UPDATES=false` (the default), `v2.1.0` writes the same `om-replication` Redis Stream entry format as `v2.0.x`.
+
+#### **2\. Ticket Lifecycle Is Unchanged**
+
+`v2.1.0` keeps the `v2.0.x` ticket lifecycle: every ticket created via `CreateTicket` starts **inactive** and only enters matchmaking pools after your matchmaker calls `ActivateTickets` for it. Tickets are removed when they reach their `expiration_time` (by default `creation_time` + `OM_CACHE_TICKET_TTL_MS`) whether they are active or inactive. If you previously tested a `v2.1.0` release candidate in which newly created tickets appeared in pools without being activated, that behavior was a bug and has been fixed.
+
+#### **3\. Packed Ticket State Updates**
+
+`v2.1.0` adds the opt-in `OM_CACHE_PACK_TICKET_STATE_UPDATES` flag, which packs many ticket IDs into each `activate` / `deactivate` stream entry. `v2.0.x` `om-core` reads only the first ticket ID of a packed entry and silently drops the rest. Therefore:
+
+* **Do not mix `om-core` instances with different settings of this flag, or packing-enabled instances with `v2.0.x` instances, in the same deployment.**
+* **Live (rolling) upgrades and rollbacks of this setting are not supported.** To enable it (including upgrading from `v2.0.x` straight to packing-enabled `v2.1.0`) or to disable it (including rolling back to `v2.0.x`), stand up a new deployment of the whole matchmaker (Redis instance, `om-core` instances, MMFs, matchmaking queue, and Director) with the new configuration. We recommend a blue-green deployment: run the new deployment alongside the existing one, send clients to its matchmaking queue as they reach parts of the game that make new matchmaking requests, let the old deployment keep running unchanged until its queue drains, and then decommission it. A maintenance window with a fresh Redis instance also works.
+
+See [Enabling or Disabling Packed Ticket State Updates](ADVANCED.md#enabling-or-disabling-packed-ticket-state-updates) for both procedures.
+
+#### **4\. Deployment Manifest Changes**
+
+If you maintain your own copies of the sample deployment files, apply the equivalent changes:
+
+* **Cloud Run** (`deploy/cloud_run/service.yaml`, `deploy/cloud_run/cloudbuild.yaml`, `ci.yaml`): the request timeout is now `900` seconds (`timeoutSeconds: 900` / `--timeout 900`), resources are `2` vCPU and `1Gi` memory (`--cpu 2 --memory 1Gi`), and `service.yaml` sets `OM_LOGGING_LEVEL=info`. The Cloud Run request timeout must exceed `OM_MMF_TIMEOUT_SECS` + `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000` (`660` seconds with defaults); Cloud Run's default `300` seconds cuts off long `InvokeMatchmakingFunctions` streams. See [Time as a Safeguard: The MMF Timeout](ADVANCED.md#time-as-a-safeguard-the-mmf-timeout-om_mmf_timeout_secs).
+* **GKE** (`deploy/gke/om.yaml`): the `om-core` container now has a `lifecycle.preStop.sleep.seconds: 10` hook and the Pod sets `terminationGracePeriodSeconds: 30`, so the HTTP gateway keeps serving in-flight REST calls while the Pod is removed from Service endpoints during rolling restarts. The `sleep` lifecycle action requires Kubernetes `1.30` or later.
+
+#### **5\. Building from Source**
+
+`v2.1.0` requires Go `1.27.4` or later (`go 1.27.4` in `go.mod`). Pre-built images are unaffected; this only matters if you compile `om-core` yourself (see [DEVELOPMENT.md](DEVELOPMENT.md)).

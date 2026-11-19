@@ -70,16 +70,16 @@ In Open Match, managing `Tickets` follows a simple, robust "fire-and-forget" mod
 
 #### **1\. Creation and Automatic Expiration**
 
-When you create a `Ticket`, it is assigned a **Time-to-Live (TTL)**. This TTL is configured in Open Match core (via the `OM_CACHE_TICKET_TTL_MS` setting).
+When you create a `Ticket`, it is assigned an **expiration time** (`Ticket.expiration_time`). If you leave it unset, Open Match core fills it in as the ticket's `creation_time` plus the **Time-to-Live (TTL)** configured in Open Match core (via the `OM_CACHE_TICKET_TTL_MS` setting). You may request an earlier expiration time, but never one later than the current time plus `OM_CACHE_TICKET_TTL_MS`.
 
 * **No Manual Deletion**: There is no `DeleteTicket` function in the Open Match API. You cannot manually delete a ticket.  
-* **Automatic Cleanup**: Once a ticket's TTL is reached, Open Match's internal cache management automatically expires and removes it from the system. This design prevents orphaned tickets and simplifies your logic, as you don't need to build a separate cleanup process.
+* **Automatic Cleanup**: Once a ticket's expiration time is reached, Open Match's internal cache management automatically expires and removes it from the system **regardless of whether the ticket is currently `active` or `inactive`**. An active ticket that is still waiting in a pool is removed at its expiration time just like an inactive one. This design prevents orphaned tickets and simplifies your logic, as you don't need to build a separate cleanup process.
 
 #### **2\. The Two States: Active and Inactive**
 
 After a `Ticket` is created, its lifecycle is managed through two simple states:
 
-* **Inactive**: When you first create a ticket using `CreateTicket`, it starts in the `inactive` state (*example:* See the `proxyCreateTicket` function in [`v2/internal/mmqueue/mmqueue.go`](https://github.com/googleforgames/open-match-ecosystem/blob/main/v2/internal/mmqueue/mmqueue.go) and its associated client call in [`v2/internal/omclient/omclient.go`](https://github.com/googleforgames/open-match-ecosystem/blob/main/v2/internal/omclient/omclient.go)). An inactive ticket will **not** be included in any pools when your matchmaking functions are invoked. 
+* **Inactive**: When you first create a ticket using `CreateTicket`, it starts in the `inactive` state (*example:* See the `proxyCreateTicket` function in [`v2/internal/mmqueue/mmqueue.go`](https://github.com/googleforgames/open-match-ecosystem/blob/main/v2/internal/mmqueue/mmqueue.go) and its associated client call in [`v2/internal/omclient/omclient.go`](https://github.com/googleforgames/open-match-ecosystem/blob/main/v2/internal/omclient/omclient.go)). An inactive ticket will **not** be included in any pools when your matchmaking functions are invoked. **Every** ticket created via `CreateTicket` starts inactive—there is no way to create a ticket that is immediately eligible for pools. This behavior is unchanged from `v2.0.x`.
 * **Active**: You use the `ActivateTickets` RPC to move a ticket into the `active` state. Only active tickets are considered for matchmaking and will be populated into the pools sent to your MMFs.
 
 #### **3\. Automatic Deactivation by Open Match**
@@ -259,7 +259,7 @@ Open Match achieves this state synchronization using Redis Streams as a central,
 
 1. **Writing to the Log (Outgoing Batch Packing and Stream Trimming)**:
    * When an Open Match instance receives an API call (e.g., `CreateTicket`, `ActivateTickets`, `DeactivateTickets`), it queues the update in its outgoing replication queue (`OM_CACHE_OUT_QUEUE_BUFFER_SIZE`) and flushes updates to the central Redis Stream in pipelined batches (up to `OM_CACHE_OUT_MAX_QUEUE_THRESHOLD` updates or after waiting `OM_CACHE_OUT_WAIT_TIMEOUT_MS`).
-   * When `OM_CACHE_PACK_TICKET_STATE_UPDATES` is set to `true`, contiguous `ActivateTickets` or `DeactivateTickets` operations—including concurrent requests from multiple callers—are coalesced into packed multi-key stream entries (up to `OM_CACHE_OUT_MAX_PACKED_KEYS` keys per entry), dramatically reducing Redis stream write amplification during match bursts.
+   * When `OM_CACHE_PACK_TICKET_STATE_UPDATES` is set to `true`, contiguous `ActivateTickets` or `DeactivateTickets` operations—including concurrent requests from multiple callers—are coalesced into packed multi-key stream entries (up to `OM_CACHE_OUT_MAX_PACKED_KEYS` keys per entry), dramatically reducing Redis stream write amplification during match bursts. Packed entries cannot be fully read by `v2.0.x` `om-core`. All `om-core` instances in a deployment must use the same setting, and the setting cannot be changed live: see [Enabling or Disabling Packed Ticket State Updates](#enabling-or-disabling-packed-ticket-state-updates) before changing it.
    * Each outgoing write pipeline appends an approximate stream trim command (`XTRIM om-replication MINID ~ <threshold>`) to evict stream entries older than the configured ticket and assignment TTL window (`OM_CACHE_TICKET_TTL_MS` + `OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS`), bounding Redis memory consumption with low overhead.
 2. **Reading from the Log (Blocking Polls and Adaptive Poll Waits)**:
    * Every Open Match instance, including the one that wrote the event, continuously polls the `om-replication` stream using blocking reads (`XREAD COUNT <OM_CACHE_IN_MAX_UPDATES_PER_POLL> BLOCK <OM_CACHE_IN_WAIT_TIMEOUT_MS>`).
@@ -275,6 +275,32 @@ This event-sourcing pattern provides two critical guarantees:
 * **Durability**: The Redis stream acts as the durable source of truth for the system's state.
 
 To prevent an instance from being "ahead" of the global state, an instance that creates a ticket **will not add that ticket to its own local cache until it receives that same creation event back from the Redis stream**. Cold-starting or newly scaled instances also enforce an initial startup catch-up barrier so `InvokeMatchmakingFunctions` waits until the existing stream backlog has been polled and applied before snapshotting active tickets. This ensures all instances update and query their state based on the same replicated event log.
+
+#### **Enabling or Disabling Packed Ticket State Updates**
+
+`OM_CACHE_PACK_TICKET_STATE_UPDATES` (default `false`) changes the format of the `activate` and `deactivate` entries that Open Match core writes to the `om-replication` stream. Unpacked entries carry exactly one ticket ID (`XADD om-replication * deactivate <id>`); packed entries carry up to `OM_CACHE_OUT_MAX_PACKED_KEYS` ticket IDs in a single entry (`XADD om-replication * deactivate <id1> <id2> <id3> ...`). **`om-core` `v2.0.x` reads only the first ticket ID of a packed entry and silently drops the rest**, with no error, log line, or metric.
+
+> [!IMPORTANT]
+> * An Open Match 2 matchmaker deployment is the **entire** matchmaker stack: the Redis instance, the `om-core` instances, the MMFs, the matchmaking queue (frontend), and the Director. Every `om-core` instance in a deployment must run the same `om-core` version with the same `OM_CACHE_PACK_TICKET_STATE_UPDATES` setting. **Do not mix instances with different settings, or packing-enabled instances with `v2.0.x` instances, in the same deployment.**
+> * **Live (rolling) upgrades and rollbacks of this setting are not supported**, in either direction: neither turning packing on (including upgrading from `v2.0.x` to `v2.1.0` with packing enabled) nor turning it off (including rolling back from packing-enabled `v2.1.0` to `v2.0.x`). A new configuration is a **new deployment** of the whole stack, including **a new Redis instance**.
+
+**Recommended: blue-green deployment**
+
+1. **Stand up the new ("green") deployment alongside the existing ("blue") one.** Green is a complete, independent copy of the matchmaker (its own Redis instance, `om-core` instances with the new version and configuration, MMFs, matchmaking queue, and Director) and shares nothing with blue.
+2. **Move clients to green as they reach parts of the game that make new matchmaking requests**, for example when a player returns to the lobby or joins a new queue: route those requests to green's matchmaking queue instead of blue's.
+3. **Let blue drain.** Blue needs no changes and is unaware of green: its Director keeps matching the players already in its queue as usual, and with no new players arriving, its tickets are matched or expire. Every blue ticket expires no later than `OM_CACHE_TICKET_TTL_MS` after blue's last ticket is created.
+4. **Decommission blue** once its queue is empty: shut down the whole blue stack, including its Redis instance.
+
+Each deployment only matches its own tickets, so the player population is split between blue and green during the transition. Keep the transition short for queues with low populations. To roll back, run the same procedure with the previous configuration as the new green deployment.
+
+**Alternative: maintenance window**
+
+1. **Drain** the matchmaker: stop sending new tickets and ticket activations to Open Match, and let in-flight matchmaking finish.
+2. **Shut down every `om-core` instance** in the deployment.
+3. **Replace the Redis instance with a fresh one.**
+4. **Start all `om-core` instances** with the new version and configuration, pointed at the fresh Redis instance, then resume matchmaker traffic.
+
+Running a mixed deployment, or changing the setting live, causes instances to silently diverge: **dropped deactivations** leave matched or cancelled tickets in active pools, so MMFs can propose players who are already in a game, and **dropped activations** leave re-activated tickets out of pools, so those players are never matched.
 
 #### **What This Means for Your Matchmaker**
 
@@ -316,3 +342,11 @@ This dovetails perfectly with the idea of a **match quality score**. Your MMFs c
 Finally, the MMF timeout should be viewed not as a matchmaking tool, but as a critical **safety net**. Its sole purpose is to prevent a malfunctioning MMF from running indefinitely and harming your matchmaker's stability.
 
 As discussed in the advanced patterns, an MMF might be designed to have a long, valid runtime for complex analytics or simulations. Your `OM_MMF_TIMEOUT_SECS` value must be set intentionally. You should carefully evaluate the longest possible *valid* runtime for any of your MMFs and set the timeout to a value comfortably longer than that. This ensures that only a truly broken MMF—one stuck in an infinite loop, for example—will ever be terminated, protecting your system's stability without interfering with legitimate, long-running tasks.
+
+**Keep platform request timeouts longer than the MMF timeout.** An `InvokeMatchmakingFunctions` stream can stay open for up to `OM_MMF_TIMEOUT_SECS` while MMFs run, plus up to `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` while Open Match core waits for the last match's ticket deactivations to replicate (when `OM_MATCH_TICKET_DEACTIVATION_WAIT=true`). Any request timeout enforced in front of Open Match core must therefore satisfy:
+
+```
+request timeout (seconds) > OM_MMF_TIMEOUT_SECS + OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000
+```
+
+With the defaults (`600` + `60000 / 1000` = `660` seconds), the Cloud Run request timeout must be longer than `660` seconds. The sample Cloud Run manifests set it to `900` seconds (`timeoutSeconds: 900` in `deploy/cloud_run/service.yaml`, `--timeout 900` in `deploy/cloud_run/cloudbuild.yaml` and `ci.yaml`); Cloud Run's default of `300` seconds is too short. If the platform timeout is shorter, Cloud Run cuts long-running `InvokeMatchmakingFunctions` streams before Open Match core can return all matches or its final status, leaving your Director unable to tell which matches were produced and which tickets were deactivated. If you raise `OM_MMF_TIMEOUT_SECS` or `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`, raise the Cloud Run timeout (maximum `3600` seconds) and any load balancer or client deadlines in front of Open Match core to match.

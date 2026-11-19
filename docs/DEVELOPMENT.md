@@ -33,7 +33,7 @@ Step #1: [builder] 2025/08/27 06:00:39 [DEBUG] GET https://go.dev/dl/?mode=json
 Step #1: [builder] ***** CACHE MISS: "go"
 Step #1: [builder] Installing Go v1.24.6.
 ``` 
-use the lower of these two versions in the `go.mod` files in Open Match 2 related projects (`go mod edit -go=<VERSION>`). This is to ensure that users following the instructions to build in their own projects can do their own builds using the default Cloud Shell environment and the latest Google Cloud buildpacks.
+use the lower of these two versions in the `go.mod` files in Open Match 2 related projects (`go mod edit -go=<VERSION>`). This is to ensure that users following the instructions to build in their own projects can do their own builds using the default Cloud Shell environment and the latest Google Cloud buildpacks. (The log above is an illustrative example from an older release; as of `v2.1.0`, `om-core` targets Go `1.27.4` via `go 1.27.4` in `go.mod`. That `go` directive is a minimum version, not a pin: Cloud Buildpacks build with the newest Go release available in the builder image, so each build picks up the latest Go fixes and security updates. If a new Go release breaks your build, pin an older version locally by setting the `GOOGLE_GO_VERSION` build environment variable (for example `GOOGLE_GO_VERSION=1.27.x` via a local `project.toml` or `--set-build-env-vars`).)
 * When upgrading dependencies, upgrade **direct dependencies only** (avoiding a blanket `go get -u ./...` across indirect dependencies), and then run `go mod tidy`, `go vet ./...`, and `go test -race ./...` to verify that everything builds and passes cleanly before committing changes to `go.mod` and `go.sum`.
 
 ## Deploy
@@ -50,9 +50,13 @@ gcloud run services replace deploy/cloud_run/service.yaml
 ```
 If you instead intend to use the `deploy/cloud_run/cloudbuild.yaml` file populated with everything you've configured, you can deploy the service with a command like the one listed in the comment at the top of `deploy/cloud_run/cloudbuild.yaml` (requires you to have enabled Cloud Build and have appropriate service account permissions):
 
-You may need to adjust the scaling configuration and amount of memory `om-core` is allowed to use depending on your matchmaker.
+You may need to adjust the scaling configuration and amount of memory `om-core` is allowed to use depending on your matchmaker. The samples request `2` vCPU and `1Gi` of memory per instance (`resources.limits` in `deploy/cloud_run/service.yaml`, `--cpu 2 --memory 1Gi` in `deploy/cloud_run/cloudbuild.yaml`) and log at `OM_LOGGING_LEVEL=info`.
+
+The samples also set the Cloud Run request timeout to `900` seconds (`timeoutSeconds: 900` in `deploy/cloud_run/service.yaml`, `--timeout 900` in `deploy/cloud_run/cloudbuild.yaml`). Keep the request timeout longer than `OM_MMF_TIMEOUT_SECS` (default `600`) plus `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000` (default `60`); otherwise Cloud Run cuts off long-running `InvokeMatchmakingFunctions` streams. If you raise either setting, raise the timeout too (see [ADVANCED.md](ADVANCED.md#time-as-a-safeguard-the-mmf-timeout-om_mmf_timeout_secs)).
 
 `core` is just a gRPC/HTTP golang application in a container image and can be deployed in most environments (local Docker/Minikube/Kubernetes/kNative) with a little effort. 
+
+For GKE, `deploy/gke/om.yaml` contains a sample `Deployment`, `ServiceAccount`, `Service`, and OpenTelemetry Collector `ConfigMap`. The `om-core` container uses a `lifecycle.preStop.sleep.seconds: 10` hook and the Pod sets `terminationGracePeriodSeconds: 30`, so that during rolling restarts the Pod is removed from `Service` endpoints before `om-core` receives `SIGTERM`, and the HTTP gateway can drain in-flight REST calls before shutting down. The `sleep` lifecycle action requires Kubernetes `1.30` or later. Keep `terminationGracePeriodSeconds` larger than the `preStop` sleep plus `om-core`'s bounded graceful shutdown (up to about 8 seconds: a 5-second HTTP/gRPC drain followed by a 3-second replication flush).
 
 ## Protocol Buffers
 The `proto` directory contains the protocol buffer definition files and documentation about using and building them. If you're developing against Open Match, you probably want to write your Matchmaking Functions ('MMFs') in a language you're comfortable in, so you'll want to use `protoc` to generate libraries in your preferred language.

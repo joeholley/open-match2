@@ -52,12 +52,12 @@ Viper's `AutomaticEnv()` only resolves environment variables that have a default
 | `OM_CACHE_OUT_WAIT_TIMEOUT_MS` | `500` | `int` | No | Maximum time in milliseconds `OutgoingReplicationQueue` waits to fill a batch up to `OM_CACHE_OUT_MAX_QUEUE_THRESHOLD` before flushing. |
 | `OM_CACHE_OUT_QUEUE_BUFFER_SIZE` | `500` | `int` | **Yes (`> 0`)** | Buffer capacity of the outgoing replication request channel (`ReplicatedTicketCache.UpRequests`). |
 | `OM_CACHE_OUT_MAX_PACKED_KEYS` | `500` | `int` | **Yes (`> 0`)** | Maximum number of ticket IDs packed into a single multi-key `activate` or `deactivate` update when `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`. |
-| `OM_CACHE_TICKET_TTL_MS` | `600000` | `int` | No | Ticket time-to-live in milliseconds (default 10 minutes) added to `creation_time` for default `expiration_time`, local min-heap eviction, and Redis `XTRIM`. |
+| `OM_CACHE_TICKET_TTL_MS` | `600000` | `int` | No | Ticket time-to-live in milliseconds (default 10 minutes) added to `creation_time` for default `expiration_time` (tickets expire at `expiration_time` whether active or inactive), local min-heap eviction, and Redis `XTRIM`. |
 | `OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS` | `600000` | `int` | No | *(Deprecated)* Additional retention window in milliseconds after `OM_CACHE_TICKET_TTL_MS` before assignments and Redis stream entries are evicted. |
 | `OM_CACHE_EXPIRATION_INTERVAL_MS` | `1000` | `int` | **Yes (`> 0`)** | Interval in milliseconds between asynchronous min-heap TTL expiration sweeps on the local cache. |
 | `OM_CACHE_EXPIRATION_MAX_DELETES_PER_CYCLE` | `5000` | `int` | **Yes (`> 0`)** | Maximum number of expired tickets/assignments evicted from the local cache in a single expiration cycle (in 256-pop lock chunks). |
 | `OM_MAX_STATE_UPDATES_PER_CALL` | `500` | `int` | **Yes (`> 0`)** | Maximum number of ticket IDs permitted in a single `ActivateTickets`, `DeactivateTickets`, or `CreateAssignments` RPC call. |
-| `OM_MMF_TIMEOUT_SECS` | `600` | `int` | No | Maximum deadline in seconds for an `InvokeMatchmakingFunctions` invocation before `om-core` cancels MMF contexts with `MMFTimeoutError`. |
+| `OM_MMF_TIMEOUT_SECS` | `600` | `int` | No | Maximum deadline in seconds for an `InvokeMatchmakingFunctions` invocation before `om-core` cancels MMF contexts with `MMFTimeoutError`. **Invariant**: the Cloud Run request timeout (`timeoutSeconds` / `--timeout`, `900` in the samples) must exceed `OM_MMF_TIMEOUT_SECS` + `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000` (`660` s with defaults), or Cloud Run cuts long streams. |
 | `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` | `60000` | `int` | **Yes (`> 0`)** | Maximum time in milliseconds to wait for match ticket deactivations to replicate to the local cache before returning the match (with `deactivation_timeout=true` on timeout). |
 
 ### Table 1.C: Boolean Configuration Variables (6 Keys)
@@ -66,7 +66,7 @@ Viper's `AutomaticEnv()` only resolves environment variables that have a default
 | :--- | :--- | :--- | :--- |
 | `OM_OTEL_SIDECAR` | `true` | `bool` | When `true`, exports OpenTelemetry metrics over OTLP gRPC to a local Collector sidecar; when `false`, serves Prometheus metrics locally on `OM_PROM_PORT`. |
 | `OM_MATCH_TICKET_DEACTIVATION_WAIT` | `true` | `bool` | When `true`, waits up to `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` for match ticket deactivations to replicate to the local cache before streaming the match to the caller (annotating `Match.Extensions["deactivation_timeout"] = true` on timeout or write failure); when `false`, streams the match immediately and deactivates tickets afterward. |
-| `OM_CACHE_PACK_TICKET_STATE_UPDATES` | `false` | `bool` | When `true`, packs multi-ticket `ActivateTickets` / `DeactivateTickets` calls and coalesces contiguous cross-caller outgoing requests into multi-key stream updates (up to `OM_CACHE_OUT_MAX_PACKED_KEYS` keys). |
+| `OM_CACHE_PACK_TICKET_STATE_UPDATES` | `false` | `bool` | When `true`, packs multi-ticket `ActivateTickets` / `DeactivateTickets` calls and coalesces contiguous cross-caller outgoing requests into multi-key stream updates (up to `OM_CACHE_OUT_MAX_PACKED_KEYS` keys). **No mixed deployments or live changes**: `v2.0.x` `om-core` reads only the first key of each packed entry and silently drops the rest. All instances in a deployment must use the same setting (and packing-enabled instances must never share a stream with `v2.0.x`). Changing it in either direction requires a new deployment of the whole matchmaker stack (including a new Redis instance), preferably blue-green. |
 | `OM_REDIS_USE_TLS` | `false` | `bool` | Enables TLS (`redis.DialUseTLS(true)`) on both Redis read and write connections. |
 | `OM_REDIS_TLS_SKIP_VERIFY` | `false` | `bool` | Skips certificate verification (`redis.DialTLSSkipVerify(true)`) when `OM_REDIS_USE_TLS=true` (for self-signed certificates in non-production environments). |
 | `OM_VERBOSE` | `false` | `bool` | Enables verbose diagnostic logging (such as unassigned inactive ticket counts during `InvokeMatchmakingFunctions` and cache dumps on shutdown). |
@@ -87,7 +87,7 @@ Override strings in environment variables must follow Go's `time.ParseDuration` 
 
 ## 2. Symptom-Based Replication Lag Tuning Matrix
 
-Always begin tuning by observing `om_core.cache.replication.lag` alongside `om_core.cache.incoming.backlog` and `om_core.cache.outgoing.backlog`, and enable `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` for any high-throughput or bursty matchmaking workload.
+Always begin tuning by observing `om_core.cache.replication.lag` alongside `om_core.cache.incoming.backlog` and `om_core.cache.outgoing.backlog`, and enable `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` for any high-throughput or bursty matchmaking workload, via a new deployment of the whole matchmaker stack (including its own Redis instance), preferably blue-green (see the no-mixed-deployments rule in Table 1.C).
 
 | Bottleneck Stage | Primary Metric Symptoms | Root Cause | Recommended Configuration Adjustments |
 | :--- | :--- | :--- | :--- |

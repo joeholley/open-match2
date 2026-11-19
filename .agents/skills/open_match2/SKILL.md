@@ -37,8 +37,8 @@ Open Match 2 (`github.com/googleforgames/open-match2/v2`) consolidates the multi
 ## 2. Eight Core Architectural Rules and Gotchas
 
 1. **Tickets Start `inactive` and Cannot Be Manually Deleted**:
-   - `CreateTicket` writes a new ticket to state storage in the **`inactive`** state (`InactiveSet`). A newly created ticket will **never** appear in matchmaking pools until `ActivateTickets` is called for its ticket ID.
-   - There is no `DeleteTicket` RPC. Tickets are immutable once created and are automatically evicted when their TTL (`OM_CACHE_TICKET_TTL_MS`, applied relative to `Ticket.attributes.creation_time` when `Ticket.expiration_time` is omitted) expires via asynchronous min-heap sweeps and Redis Stream `XTRIM`.
+   - `CreateTicket` writes a new ticket to state storage in the **`inactive`** state (`InactiveSet`). A newly created ticket will **never** appear in matchmaking pools until `ActivateTickets` is called for its ticket ID. This is unchanged from `v2.0.x` (an earlier `v2.1.0-rc1` build that applied replicated `Ticket` events as active was a bug and is fixed); never reintroduce pool eligibility on creation.
+   - There is no `DeleteTicket` RPC. Tickets are immutable once created and are automatically evicted at `Ticket.expiration_time` (defaulting to `Ticket.attributes.creation_time` + `OM_CACHE_TICKET_TTL_MS`; explicit values may be earlier but never later than now + `OM_CACHE_TICKET_TTL_MS`) **whether active or inactive**, via asynchronous min-heap sweeps and Redis Stream `XTRIM`.
 
 2. **Viper `SetDefault` Registration & Positive Integer Enforcement**:
    - Viper's `AutomaticEnv()` only reads environment variables for keys that already have a default registered via `cfg.SetDefault(...)` in `internal/config/config.go` (`Read()`). Never read an unregistered env var via Viper without registering its default in `Read()`.
@@ -47,6 +47,7 @@ Open Match 2 (`github.com/googleforgames/open-match2/v2`) consolidates the multi
 3. **Event-Sourced Replication & Cold-Start Catch-Up Barrier**:
    - `om-core` instances never mutate their local `ReplicatedTicketCache` directly during an RPC write. All state mutations (`Ticket`, `Activate`, `Deactivate`, `Assign`) flow through `OutgoingReplicationQueue` to the central stream (`om-replication`) and are applied locally only when read back by `IncomingReplicationQueue`.
    - On cold start, `InvokeMatchmakingFunctions` waits on `tc.WaitForCatchUp` until the initial stream backlog is polled and applied (returning `codes.Unavailable` with `"initial ticket cache replication catch-up did not complete in time"` if the context expires first).
+   - **Packed updates: no mixed deployments, no live changes**: `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` writes multi-key `activate`/`deactivate` stream entries that `v2.0.x` `om-core` only partially reads (first key only; the rest are silently dropped). A matchmaker deployment is the **entire** stack (Redis, `om-core`, MMFs, matchmaking queue, Director); never mix different settings of this flag (or packing-enabled instances with `v2.0.x`) in one deployment. Live (rolling) upgrades and rollbacks of the setting are **not supported**: a new configuration is a new deployment with a **new Redis instance**. Recommend blue-green (stand up a complete, independent green stack alongside blue; route clients to green's matchmaking queue as they make new matchmaking requests; blue, including its Director, keeps running unchanged and unaware of green until its queue drains; then decommission the whole blue stack), or a maintenance window with a fresh Redis instance. Never change the packed wire format without accounting for this.
 
 4. **Automatic Match Ticket Deactivation & `"deactivation_timeout"` Extension**:
    - For every `Match` streamed back by an MMF, `om-core` validates all roster ticket IDs against `^\d{13}-\d+$`, skips invalid IDs for deactivation while listing them in `Match.Extensions["invalid_ticket_ids"]` (`MatchInvalidTicketIdsExtensionKey`, `structpb.ListValue` of strings), and automatically deactivates all valid tickets.
@@ -87,6 +88,7 @@ go run .
 - Prometheus metrics listen on `http://localhost:2223/metrics` (`OM_PROM_PORT`) when `OM_OTEL_SIDECAR=false`.
 
 ### Build, Vet, and Run Unit Tests
+The module targets Go `1.27.4` (`go 1.27.4` in `go.mod`); use a Go `1.27.4` or later toolchain. The `go` directive is a minimum, not a pin: Cloud Buildpacks intentionally build with the newest Go release in the builder image so every build picks up the latest fixes and security updates. Do not add a repository-level `GOOGLE_GO_VERSION` pin; if a new Go release breaks the build, pin it locally (e.g. `--set-build-env-vars GOOGLE_GO_VERSION=1.27.x` or a local `project.toml`).
 ```bash
 # Compile and run static analysis
 go build ./...
@@ -128,6 +130,11 @@ Because `om-core` relies on continuous background goroutines (`IncomingReplicati
 | **Gen2 Execution Environment** | `--execution-environment` `gen2` (`--execution-environment=gen2`) | `run.googleapis.com/execution-environment: gen2` |
 | **Warm Replicas (Minimum 2 instances)** | `--min-instances` `2` (`--min-instances=2`) | `autoscaling.knative.dev/minScale: '2'` |
 | **Production Ingress Control** | `--ingress` `internal` (`--ingress=internal` in `deploy/cloud_run/cloudbuild.yaml`; `--ingress` `all` with `--no-allow-unauthenticated` in `ci.yaml` for default-pool smoke tests) | `run.googleapis.com/ingress: internal` and `run.googleapis.com/ingress-status: internal` |
+| **Request Timeout > MMF Timeout + Deactivation Wait** | `--timeout 900` (must exceed `OM_MMF_TIMEOUT_SECS` + `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000`, i.e. `> 660` s with defaults; Cloud Run's `300` s default cuts long `InvokeMatchmakingFunctions` streams) | `spec.template.spec.timeoutSeconds: 900` |
+| **Instance Resources (sample default)** | `--cpu 2 --memory 1Gi` | `resources.limits` `cpu: '2'`, `memory: 1Gi` (with `OM_LOGGING_LEVEL=info`) |
+
+### GKE Graceful Draining
+`deploy/gke/om.yaml` sets `lifecycle.preStop.sleep.seconds: 10` on the `om-core` container and `terminationGracePeriodSeconds: 30` on the Pod so the Pod leaves `Service` endpoints before `SIGTERM` and the HTTP gateway drains in-flight REST calls during rolling restarts (the `sleep` action requires Kubernetes `1.30`+). Keep `terminationGracePeriodSeconds` greater than the `preStop` sleep plus `om-core`'s bounded graceful shutdown (up to ~8s: 5s HTTP/gRPC drain + 3s replication flush).
 
 ### OpenTelemetry Collector Sidecar Configuration
 The sidecar image in `deploy/cloud_run/otel-collector-sidecar/Dockerfile` is built on `us-docker.pkg.dev/cloud-ops-agents-artifacts/google-cloud-opentelemetry-collector/otelcol-google:0.121.0` and exports metrics via `googlemanagedprometheus`.
