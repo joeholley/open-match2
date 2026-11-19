@@ -3444,6 +3444,29 @@ func TestCloudRunDeploymentManifestFlags(t *testing.T) {
 	assert.Contains(t, svcContent, "run.googleapis.com/execution-environment: gen2")
 	assert.Contains(t, svcContent, "autoscaling.knative.dev/minScale: '2'")
 	assert.Contains(t, svcContent, "run.googleapis.com/ingress: internal")
+	assert.Contains(t, svcContent, "timeoutSeconds: 900")
+	assert.Contains(t, svcContent, "cpu: '2'")
+	assert.Contains(t, svcContent, "memory: 1Gi")
+	assert.NotContains(t, svcContent, "value: debug")
+
+	// Cloud Run request timeout must exceed OM_MMF_TIMEOUT_SECS +
+	// OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS/1000 in every Cloud Run manifest.
+	defaults := config.Read()
+	minTimeoutSecs := defaults.GetInt("OM_MMF_TIMEOUT_SECS") + defaults.GetInt("OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS")/1000
+	assert.Greater(t, 900, minTimeoutSecs)
+	for name, content := range map[string]string{"ci.yaml": ciContent, "deploy/cloud_run/cloudbuild.yaml": cbContent} {
+		assert.Contains(t, content, "- --timeout\n      - \"900\"", name)
+		assert.Contains(t, content, "- --cpu\n      - \"2\"", name)
+		assert.Contains(t, content, "- --memory\n      - 1Gi", name)
+	}
+
+	// deploy/gke/om.yaml graceful draining.
+	gkeBytes, err := os.ReadFile("deploy/gke/om.yaml")
+	require.NoError(t, err)
+	gkeContent := string(gkeBytes)
+	assert.Contains(t, gkeContent, "terminationGracePeriodSeconds: 30")
+	assert.Contains(t, gkeContent, "preStop:")
+	assert.Contains(t, gkeContent, "seconds: 10")
 
 	// 4. .agents/skills/open_match2/SKILL.md
 	skillBytes, err := os.ReadFile(".agents/skills/open_match2/SKILL.md")

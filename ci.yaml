@@ -68,6 +68,11 @@ steps:
       - "2"
       - --concurrency
       - "1000"
+      # Request timeout must exceed OM_MMF_TIMEOUT_SECS (default 600) +
+      # OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000 (default 60), otherwise
+      # Cloud Run cuts long-running InvokeMatchmakingFunctions streams.
+      - --timeout
+      - "900"
       - --service-account
       - ${_SERVICE_ACCOUNT}
       - --region
@@ -100,8 +105,10 @@ steps:
       - '${_ARTIFACT_REGISTRY_URI}/${_JOB_NAME}:${COMMIT_SHA}'
       - --port
       - "8080"
+      - --cpu
+      - "2"
       - --memory
-      - 1024Mi
+      - 1Gi
 
       # env vars for 'core'
       - --update-env-vars

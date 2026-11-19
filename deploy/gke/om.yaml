@@ -36,12 +36,23 @@ spec:
         app: open-match-deployment
     spec:
       serviceAccountName: open-match-sa
+      # Must cover the preStop delay (10s) + om-core's graceful shutdown
+      # budget (5s server drain + 3s replication flush) with headroom.
+      terminationGracePeriodSeconds: 30
       containers:
         - image: us-docker.pkg.dev/open-match-public-images/open-match2/om-core
           imagePullPolicy: Always
           name: om-core
           ports:
           - containerPort: 8080
+          # Delay SIGTERM until the pod has been removed from Service
+          # endpoints, so no new requests arrive once om-core begins draining
+          # in-flight requests during rolling restarts. The native `sleep`
+          # lifecycle action requires Kubernetes 1.30+.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
           env:
           - name: OM_LOGGING_LEVEL
             value: info

@@ -94,6 +94,11 @@ REQUIRED_POSITIVE_INT_VARS: Set[str] = {
     "REDISPORT",
 }
 
+# Minimum Cloud Run request timeout (seconds): OM_MMF_TIMEOUT_SECS (default 600)
+# + OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS / 1000 (default 60). Shorter request
+# timeouts cut long-running InvokeMatchmakingFunctions streams.
+MIN_CLOUD_RUN_TIMEOUT_SECS: int = 660
+
 VALID_INGRESS_VALUES: Set[str] = {
     "internal",
     "internal-and-cloud-load-balancing",
@@ -515,10 +520,54 @@ def _audit_knative_service_yaml(
     exec_env: Optional[Tuple[int, str]] = None
     min_scale: Optional[Tuple[int, str]] = None
     ingress: Optional[Tuple[int, str]] = None
+    timeout_secs: Optional[Tuple[int, str]] = None
+    has_cpu_limit = False
+    has_memory_limit = False
+    in_limits = False
+    limits_indent = -1
+    pending_env_name: Optional[str] = None
 
     for line_no, raw_line in enumerate(lines, start=1):
         code = _strip_inline_comment(raw_line).strip()
         if not code:
+            continue
+
+        indent = len(raw_line) - len(raw_line.lstrip())
+        if in_limits and indent <= limits_indent:
+            in_limits = False
+        if re.match(r"^limits\s*:\s*$", code):
+            in_limits = True
+            limits_indent = indent
+            continue
+        if in_limits:
+            if re.match(r"^cpu\s*:\s*\S+", code):
+                has_cpu_limit = True
+            elif re.match(r"^memory\s*:\s*\S+", code):
+                has_memory_limit = True
+
+        m_timeout = re.match(r"^timeoutSeconds\s*:\s*(\S+)$", code)
+        if m_timeout:
+            timeout_secs = (line_no, _unquote(m_timeout.group(1)))
+            continue
+
+        m_env_name = re.match(r"^-?\s*name\s*:\s*(\S+)$", code)
+        if m_env_name:
+            pending_env_name = _unquote(m_env_name.group(1))
+            continue
+        m_env_value = re.match(r"^value\s*:\s*(\S+)$", code)
+        if m_env_value and pending_env_name == "OM_LOGGING_LEVEL":
+            level = _unquote(m_env_value.group(1)).lower()
+            if level in ("debug", "trace"):
+                findings.append(
+                    Finding(
+                        "WARN",
+                        display_path,
+                        line_no,
+                        f"OM_LOGGING_LEVEL is '{level}'; use 'info' (or higher) for production "
+                        "to avoid log volume and per-request logging overhead.",
+                    )
+                )
+            pending_env_name = None
             continue
 
         m_cpu = re.match(r"^['\"]?run\.googleapis\.com/cpu-throttling['\"]?\s*:\s*(.*)$", code)
@@ -630,6 +679,64 @@ def _audit_knative_service_yaml(
             )
         )
 
+    _check_cloud_run_timeout(display_path, timeout_secs, "timeoutSeconds", findings)
+
+    if not (has_cpu_limit and has_memory_limit):
+        findings.append(
+            Finding(
+                "WARN",
+                display_path,
+                1,
+                "om-core container should set explicit 'resources.limits' for both cpu and memory "
+                "(recommended: cpu '2', memory 1Gi).",
+            )
+        )
+
+
+def _check_cloud_run_timeout(
+    display_path: str,
+    timeout: Optional[Tuple[int, str]],
+    setting_name: str,
+    findings: List[Finding],
+) -> None:
+    """Warns when the Cloud Run request timeout is missing or too short for InvokeMatchmakingFunctions."""
+    if timeout is None:
+        findings.append(
+            Finding(
+                "WARN",
+                display_path,
+                1,
+                f"Missing Cloud Run request timeout ('{setting_name}'); the 300s default is shorter than "
+                f"OM_MMF_TIMEOUT_SECS + OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS/1000 "
+                f"({MIN_CLOUD_RUN_TIMEOUT_SECS}s with defaults). Recommended: 900.",
+            )
+        )
+        return
+    raw = timeout[1].rstrip("s")
+    try:
+        secs = int(raw, 10)
+    except ValueError:
+        findings.append(
+            Finding(
+                "ERROR",
+                display_path,
+                timeout[0],
+                f"Cloud Run request timeout '{setting_name}' must be an integer number of seconds, got '{timeout[1]}'.",
+            )
+        )
+        return
+    if secs < MIN_CLOUD_RUN_TIMEOUT_SECS:
+        findings.append(
+            Finding(
+                "WARN",
+                display_path,
+                timeout[0],
+                f"Cloud Run request timeout '{setting_name}' is {secs}s; it must exceed OM_MMF_TIMEOUT_SECS + "
+                f"OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS/1000 ({MIN_CLOUD_RUN_TIMEOUT_SECS}s with defaults) "
+                "or long InvokeMatchmakingFunctions streams are cut. Recommended: 900.",
+            )
+        )
+
 
 def _audit_cloudbuild_yaml(
     display_path: str,
@@ -695,6 +802,8 @@ def _audit_cloudbuild_yaml(
         min_instances_line = step_line
         has_min_instances_flag = False
 
+        timeout_val: Optional[Tuple[int, str]] = None
+
         i = 0
         while i < len(step_tokens):
             line_no, tok = step_tokens[i]
@@ -739,7 +848,18 @@ def _audit_cloudbuild_yaml(
                 min_instances_line = line_no
                 min_instances_val = _unquote(tok.split("=", 1)[1])
 
+            elif tok == "--timeout":
+                if i + 1 < len(step_tokens) and not step_tokens[i + 1][1].startswith("-"):
+                    timeout_val = (line_no, _unquote(step_tokens[i + 1][1]))
+                    i += 1
+                else:
+                    timeout_val = (line_no, "")
+            elif tok.startswith("--timeout="):
+                timeout_val = (line_no, _unquote(tok.split("=", 1)[1]))
+
             i += 1
+
+        _check_cloud_run_timeout(display_path, timeout_val, "--timeout", findings)
 
         if has_cpu_throttling_enabled or not has_no_cpu_throttling:
             findings.append(
