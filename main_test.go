@@ -633,50 +633,6 @@ func newFastCoreTestConfig() *viper.Viper {
 	return c
 }
 
-var parkedPollerForever = make(chan struct{})
-
-type trackedStateReplicator struct {
-	base       store.StateReplicator
-	mu         sync.Mutex
-	parking    bool
-	parkedOnce sync.Once
-	parkedChan chan struct{}
-}
-
-func newTrackedStateReplicator(base store.StateReplicator) *trackedStateReplicator {
-	return &trackedStateReplicator{
-		base:       base,
-		parkedChan: make(chan struct{}),
-	}
-}
-
-func (tr *trackedStateReplicator) GetUpdates() []*store.StateUpdate {
-	tr.mu.Lock()
-	if tr.parking {
-		tr.parkedOnce.Do(func() { close(tr.parkedChan) })
-		tr.mu.Unlock()
-		<-parkedPollerForever
-		return nil
-	}
-	tr.mu.Unlock()
-	return tr.base.GetUpdates()
-}
-
-func (tr *trackedStateReplicator) parkPoller() {
-	tr.mu.Lock()
-	tr.parking = true
-	tr.mu.Unlock()
-	<-tr.parkedChan
-}
-
-func (tr *trackedStateReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
-	return tr.base.SendUpdates(updates)
-}
-
-func (tr *trackedStateReplicator) GetReplIdValidator() *regexp.Regexp {
-	return tr.base.GetReplIdValidator()
-}
-
 func startLocalTestCache(t *testing.T, customCfg *viper.Viper, repl store.StateReplicator) *cache.ReplicatedTicketCache {
 	t.Helper()
 	if customCfg == nil {
@@ -685,8 +641,7 @@ func startLocalTestCache(t *testing.T, customCfg *viper.Viper, repl store.StateR
 	if repl == nil {
 		repl = memoryReplicator.New(customCfg)
 	}
-	tracked := newTrackedStateReplicator(repl)
-	localTc := cache.New(customCfg, tracked)
+	localTc := cache.New(customCfg, repl)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -698,8 +653,10 @@ func startLocalTestCache(t *testing.T, customCfg *viper.Viper, repl store.StateR
 		defer wg.Done()
 		localTc.IncomingReplicationQueue(ctx)
 	}()
+	// IncomingReplicationQueue joins its own poller and expiration goroutines
+	// before returning, so waiting on wg guarantees no goroutine from this
+	// cache outlives the test.
 	t.Cleanup(func() {
-		tracked.parkPoller()
 		cancel()
 		wg.Wait()
 	})
@@ -722,9 +679,8 @@ func setupGlobalTestCache(t *testing.T, customCfg *viper.Viper, repl store.State
 	if repl == nil {
 		repl = memoryReplicator.New(cfg)
 	}
-	tracked := newTrackedStateReplicator(repl)
 	tc = cache.ReplicatedTicketCache{}
-	tc.Init(cfg, tracked)
+	tc.Init(cfg, repl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -741,7 +697,6 @@ func setupGlobalTestCache(t *testing.T, customCfg *viper.Viper, repl store.State
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() {
-			tracked.parkPoller()
 			cancel()
 			wg.Wait()
 			cfg = origCfg
@@ -2919,6 +2874,8 @@ func TestInvokeMatchmakingFunctionsColdStartCatchUpBarrier(t *testing.T) {
 			validator: regexp.MustCompile(`^\d{13}-\d+$`),
 			firstWave: []*store.StateUpdate{
 				{Cmd: store.Ticket, Key: tid, Value: string(rawTicket), ReplId: tid},
+				// Tickets begin inactive; the backlog also contains its activation.
+				{Cmd: store.Activate, Key: tid, ReplId: fmt.Sprintf("%s0", tid)},
 			},
 		}
 		setupGlobalTestCache(t, nil, delayedRepl)
