@@ -27,6 +27,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -2413,6 +2414,116 @@ func TestContextCancellationAndGracefulServerShutdown(t *testing.T) {
 			t.Fatal("start() did not shut down gRPC and HTTP servers within 2 seconds")
 		}
 	})
+
+	t.Run("InFlightRESTRequestDrainsDuringShutdown", func(t *testing.T) {
+		// Hold a CreateTicket REST call in flight inside the replicator while
+		// shutdown begins. The gateway's gRPC client connection must stay open
+		// until httpServer.Shutdown has drained the call (regression test for
+		// "grpc: the client connection is closing" during rolling restarts).
+		blocking := &blockingSendReplicator{
+			StateReplicator: memoryReplicator.New(newFastCoreTestConfig()),
+			entered:         make(chan struct{}),
+			release:         make(chan struct{}),
+		}
+		setupGlobalTestCache(t, nil, blocking)
+
+		lGrpc, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		grpcPort := lGrpc.Addr().(*net.TCPAddr).Port
+		require.NoError(t, lGrpc.Close())
+		lHttp, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		httpPort := lHttp.Addr().(*net.TCPAddr).Port
+		require.NoError(t, lHttp.Close())
+
+		srvCfg := newFastCoreTestConfig()
+		srvCfg.Set("OM_GRPC_PORT", strconv.Itoa(grpcPort))
+		srvCfg.Set("PORT", strconv.Itoa(httpPort))
+
+		srvCtx, srvCancel := context.WithCancel(context.Background())
+		defer srvCancel()
+		done := make(chan struct{})
+		go func() {
+			start(srvCtx, srvCfg)
+			close(done)
+		}()
+		require.Eventually(t, func() bool {
+			c, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", httpPort), 50*time.Millisecond)
+			if dialErr != nil {
+				return false
+			}
+			_ = c.Close()
+			return true
+		}, 3*time.Second, 15*time.Millisecond)
+
+		type httpResult struct {
+			code int
+			body string
+			err  error
+		}
+		resCh := make(chan httpResult, 1)
+		go func() {
+			resp, postErr := http.Post(
+				fmt.Sprintf("http://127.0.0.1:%d/tickets", httpPort),
+				"application/json",
+				strings.NewReader(`{"ticket":{"attributes":{"tags":["drain"]}}}`),
+			)
+			if postErr != nil {
+				resCh <- httpResult{err: postErr}
+				return
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			resCh <- httpResult{code: resp.StatusCode, body: string(b)}
+		}()
+
+		// Wait until the CreateTicket write is in flight in the replicator.
+		select {
+		case <-blocking.entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("CreateTicket never reached the replicator")
+		}
+
+		// Begin graceful shutdown (equivalent to SIGTERM), give the shutdown
+		// sequence time to start, then let the in-flight write complete.
+		srvCancel()
+		time.Sleep(200 * time.Millisecond)
+		close(blocking.release)
+
+		select {
+		case res := <-resCh:
+			require.NoError(t, res.err)
+			assert.Equal(t, http.StatusOK, res.code, "in-flight REST call must drain successfully; body: %s", res.body)
+			assert.Contains(t, res.body, "ticketId")
+			assert.NotContains(t, res.body, "client connection is closing")
+		case <-time.After(5 * time.Second):
+			t.Fatal("in-flight REST call did not complete during graceful shutdown")
+		}
+
+		select {
+		case <-done:
+		case <-time.After(6 * time.Second):
+			t.Fatal("start() did not return after graceful shutdown")
+		}
+	})
+}
+
+// blockingSendReplicator wraps a StateReplicator and blocks the first
+// SendUpdates call until release is closed, signalling entered when it starts
+// blocking.
+type blockingSendReplicator struct {
+	store.StateReplicator
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingSendReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
+	b.once.Do(func() {
+		close(b.entered)
+		<-b.release
+	})
+	return b.StateReplicator.SendUpdates(updates)
 }
 
 // Scenario 17: Server Panic Recovery Interceptors

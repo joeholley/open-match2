@@ -111,8 +111,16 @@ func start(parentCtx context.Context, cfg *viper.Viper) {
 	// http (grpc-gateway) server setup
 	logger.Infof("Open Match Server starting HTTP gRPC proxy on port %v", cfg.GetString("PORT"))
 	mux := runtime.NewServeMux()
+	// The generated RegisterOpenMatchServiceHandlerFromEndpoint closes its
+	// client connection to the gRPC server as soon as the context it is given
+	// is done. Use a context that is detached from the signal context and is
+	// only cancelled after httpServer.Shutdown has drained in-flight REST
+	// requests; otherwise SIGTERM closes the gateway connection mid-drain and
+	// in-flight calls fail with "grpc: the client connection is closing".
+	gwCtx, gwCancel := context.WithCancel(context.WithoutCancel(parentCtx))
+	defer gwCancel()
 	err = gw.RegisterOpenMatchServiceHandlerFromEndpoint(
-		ctx,
+		gwCtx,
 		mux,
 		"localhost:"+cfg.GetString("OM_GRPC_PORT"),
 		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
@@ -138,12 +146,20 @@ func start(parentCtx context.Context, cfg *viper.Viper) {
 	<-ctx.Done()
 	stop()
 
+	// Shutdown order:
+	//  1. Stop accepting new HTTP connections and drain in-flight REST calls
+	//     (the gateway's gRPC client connection is still open).
+	//  2. Close the gateway's gRPC client connection.
+	//  3. Gracefully stop the gRPC server (draining direct gRPC calls).
+	// The caller stops the state replication queues only after start returns,
+	// so writes issued by draining requests can still complete.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	if shutdownErr := httpServer.Shutdown(shutdownCtx); shutdownErr != nil {
 		logger.Warnf("HTTP server shutdown error: %v", shutdownErr)
 	}
+	gwCancel()
 
 	grpcDone := make(chan struct{})
 	go func() {

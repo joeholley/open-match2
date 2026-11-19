@@ -101,6 +101,12 @@ const (
 	mmfFailureErrorInfoDomain = "open-match"
 )
 
+// replicationShutdownTimeout bounds how long main waits for the state
+// replication queues to flush and stop after the servers have shut down.
+// Together with the 5s server shutdown budget in start(), this keeps total
+// graceful shutdown inside Cloud Run's 10s SIGTERM-to-SIGKILL window.
+const replicationShutdownTimeout = 3 * time.Second
+
 // Required by protobuf compiler's golang gRPC auto-generated code.
 type grpcServer struct {
 	pb.UnimplementedOpenMatchServiceServer
@@ -199,12 +205,43 @@ func main() {
 	}
 	tc.Init(cfg, replicator)
 
-	// These goroutines send and receive cache updates from state storage
-	go tc.OutgoingReplicationQueue(ctx)
-	go tc.IncomingReplicationQueue(ctx)
+	// These goroutines send and receive cache updates from state storage.
+	//
+	// They run on a context detached from the termination signal so that
+	// state updates issued by requests that are still draining during
+	// graceful shutdown (e.g. ActivateTickets via the HTTP gateway) can still
+	// be replicated. They are stopped, and joined, only after the gRPC and
+	// HTTP servers have shut down, and before the replicator is closed by the
+	// deferred Close() above.
+	replCtx, replCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer replCancel()
+	var replWg sync.WaitGroup
+	replWg.Add(2)
+	go func() {
+		defer replWg.Done()
+		tc.OutgoingReplicationQueue(replCtx)
+	}()
+	go func() {
+		defer replWg.Done()
+		tc.IncomingReplicationQueue(replCtx)
+	}()
 
-	// Start the gRPC server
+	// Start the gRPC server; returns after the servers have drained.
 	start(ctx, cfg)
+
+	// Stop the replication queues. OutgoingReplicationQueue flushes any
+	// already-queued updates before returning.
+	replCancel()
+	replDone := make(chan struct{})
+	go func() {
+		replWg.Wait()
+		close(replDone)
+	}()
+	select {
+	case <-replDone:
+	case <-time.After(replicationShutdownTimeout):
+		logger.Warnf("state replication queues did not stop within %v", replicationShutdownTimeout)
+	}
 
 	// Dump the final state of the cache to the log for debugging.
 	if cfg.GetBool("OM_VERBOSE") {
